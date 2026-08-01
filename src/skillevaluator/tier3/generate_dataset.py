@@ -44,9 +44,14 @@ import asyncio
 import json
 import os
 import re
+import secrets
+import stat
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+
+from skillevaluator.evaluation.results import DatasetGenerationError, DatasetGenerationResult
 
 _INTERACTIVE_RE = re.compile(
     r"interactive|opens?\s+a?\s*browser|waits?\s+for\s+(the\s+)?user|device.code\s+flow",
@@ -852,7 +857,33 @@ def _refine_from_trajectory_template(
     return refined
 
 
-def main():
+def _abort(message: str) -> None:
+    """Raise an actionable error shared by CLI and in-process callers."""
+    raise DatasetGenerationError(message)
+
+
+def _write_dataset(output_path: Path, dataset: dict[str, Any]) -> None:
+    """Atomically replace a dataset without corrupting an existing file."""
+    temporary_path: Path | None = None
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        existing_mode = stat.S_IMODE(output_path.stat().st_mode) if output_path.exists() else None
+        temporary_path = output_path.with_name(f".{output_path.name}.{secrets.token_hex(16)}.tmp")
+        with temporary_path.open("x", encoding="utf-8") as temporary:
+            json.dump(dataset, temporary, indent=2, ensure_ascii=False)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        if existing_mode is not None:
+            temporary_path.chmod(existing_mode)
+        temporary_path.replace(output_path)
+    except Exception as exc:
+        raise DatasetGenerationError(f"Could not write dataset {output_path}: {exc}") from exc
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def main(argv: Sequence[str] | None = None) -> DatasetGenerationResult:
     parser = argparse.ArgumentParser(
         description="Generate eval dataset for a skill.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -908,19 +939,16 @@ Agent-refined mode (--refine):
         help="With --refine: external results root to search before the legacy skill directory",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     skill_path = args.path.resolve()
 
     if not (skill_path / "SKILL.md").exists():
-        print(f"Error: {skill_path} does not contain a SKILL.md")
-        sys.exit(1)
+        _abort(f"{skill_path} does not contain a SKILL.md")
 
     if args.from_results and not args.refine:
-        print("Error: --from-results requires --refine")
-        sys.exit(1)
+        _abort("--from-results requires --refine")
     if args.results_dir and not args.refine:
-        print("Error: --results-dir requires --refine")
-        sys.exit(1)
+        _abort("--results-dir requires --refine")
 
     evals_dir = skill_path / "evals"
     output_path = evals_dir / "evals.json"
@@ -929,7 +957,7 @@ Agent-refined mode (--refine):
     if output_path.exists() and not args.force and not args.refine:
         print(f"Dataset already exists: {output_path}")
         print("Use --force to overwrite.")
-        return
+        return DatasetGenerationResult(status="unchanged", path=output_path)
 
     # Parse skill
     skill = _parse_skill(skill_path, prompt_file=args.prompt)
@@ -988,15 +1016,20 @@ Agent-refined mode (--refine):
         else:
             print("  No trajectory available — using initial cases as-is.")
 
+    dataset = _to_agentskills_dataset(skill["name"], cases)
+
     if args.dry_run:
         print("\nDry run — not saved.")
-        print(json.dumps(_to_agentskills_dataset(skill["name"], cases), indent=2))
-        return
+        print(json.dumps(dataset, indent=2))
+        return DatasetGenerationResult(
+            status="preview",
+            path=output_path,
+            dataset=dataset,
+            cases_count=len(cases),
+        )
 
     # Save
-    evals_dir.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(_to_agentskills_dataset(skill["name"], cases), f, indent=2, ensure_ascii=False)
+    _write_dataset(output_path, dataset)
 
     print(f"\nSaved: {output_path}")
     print(f"  {len(cases)} test case(s)")
@@ -1005,7 +1038,17 @@ Agent-refined mode (--refine):
     else:
         print(f"\nNext: skillevaluator evaluate {skill_path} --agents claude-code --env-mode docker")
         print(f"  Or refine with trajectory: skillevaluator create-eval-dataset {skill_path} --refine --force")
+    return DatasetGenerationResult(
+        status="created",
+        path=output_path,
+        dataset=dataset,
+        cases_count=len(cases),
+    )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except DatasetGenerationError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc

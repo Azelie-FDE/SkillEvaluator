@@ -49,6 +49,27 @@ def test_top_level_help_shows_branded_header() -> None:
     assert "\x1b[" not in result.output
 
 
+def test_top_level_help_groups_commands_by_workflow() -> None:
+    result = CliRunner().invoke(cli, ["--help"])
+
+    assert result.exit_code == 0
+    headings = (
+        "Core workflows:",
+        "Tier 1 · Static and security:",
+        "Tier 2 · Deduplication:",
+        "Tier 3 · Live evaluation:",
+        "Expert aliases:",
+    )
+    positions = [result.output.index(heading) for heading in headings]
+    assert positions == sorted(positions)
+
+    core = result.output.split(headings[0], 1)[1].split(headings[1], 1)[0]
+    assert all(command in core for command in ("validate", "health-check", "doctor", "models"))
+    tier3 = result.output.split(headings[3], 1)[1].split(headings[4], 1)[0]
+    assert all(command in tier3 for command in ("create-eval-dataset", "compare", "view", "harbor-view"))
+    assert "Other commands:" not in result.output
+
+
 def test_help_emits_color_when_enabled() -> None:
     ctx = click.Context(cli, info_name="skillevaluator", color=True)
     colored = render_help(cli, ctx, width=80)
@@ -646,6 +667,9 @@ def test_validate_code_integrity_reports_only_static_test_evidence(tmp_path: Pat
     assert len(report_paths) == 3
     benchmark_path = reports / "BENCHMARK.md"
     assert benchmark_path.is_file()
+    benchmark = benchmark_path.read_text(encoding="utf-8")
+    assert "Evaluation of the `untrusted-skill` skill" in benchmark
+    assert "- Skill: `untrusted-skill`" in benchmark
     data = json.loads(next(reports.glob("skillevaluator-output-*.json")).read_text(encoding="utf-8"))
     hygiene = next(item for item in data["results"] if item["validator"] == "Code Integrity & Hygiene")
     detail = next(item for item in hygiene["success_details"] if item["check"] == "test_discovery")

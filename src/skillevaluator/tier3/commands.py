@@ -9,7 +9,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import tomllib
 import webbrowser
@@ -24,6 +23,7 @@ from rich.table import Table
 from rich.text import Text
 
 from skillevaluator import __version__
+from skillevaluator.evaluation.results import DatasetGenerationError, DatasetGenerationResult
 from skillevaluator.evaluation.tier3_report import render_agent_eval_html_report
 from skillevaluator.provider_config import ProviderConfigurationError, resolve_llm_provider
 from skillevaluator.tier3.case_ids import safe_child, validate_case_id, validate_case_ids
@@ -374,7 +374,7 @@ def create_dataset(
     refine: bool = False,
     from_results: Path | None = None,
     results_dir: Path | None = None,
-) -> None:
+) -> DatasetGenerationResult:
     """Generate a synthetic evaluation dataset using the migrated generator."""
     from skillevaluator.tier3 import generate_dataset
 
@@ -396,12 +396,13 @@ def create_dataset(
     if results_dir:
         argv.extend(["--results-dir", str(results_dir.expanduser().resolve())])
 
-    original = sys.argv[:]
     try:
-        sys.argv = ["skillevaluator create-eval-dataset", *argv]
-        generate_dataset.main()
-    finally:
-        sys.argv = original
+        return generate_dataset.main(argv)
+    except SystemExit as exc:
+        diagnostic = getattr(exc, "diagnostic", None)
+        if isinstance(diagnostic, str) and diagnostic.strip():
+            raise DatasetGenerationError(diagnostic) from exc
+        raise DatasetGenerationError(f"Dataset generation failed with exit code {exc.code}") from exc
 
 
 def init_custom_grader(

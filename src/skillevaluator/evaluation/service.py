@@ -15,8 +15,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+# These lightweight imports intentionally remain available at runtime so API
+# frameworks and callers can resolve the public method annotations.
+from skillevaluator.evaluation.options import DatasetOptions, EvaluationOptions  # noqa: TC001
+from skillevaluator.evaluation.results import DatasetGenerationResult  # noqa: TC001
+
 if TYPE_CHECKING:
-    from skillevaluator.evaluation.options import DatasetOptions, EvaluationOptions
     from skillevaluator.tier3.harbor.progress import ProgressReporter
 
 
@@ -66,11 +70,11 @@ class EvaluationService:
             return f"Tier 3 evaluation execution status is {label}"
         return None
 
-    def create_dataset(self, options: DatasetOptions) -> None:
-        """Create a synthetic evaluation dataset for a skill."""
+    def create_dataset(self, options: DatasetOptions) -> DatasetGenerationResult:
+        """Create or preview a synthetic dataset and return its outcome."""
         from skillevaluator.tier3.commands import create_dataset as _create_dataset
 
-        _create_dataset(options.skill_path, **options.engine_kwargs())
+        return _create_dataset(options.skill_path, **options.engine_kwargs())
 
     def create_autopilot_dataset(self, skill_path: Path, *, use_llm: bool) -> Path:
         """Create one missing eval case for the CLI autopilot workflow."""
