@@ -98,7 +98,10 @@ An `evals/` directory directly owned by a skill package is evaluator-only. Tier
 3 reads datasets, graders, native Harbor tasks, and custom environments from the
 source tree, but does not install those directories from the target or any
 nested, reference, or workspace skill into agent-visible copies. `--copy-repo`
-uses the same filtering and excludes generated result roots. Runtime assets that
+uses the same filtering and excludes generated result roots. Authenticated
+historical result roots remain excluded after the configured output location is
+changed; a present marker that is copied, stale, or cannot be authenticated
+fails staging closed instead of copying that tree. Runtime assets that
 the agent needs should live outside skill-owned `evals/`, or be declared as task
 inputs with `files`.
 

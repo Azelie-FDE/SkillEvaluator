@@ -9,6 +9,8 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -880,6 +882,117 @@ def test_marked_prior_run_does_not_block_declared_results_root(tmp_path: Path) -
     validate_results_root_location(target, results_root)
 
 
+@pytest.mark.parametrize("copy_repo", [False, True])
+@pytest.mark.parametrize("stager_name", ["generated", "native"])
+def test_rotated_generated_output_is_excluded_from_runtime_skill_and_repo(
+    tmp_path: Path,
+    copy_repo: bool,
+    stager_name: str,
+) -> None:
+    repo, target, _, _ = _write_projection_fixture(tmp_path)
+    (target / "evals" / "files" / "selected.txt").write_text("OLD-CASE-SECRET\n", encoding="utf-8")
+    old_output_root = target / "archived-output"
+    old_dataset = old_output_root / "dataset"
+    generate_harbor_tasks(
+        target,
+        old_dataset,
+        repo_context_exclude_paths=(old_output_root,),
+    )
+    assert (old_dataset / "case-001" / "environment" / "input" / "selected.txt").is_file()
+    older_output_root = target / "older-output"
+    older_dataset = older_output_root / "dataset"
+    generate_harbor_tasks(
+        target,
+        older_dataset,
+        repo_context_exclude_paths=(older_output_root,),
+    )
+
+    (target / "evals" / "evals.json").write_text(
+        json.dumps([{"id": "case-001", "question": "Do not use old fixtures.", "files": []}]),
+        encoding="utf-8",
+    )
+    if stager_name == "native":
+        _write_minimal_native_task(target)
+        stager = stage_native_harbor_tasks
+    else:
+        stager = generate_harbor_tasks
+
+    task = stager(target, tmp_path / f"current-{stager_name}-{copy_repo}", copy_repo=copy_repo)[0]
+    environment = task / "environment"
+    for copied_relative in (Path("archived-output") / "dataset", Path("older-output") / "dataset"):
+        assert not (environment / "skills" / target.name / copied_relative).exists()
+        if copy_repo:
+            assert not (environment / "repo" / target.relative_to(repo) / copied_relative).exists()
+    readable = "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore") for path in environment.rglob("*") if path.is_file()
+    )
+    assert "OLD-CASE-SECRET" not in readable
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires the macOS /var root alias")
+def test_rotated_output_is_excluded_through_macos_platform_root_alias() -> None:
+    with tempfile.TemporaryDirectory(prefix="issue29-platform-alias-") as temporary:
+        root = Path(temporary)
+        if root.absolute() == root.resolve():
+            pytest.skip("temporary directory does not use a platform root alias")
+        _, target, _, _ = _write_projection_fixture(root)
+        selected = target / "evals" / "files" / "selected.txt"
+        selected.write_text("PLATFORM-ALIAS-SECRET\n", encoding="utf-8")
+        old_root = target / "archived-output"
+        generate_harbor_tasks(
+            target,
+            old_root / "dataset",
+            repo_context_exclude_paths=(old_root,),
+        )
+        (target / "evals" / "evals.json").write_text(
+            json.dumps([{"id": "case-001", "question": "No old fixtures.", "files": []}]),
+            encoding="utf-8",
+        )
+
+        task = generate_harbor_tasks(target, root / "current", copy_repo=True)[0]
+
+        readable = "\n".join(
+            path.read_text(encoding="utf-8", errors="ignore")
+            for path in (task / "environment").rglob("*")
+            if path.is_file()
+        )
+        assert "PLATFORM-ALIAS-SECRET" not in readable
+
+
+@pytest.mark.parametrize("marker_state", ["copied", "rotated-key"])
+def test_unverifiable_historical_generated_output_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    marker_state: str,
+) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    old_output_root = target / "archived-output"
+    old_dataset = old_output_root / "dataset"
+    generate_harbor_tasks(
+        target,
+        old_dataset,
+        repo_context_exclude_paths=(old_output_root,),
+    )
+
+    if marker_state == "copied":
+        shutil.copytree(old_dataset, target / "copied-output")
+    else:
+        monkeypatch.setenv(
+            "SKILLEVALUATOR_OUTPUT_PROVENANCE_KEY_FILE",
+            str(tmp_path / ".rotated-state" / "output-provenance.key"),
+        )
+
+    (target / "evals" / "evals.json").write_text(
+        json.dumps([{"id": "case-001", "question": "Do not use old fixtures.", "files": []}]),
+        encoding="utf-8",
+    )
+    current = tmp_path / f"current-{marker_state}"
+    with pytest.raises(ValueError, match=r"marker.*(?:invalid|authenticated|verified)"):
+        generate_harbor_tasks(target, current, copy_repo=True)
+
+    assert not current.exists()
+
+
 def test_declared_in_skill_output_recovers_after_partial_generation_failure(tmp_path: Path) -> None:
     _, target, _, _ = _write_projection_fixture(tmp_path)
     (target / "evals" / "evals.json").write_text(
@@ -1294,11 +1407,14 @@ def test_generated_baseline_rejects_renamed_target_manifest_payload(tmp_path: Pa
     [
         "/workspace/.agents/skills",
         "/workspace/.claude/skills",
+        "/workspace/.cline/skills",
         "/workspace/.codex/skills",
+        "/workspace/.config/goose/skills",
         "/workspace/.config/opencode/skills",
         "/workspace/.cursor/skills",
         "/workspace/.gemini/skills",
         "/workspace/.opencode/skills",
+        "/workspace/.qwen/skills",
     ],
 )
 def test_final_projection_clears_authored_project_skill_root(
@@ -1366,6 +1482,10 @@ def test_final_projection_clears_effective_workdir_ancestors_and_home(tmp_path: 
     assert 'BASH_ENV=""' in dockerfile
     assert 'CLAUDE_CODE_DISABLE_POLICY_SKILLS="1"' in dockerfile
     assert "/etc/codex/skills" in dockerfile
+    assert "/tmp/codex-home/skills" in dockerfile
+    assert ".config/goose/skills" in dockerfile
+    assert ".cline/skills" in dockerfile
+    assert ".qwen/skills" in dockerfile
     assert "WORKDIR /opt/task/subdir" in dockerfile[final_projection:]
     assert dockerfile.rindex("current=$(/bin/pwd -P)") > dockerfile.rindex("COPY input/ /workspace/input/")
     task_toml = (task / "task.toml").read_text(encoding="utf-8")
@@ -1390,6 +1510,9 @@ def test_generated_tasks_reject_unsafe_agent_workdir(tmp_path: Path, agent_workd
         "/workspace/repo/subdir",
         "/workspace/skills",
         "/opt/project/.claude/skills/hidden",
+        "/opt/project/.cline/skills/hidden",
+        "/opt/project/.config/goose/skills/hidden",
+        "/opt/project/.qwen/skills/hidden",
     ],
 )
 def test_generated_tasks_reject_workdir_inside_runtime_projection(tmp_path: Path, agent_workdir: str) -> None:
@@ -2278,6 +2401,9 @@ def test_linked_repo_projection_rejects_reserved_workspace_input(
     [
         ("skills/target-skill/SKILL.md", "../../skills/target-skill/SKILL.md"),
         (".claude/skills/hidden/SKILL.md", "../../.claude/skills/hidden/SKILL.md"),
+        (".cline/skills/hidden/SKILL.md", "../../.cline/skills/hidden/SKILL.md"),
+        (".config/goose/skills/hidden/SKILL.md", "../../.config/goose/skills/hidden/SKILL.md"),
+        (".qwen/skills/hidden/SKILL.md", "../../.qwen/skills/hidden/SKILL.md"),
     ],
 )
 def test_linked_repo_cannot_overlay_agent_discovery_roots(

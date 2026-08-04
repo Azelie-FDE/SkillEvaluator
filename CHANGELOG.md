@@ -82,6 +82,9 @@ All notable changes to SkillEvaluator are documented in this file.
   from every staged skill package, including sanitized `--copy-repo` contexts,
   while graders, native tasks, custom
   environments, and declared inputs continue to load from the source dataset.
+  Authenticated historical result trees are also excluded after output rotation,
+  invalid markers fail closed, and late Codex, Cline, Goose, and Qwen
+  skill-discovery roots are reset before agent execution.
 - Public benchmark cards now omit policy profiles, redact absolute host paths,
   and normalize imported internal or retired metadata before publication.
 - Previous-version validation now rejects catalog-wide scalar reuse and removal

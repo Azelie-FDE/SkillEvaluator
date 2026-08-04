@@ -323,13 +323,15 @@ def _find_target_manifest_payload(
     return None
 
 
+def _casefold_contained(candidate: Path, root: Path) -> bool:
+    """Return whether *candidate* is lexically below *root*, ignoring path casing."""
+    candidate_parts = tuple(part.casefold() for part in candidate.parts)
+    root_parts = tuple(part.casefold() for part in root.parts)
+    return len(candidate_parts) >= len(root_parts) and candidate_parts[: len(root_parts)] == root_parts
+
+
 def _path_is_excluded(path: Path, excluded_roots: Sequence[Path]) -> bool:
     """Check lexical and resolved containment using cross-platform path casing."""
-
-    def _casefold_contained(candidate: Path, root: Path) -> bool:
-        candidate_parts = tuple(part.casefold() for part in candidate.parts)
-        root_parts = tuple(part.casefold() for part in root.parts)
-        return len(candidate_parts) >= len(root_parts) and candidate_parts[: len(root_parts)] == root_parts
 
     for excluded_root in excluded_roots:
         if _casefold_contained(path.absolute(), excluded_root.absolute()):
@@ -378,18 +380,75 @@ def _path_is_canonically_contained(path: Path, root: Path) -> bool:
     return True
 
 
+def _authenticated_generated_output_ancestor(
+    path: Path,
+    root: Path,
+    authenticated_roots: set[Path] | None = None,
+) -> Path | None:
+    """Find an authenticated generated-output boundary or reject an unsafe marker."""
+    lexical_path = path.absolute()
+    for authenticated_root in authenticated_roots or ():
+        if _casefold_contained(lexical_path, authenticated_root.absolute()):
+            return authenticated_root
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        current = path.parent
+    except OSError as exc:
+        raise ValueError(f"Cannot inspect potential generated output path: {path}") from exc
+    else:
+        current = (
+            path if stat.S_ISDIR(metadata.st_mode) and not _path_is_link_or_reparse(path, metadata) else path.parent
+        )
+
+    lexical_root = root.absolute()
+    try:
+        resolved_root = root.resolve()
+    except (OSError, RuntimeError):
+        resolved_root = lexical_root
+
+    def _inside_root(candidate: Path) -> bool:
+        absolute_candidate = candidate.absolute()
+        if _casefold_contained(absolute_candidate, lexical_root) or _casefold_contained(
+            absolute_candidate, resolved_root
+        ):
+            return True
+        try:
+            return _casefold_contained(candidate.resolve(), resolved_root)
+        except (OSError, RuntimeError):
+            return False
+
+    while _inside_root(current):
+        marker = current / GENERATED_OUTPUT_MARKER
+        if os.path.lexists(marker):
+            if _path_is_link_or_reparse(current):
+                raise ValueError(f"Generated output marker is under an unsafe linked directory: {current}")
+            try:
+                authenticated = is_generated_output_root(current)
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"Generated output marker is invalid or cannot be authenticated: {current}") from exc
+            if not authenticated:
+                raise ValueError(f"Generated output marker is invalid or cannot be authenticated: {current}")
+            if authenticated_roots is not None:
+                authenticated_roots.add(current)
+            return current
+        if _paths_equivalent(current, root):
+            break
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return None
+
+
 def _inside_declared_generated_dataset(path: Path, declared_roots: Sequence[Path]) -> bool:
     """Return whether *path* is below a staged dataset marker in a declared output root."""
     for declared_root in declared_roots:
         if not _path_is_excluded(path, (declared_root,)):
             continue
-        current = path if path.is_dir() else path.parent
-        while _path_is_excluded(current, (declared_root,)):
-            if is_generated_output_root(current):
-                return True
-            if _paths_equivalent(current, declared_root):
-                break
-            current = current.parent
+        if _authenticated_generated_output_ancestor(path, declared_root) is not None:
+            return True
     return False
 
 
@@ -535,6 +594,16 @@ def _runtime_skill_copy_ignore(skill_root: Path, excluded_roots: Sequence[Path] 
     """Build a root-aware ignore callback for an agent-visible skill copy."""
     resolved_root = skill_root.resolve()
     excluded_roots = _skill_scoped_excluded_roots(skill_root, excluded_roots)
+    authenticated_output_roots: set[Path] = set()
+    if (
+        _authenticated_generated_output_ancestor(
+            skill_root,
+            skill_root,
+            authenticated_output_roots,
+        )
+        is not None
+    ):
+        raise ValueError(f"Runtime skill source must not be a generated output root: {skill_root}")
 
     def _ignore(directory: str, contents: list[str]) -> list[str]:
         current = Path(directory)
@@ -543,7 +612,16 @@ def _runtime_skill_copy_ignore(skill_root: Path, excluded_roots: Sequence[Path] 
             ignored.update(name for name in contents if name.casefold() == "evals")
         for name in contents:
             candidate = current / name
-            if _is_skill_evals_path(candidate, skill_root) or _path_is_excluded(candidate, excluded_roots):
+            if (
+                _is_skill_evals_path(candidate, skill_root)
+                or _path_is_excluded(candidate, excluded_roots)
+                or _authenticated_generated_output_ancestor(
+                    candidate,
+                    skill_root,
+                    authenticated_output_roots,
+                )
+                is not None
+            ):
                 ignored.add(name)
         return sorted(ignored)
 
@@ -735,17 +813,27 @@ def _staged_relative_link_path(skill_name: str, raw_target: str) -> Path | None:
         "skills",
         ".agents",
         ".claude",
+        ".cline",
         ".codex",
         ".config",
         ".cursor",
         ".gemini",
         ".opencode",
+        ".qwen",
     }:
         return None
     return rel
 
 
-def _repo_context_ignore_file(path: Path, root: Path) -> bool:
+def _repo_context_ignore_file(
+    path: Path,
+    root: Path,
+    authenticated_output_roots: set[Path] | None = None,
+) -> bool:
+    if authenticated_output_roots is None:
+        authenticated_output_roots = set()
+    if _authenticated_generated_output_ancestor(path, root, authenticated_output_roots) is not None:
+        return True
     try:
         path.resolve().relative_to(root.resolve())
     except ValueError:
@@ -821,11 +909,19 @@ def _git_context_files(root: Path) -> list[Path]:
     return [root / line for line in result.stdout.splitlines() if line.strip()]
 
 
-def _iter_repo_context_files(root: Path) -> list[Path]:
+def _iter_repo_context_files(root: Path, authenticated_output_roots: set[Path]) -> list[Path]:
     git_files = _git_context_files(root)
     if git_files:
-        return sorted(path for path in git_files if path.is_file())
-    return sorted(path for path in root.rglob("*") if path.is_file() and not _repo_context_ignore_file(path, root))
+        return sorted(
+            path
+            for path in git_files
+            if path.is_file() and not _repo_context_ignore_file(path, root, authenticated_output_roots)
+        )
+    return sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file() and not _repo_context_ignore_file(path, root, authenticated_output_roots)
+    )
 
 
 def _stage_repo_context(
@@ -843,6 +939,16 @@ def _stage_repo_context(
     source_skill_path = source_skill_path.resolve()
     skill_md = _skill_manifest(source_skill_path)
     repo_root = _repo_context_root(source_skill_path)
+    authenticated_output_roots: set[Path] = set()
+    if (
+        _authenticated_generated_output_ancestor(
+            repo_root,
+            repo_root,
+            authenticated_output_roots,
+        )
+        is not None
+    ):
+        raise ValueError(f"Repo context root must not be a generated output root: {repo_root}")
 
     resolved_excluded_roots: list[Path] = []
     for excluded_root in excluded_roots:
@@ -863,10 +969,10 @@ def _stage_repo_context(
     staged: list[dict[str, str]] = []
 
     if mode == "full":
-        for src in _iter_repo_context_files(repo_root):
+        for src in _iter_repo_context_files(repo_root, authenticated_output_roots):
             if _is_excluded_output(src):
                 continue
-            if _repo_context_ignore_file(src, repo_root):
+            if _repo_context_ignore_file(src, repo_root, authenticated_output_roots):
                 continue
             if exclude_source_skill and _is_relative_to(src, source_skill_path):
                 continue
@@ -901,8 +1007,14 @@ def _stage_repo_context(
         if _is_excluded_output(target_path) or _path_is_excluded(lexical_target_path, resolved_excluded_roots):
             logger.warning("Skipping SKILL.md link into generated output: %s", raw_target)
             continue
-        if _repo_context_ignore_file(lexical_target_path, repo_root) or _repo_context_ignore_file(
-            target_path, repo_root
+        if _repo_context_ignore_file(
+            lexical_target_path,
+            repo_root,
+            authenticated_output_roots,
+        ) or _repo_context_ignore_file(
+            target_path,
+            repo_root,
+            authenticated_output_roots,
         ):
             logger.warning("Skipping ignored SKILL.md repo link: %s", raw_target)
             continue
@@ -2717,22 +2829,29 @@ _AGENT_SKILL_PATHS = [
 ]
 _RUNTIME_SKILL_DIRS = (
     "/etc/codex/skills",
+    "/tmp/codex-home/skills",
     "/workspace/skills",
     "/workspace/.agents/skills",
     "/workspace/.claude/commands",
     "/workspace/.claude/skills",
+    "/workspace/.cline/skills",
     "/workspace/.codex/skills",
+    "/workspace/.config/goose/skills",
     "/workspace/.config/opencode/skills",
     "/workspace/.cursor/skills",
     "/workspace/.gemini/skills",
     "/workspace/.gemini/extensions",
     "/workspace/.opencode/skills",
+    "/workspace/.qwen/skills",
     "/root/.claude/commands",
     "/root/.claude/skills",
+    "/root/.cline/skills",
     "/root/.agents/skills",
     "/root/.codex/skills",
+    "/root/.config/goose/skills",
     "/root/.config/opencode/skills",
     "/root/.gemini/extensions",
+    "/root/.qwen/skills",
     "/logs/agent/sessions/skills",
     "/tmp/agent-home/sessions/skills",
 )
@@ -2740,12 +2859,15 @@ _PROJECT_SKILL_RELATIVE_DIRS = (
     ".agents/skills",
     ".claude/commands",
     ".claude/skills",
+    ".cline/skills",
     ".codex/skills",
+    ".config/goose/skills",
     ".config/opencode/skills",
     ".cursor/skills",
     ".gemini/skills",
     ".gemini/extensions",
     ".opencode/skills",
+    ".qwen/skills",
 )
 _RUNTIME_DISCOVERY_ENV_NAMES = frozenset(
     {
@@ -2842,11 +2964,12 @@ _RUNTIME_PROJECTION_OVERLAP_PREFLIGHT = (
     "/workspace/input|/workspace/input/*|/workspace/repo|/workspace/repo/*|"
     "/workspace/skills|/workspace/skills/*|"
     "*/.agents/skills|*/.agents/skills/*|*/.claude/commands|*/.claude/commands/*|"
-    "*/.claude/skills|*/.claude/skills/*|"
-    "*/.codex/skills|*/.codex/skills/*|*/.config/opencode/skills|*/.config/opencode/skills/*|"
+    "*/.claude/skills|*/.claude/skills/*|*/.cline/skills|*/.cline/skills/*|"
+    "*/.codex/skills|*/.codex/skills/*|*/.config/goose/skills|*/.config/goose/skills/*|"
+    "*/.config/opencode/skills|*/.config/opencode/skills/*|"
     "*/.cursor/skills|*/.cursor/skills/*|*/.gemini/skills|*/.gemini/skills/*|"
     "*/.gemini/extensions|*/.gemini/extensions/*|"
-    "*/.opencode/skills|*/.opencode/skills/*) "
+    "*/.opencode/skills|*/.opencode/skills/*|*/.qwen/skills|*/.qwen/skills/*) "
     "echo 'SkillEvaluator agent workdir/home overlaps an evaluator-controlled runtime projection' >&2; "
     'exit 78;; esac; }; check_control_path() { value=$1; check_path "$value"; '
     'if [ -d "$value" ]; then canonical=$(CDPATH= cd -P -- "$value" 2>/dev/null && /bin/pwd -P) || exit 78; '
@@ -2899,11 +3022,14 @@ def _validated_agent_workdir(agent_workdir: str | None) -> str | None:
     discovery_parts = (
         (".agents", "skills"),
         (".claude", "skills"),
+        (".cline", "skills"),
         (".codex", "skills"),
+        (".config", "goose", "skills"),
         (".config", "opencode", "skills"),
         (".cursor", "skills"),
         (".gemini", "skills"),
         (".opencode", "skills"),
+        (".qwen", "skills"),
     )
     if any(
         parts[index : index + len(candidate)] == candidate
