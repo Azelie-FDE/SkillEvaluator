@@ -60,7 +60,7 @@ DEFAULT_CHECKS = (
     "lint",
 )
 # Opt-in checks: recognized by ``--checks`` but excluded from the default run.
-# Mirrors Skill Evaluator, where the semantic-version bump check and the pip-audit /
+# Mirrors SkillEvaluator, where the semantic-version bump check and the pip-audit /
 # Safety dependency CVE audit (shipped as the standalone ``dependency-audit``
 # command) were opt-in rather than part of the default validate pipeline.
 OPTIONAL_CHECKS = ("dependency",)
@@ -158,7 +158,7 @@ def run_validation(
     plugins). When *fail_fast* is set, the
     run stops after the first failing check. *continue_on_failure* overrides
     *fail_fast* and also keeps batch folder validation scanning every skill past
-    a CRITICAL finding (parity with Skill Evaluator ``--continue-on-failure``).
+    a CRITICAL finding (parity with SkillEvaluator ``--continue-on-failure``).
 
     When *policy* is provided, the schema validator applies the policy's
     audience-aware author rules; finalized severities for all validators are
@@ -343,7 +343,7 @@ def emit_reports(
     *target_path* (the content's repo URL or path) and *content_label* are
     forwarded to the HTML reporter so the report shows a Target link and the
     correct content noun. HTML navigation tabs are derived from the tiers
-    present in *results*, matching Skill Evaluator's combined report.
+    present in *results*, matching SkillEvaluator's combined report.
     """
     if policy is not None:
         apply_policy(results, policy)

@@ -232,14 +232,46 @@ def test_public_docs_declare_support_and_security_sections() -> None:
     assert "Support level: **Experimental**" in support
 
 
-def test_public_quickstart_is_one_install_command_without_a_fixture_clone() -> None:
+def test_public_readme_is_a_concise_docs_landing_page() -> None:
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-    quickstart = readme.split("\n## Quickstart\n", 1)[1].split("\n## Tier 1:", 1)[0]
+    quickstart = readme.partition("\n## Quickstart\n")[2].partition("\n## LLM provider setup\n")[0]
+    deeper_evaluations = readme.partition("\n## Run deeper evaluations\n")[2].partition("\n## Documentation\n")[0]
+    normalized = " ".join(readme.split())
 
-    install = 'uv tool install --python 3.13 "skillevaluator[all] @ git+https://github.com/NVIDIA/SkillEvaluator.git"'
-    assert install in quickstart
-    assert "skillevaluator quality-check ./my-skill" in quickstart
-    assert "git clone" not in quickstart
+    positioning = (
+        "SkillEvaluator is an open-source, multi-tier framework for evaluating AI agent artifacts, "
+        "starting with agent skills: deterministic quality gates, semantic overlap detection, "
+        "synthetic eval dataset generation, and live agent evaluation."
+    )
+    assert positioning in normalized
+    assert "https://docs.nvidia.com/skills/skillevaluator/" in readme
+    assert "https://docs.nvidia.com/skills/" in readme
+    assert "https://github.com/NVIDIA/SkillSpector" in readme
+    assert "\n## Three-tier overview\n" not in readme
+    assert "\n## Quickstart\n" in readme
+    assert "skillevaluator[all] @ git+https://github.com/NVIDIA/SkillEvaluator.git" in readme
+    assert (
+        "skillevaluator validate ./my-skill \\\n  --checks schema,pii,license,quality,unicode,lint \\\n  --no-dedup"
+    ) in quickstart
+    assert "skillevaluator quality-check ./my-skill" not in quickstart
+    assert "SKILL_EVAL_LLM_PROVIDER=nv_build" in readme
+    assert "NVIDIA_API_KEY='nvapi-...'" in readme
+    assert "skillevaluator context-optimization-check ./my-skill" in readme
+    assert (
+        "skillevaluator validate ./my-skill \\\n  --full \\\n  --agents codex \\\n  --env-mode docker"
+    ) in deeper_evaluations
+    assert "Semgrep, SkillSpector, and Gitleaks" in deeper_evaluations
+    assert "enables autopilot" in deeper_evaluations
+    assert "evals/evals.json" in deeper_evaluations
+    assert "only for trusted skills and workspaces" in deeper_evaluations
+    assert "skillevaluator create-eval-dataset ./my-skill --full" in deeper_evaluations
+    assert "skillevaluator tier3 evaluate ./my-skill" not in deeper_evaluations
+    assert "--n-attempts 1" not in deeper_evaluations
+    assert "tier3-live-evaluation#plan-for-cost" in readme
+    assert "\n## Tier 1:" not in readme
+    assert "Skill Evaluator" not in readme
+    assert "Skillevaluator" not in readme
+    assert len(readme.split()) <= 750
 
 
 def test_release_metadata_is_public_facing_and_version_consistent() -> None:
@@ -479,9 +511,9 @@ def test_public_docs_show_external_nvidia_build_harness_paths_only() -> None:
     assert "--agent-model codex=nvidia/nemotron-3-super-120b-a12b" in public_docs
     assert "--agent-model claude-code=nvidia/nemotron-3-super-120b-a12b" in public_docs
     assert "--agent-model opencode=nvidia/meta/llama-3.1-8b-instruct" in public_docs
-    assert "skillevaluator evaluate ./my-skill --agents opencode --env-mode docker\n" in tier3
-    assert "skillevaluator evaluate ./my-skill --agents codex --env-mode docker\n" in tier3
-    assert "skillevaluator evaluate ./my-skill --agents claude-code --env-mode docker\n" in tier3
+    assert "skillevaluator tier3 evaluate ./my-skill --agents opencode --env-mode docker\n" in tier3
+    assert "skillevaluator tier3 evaluate ./my-skill --agents codex --env-mode docker\n" in tier3
+    assert "skillevaluator tier3 evaluate ./my-skill --agents claude-code --env-mode docker\n" in tier3
     assert "never changes models silently" in public_docs
     assert "direct OpenCode" in public_docs
     assert "Docker or local compatibility bridge" in public_docs
@@ -499,3 +531,107 @@ def test_ci_installs_the_security_wheel_on_rhel8() -> None:
     assert 'Version(version("pip-audit")) >= Version("2.10.0")' in rhel8_job
     assert ".rhel8-security-venv/bin/bandit --version" in rhel8_job
     assert ".rhel8-security-venv/bin/semgrep --version" not in rhel8_job
+
+
+def test_fern_docs_use_the_verified_skills_basepath_and_launch_positioning() -> None:
+    fern = (REPO_ROOT / "fern" / "docs.yml").read_text(encoding="utf-8")
+    overview = (REPO_ROOT / "docs" / "index.mdx").read_text(encoding="utf-8")
+    normalized_overview = " ".join(overview.split())
+
+    positioning = (
+        "SkillEvaluator is an open-source, multi-tier framework for evaluating AI agent artifacts, "
+        "starting with agent skills: deterministic quality gates, semantic overlap detection, "
+        "synthetic eval dataset generation, and live agent evaluation."
+    )
+    assert "url: nvidia-skillevaluator.docs.buildwithfern.com/skills/skillevaluator" in fern
+    assert "custom-domain: docs.nvidia.com/skills/skillevaluator" in fern
+    assert "docs.nvidia.com/skillevaluator" not in fern
+    assert positioning in normalized_overview
+    assert "https://docs.nvidia.com/skills/" in overview
+    assert "https://github.com/NVIDIA/SkillSpector" in overview
+
+
+def test_tier3_docs_explain_cost_controls_and_local_mode_tradeoffs() -> None:
+    tier3 = (REPO_ROOT / "docs" / "tier3-live-evaluation.mdx").read_text(encoding="utf-8")
+    normalized = " ".join(tier3.split())
+
+    assert "eval cases \u00d7 agents \u00d7 attempts \u00d7 arms" in normalized
+    assert "--skip-baseline" in tier3
+    assert "cannot produce Skill Lift" in normalized
+    assert "--n-concurrent" in tier3
+    assert "--max-agents" in tier3
+    assert "do not reduce the total planned trials" in tier3
+    assert "--env-mode local" in tier3
+    assert "does **not** automatically eliminate model charges" in tier3
+    assert "weaker isolation than Docker" in tier3
+
+
+def test_launch_docs_address_scanner_and_naming_ambiguities() -> None:
+    quickstart = (REPO_ROOT / "docs" / "quickstart.mdx").read_text(encoding="utf-8")
+    ci = (REPO_ROOT / "docs" / "ci-integration.mdx").read_text(encoding="utf-8")
+    environment = (REPO_ROOT / "docs" / "environment-variables.mdx").read_text(encoding="utf-8")
+    normalized_quickstart = " ".join(quickstart.split())
+
+    assert "brew install semgrep gitleaks" in quickstart
+    assert "uv tool install git+https://github.com/NVIDIA/SkillSpector.git" in quickstart
+    assert "Semgrep, SkillSpector, and Gitleaks" in quickstart
+    assert "missing scanner evidence leaves the result `INCOMPLETE` and exits `1`" in normalized_quickstart
+    assert "most often Gitleaks" not in ci
+    assert "Semgrep, SkillSpector, and Gitleaks are all separate executables" in " ".join(ci.split())
+    assert "`SKILL_EVAL_*` covers provider and model configuration" in " ".join(environment.split())
+    assert "`SKILLEVALUATOR_*` covers product-level validation" in " ".join(environment.split())
+    assert "are not interchangeable" in environment
+
+
+def test_harbor_atif_and_agent_eval_alias_are_defined() -> None:
+    harbor_url = "https://github.com/harbor-framework/harbor"
+    harbor_pages = [
+        REPO_ROOT / "README.md",
+        REPO_ROOT / "docs" / "agents-and-sandboxes.mdx",
+        REPO_ROOT / "docs" / "cli-reference.mdx",
+        REPO_ROOT / "docs" / "configuration.mdx",
+        REPO_ROOT / "docs" / "custom-graders.mdx",
+        REPO_ROOT / "docs" / "developer-guide.mdx",
+        REPO_ROOT / "docs" / "environment-variables.mdx",
+        REPO_ROOT / "docs" / "eval-datasets.mdx",
+        REPO_ROOT / "docs" / "installation.mdx",
+        REPO_ROOT / "docs" / "reports.mdx",
+        REPO_ROOT / "docs" / "tier3-live-evaluation.mdx",
+    ]
+
+    for path in harbor_pages:
+        content = path.read_text(encoding="utf-8")
+        assert f"[Harbor]({harbor_url})" in content, path
+        assert "open-source agent evaluation framework" in " ".join(content.split()), path
+
+    for name in ("custom-graders.mdx", "environment-variables.mdx"):
+        content = (REPO_ROOT / "docs" / name).read_text(encoding="utf-8")
+        assert "Agent Trajectory Interchange Format (ATIF)" in content
+
+    for name in ("tier1-validation.mdx", "ci-integration.mdx", "cli-reference.mdx", "tier3-live-evaluation.mdx"):
+        content = (REPO_ROOT / "docs" / name).read_text(encoding="utf-8")
+        assert "--agent-eval" in content
+        assert "not currently deprecated" in " ".join(content.split())
+
+
+def test_public_product_branding_uses_the_canonical_name() -> None:
+    paths = [
+        REPO_ROOT / "README.md",
+        REPO_ROOT / "CHANGELOG.md",
+        REPO_ROOT / "CITATION.cff",
+        REPO_ROOT / "CODE_OF_CONDUCT.md",
+        REPO_ROOT / "SECURITY.md",
+        REPO_ROOT / "SUPPORT.md",
+        REPO_ROOT / "Dockerfile",
+        REPO_ROOT / "sonar-project.properties",
+        *(REPO_ROOT / ".github" / "ISSUE_TEMPLATE").glob("*.yml"),
+        *(REPO_ROOT / "docs").rglob("*.mdx"),
+        *(REPO_ROOT / "src" / "skillevaluator").rglob("*.py"),
+        *(REPO_ROOT / "src" / "skillevaluator").rglob("*.j2"),
+        *(REPO_ROOT / "src" / "skillevaluator").rglob("SKILL.md"),
+    ]
+
+    for path in paths:
+        content = path.read_text(encoding="utf-8")
+        assert "Skill Evaluator" not in content, path
+        assert "Skillevaluator" not in content, path
