@@ -74,6 +74,10 @@ All notable changes to SkillEvaluator are documented in this file.
 
 ### Fixed
 
+- Tier 3 generated tasks now stage only an entry's declared `files`, preventing
+  undeclared fixtures from the shared `evals/files/` directory from appearing
+  in that task's `/workspace/input/`, while preserving copy-all behavior for
+  legacy entries that omit the field.
 - Public benchmark cards now omit policy profiles, redact absolute host paths,
   and normalize imported internal or retired metadata before publication.
 - Previous-version validation now rejects catalog-wide scalar reuse and removal

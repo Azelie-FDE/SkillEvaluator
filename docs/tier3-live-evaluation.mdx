@@ -88,6 +88,12 @@ receive, an `expected_output`, and optional `assertions` the grader checks.
 Edit freely — the generated cases are a starting point, and the run is only as
 good as its dataset.
 
+Each eval entry can declare task inputs with a `files` string or list. Paths are
+relative to `evals/` (for example, `"files/case-001/input.txt"`) and only those
+declared paths are staged into that task's `/workspace/input/`. An explicit
+empty list or `null` stages no task input. For backward compatibility, omitting
+the `files` field stages the entire shared `evals/files/` directory.
+
 ### Run the comparison
 
 ```bash title="With-skill vs. without-skill in Docker"

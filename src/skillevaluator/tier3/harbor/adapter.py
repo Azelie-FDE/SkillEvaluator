@@ -1469,9 +1469,12 @@ def _stage_task_inputs(
     evals_dir: Path,
 ) -> bool:
     input_dir = env_dir / "input"
-    if input_files_dir and input_files_dir.exists():
-        if input_dir.exists():
-            shutil.rmtree(input_dir)
+    if os.path.lexists(input_dir) and (input_dir.is_symlink() or not input_dir.is_dir()):
+        input_dir.unlink()
+    elif input_dir.exists():
+        shutil.rmtree(input_dir)
+
+    if "files" not in entry and input_files_dir and input_files_dir.exists():
         copytree_secure(input_files_dir, input_dir, dirs_exist_ok=True)
 
     for ref in _entry_file_refs(entry):
@@ -1704,7 +1707,7 @@ def _write_dockerfile(
     )
     dockerfile_lines.extend(agent_config_lines)
 
-    if input_files_dir and input_files_dir.exists():
+    if include_input:
         dockerfile_lines.append("COPY input/ /workspace/input/")
     if include_repo:
         dockerfile_lines.append("COPY repo/ /workspace/repo/")
