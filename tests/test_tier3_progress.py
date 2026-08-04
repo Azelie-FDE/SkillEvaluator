@@ -10,6 +10,7 @@ import io
 import json
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -686,6 +687,40 @@ def test_default_run_cleans_transient_harbor_artifacts(
     persisted = json.loads(Path(result["result_path"]).read_text(encoding="utf-8"))
     assert persisted["harbor_jobs_retained"] is False
     assert persisted["run_config"]["harbor"]["jobs_retained"] is False
+
+
+def test_runner_rejects_preexisting_run_symlink_before_child_creation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner, skill = _stub_runner(monkeypatch, tmp_path)
+    timestamp = "20260804_123456"
+    fixed_now = SimpleNamespace(strftime=lambda _format: timestamp)
+    monkeypatch.setattr(runner, "datetime", SimpleNamespace(now=lambda _timezone: fixed_now))
+    monkeypatch.setattr(runner.os, "getpid", lambda: 12345)
+    monkeypatch.setattr(runner, "uuid4", lambda: SimpleNamespace(hex="abcdef012345"))
+    run_id = f"{timestamp}_12345_abcdef012345"
+    results_root = tmp_path / "results"
+    victim = tmp_path / "victim"
+    results_root.mkdir()
+    victim.mkdir()
+    (results_root / run_id).symlink_to(victim, target_is_directory=True)
+
+    result = runner.run_harbor_eval(skill, ["codex"], output_dir=results_root)
+
+    assert "unique Tier 3 run directory" in str(result["error"][0])
+    assert not (victim / "_harbor-jobs").exists()
+
+
+def test_runner_reserves_unique_run_directories_concurrently(tmp_path: Path) -> None:
+    from skillevaluator.tier3.harbor import runner
+
+    results_root = tmp_path / "results"
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        run_dirs = list(executor.map(lambda _index: runner._reserve_run_dir(results_root, "20260804_123456"), range(8)))
+
+    assert len(set(run_dirs)) == 8
+    assert all((run_dir / ".skillevaluator-generated-output").is_file() for run_dir in run_dirs)
 
 
 def test_runner_persists_compact_feedback_to_result_json(

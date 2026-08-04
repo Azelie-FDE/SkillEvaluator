@@ -227,10 +227,10 @@ def test_generated_task_rebases_custom_dockerfile_content(tmp_path: Path) -> Non
     )[0]
 
     dockerfile = (task / "environment" / "Dockerfile").read_text(encoding="utf-8")
-    assert dockerfile.startswith(
-        "FROM registry.example/eval-base:verified\n# SkillEvaluator: original base was FROM python:3.11-slim\n"
+    assert dockerfile.startswith("FROM registry.example/eval-base:verified\n")
+    assert dockerfile.index("RUN echo generated-custom-layer\n") < dockerfile.index(
+        "# SkillEvaluator: original base was FROM python:3.11-slim\n"
     )
-    assert "RUN echo generated-custom-layer\n" in dockerfile
 
 
 def test_native_task_rebases_custom_dockerfile_content(tmp_path: Path) -> None:
@@ -254,24 +254,22 @@ def test_native_task_rebases_custom_dockerfile_content(tmp_path: Path) -> None:
     )[0]
 
     dockerfile = (task / "environment" / "Dockerfile").read_text(encoding="utf-8")
-    assert dockerfile.startswith(
-        "FROM registry.example/eval-base:verified\n# SkillEvaluator: original base was FROM ubuntu:24.04\n"
+    assert dockerfile.startswith("FROM registry.example/eval-base:verified\n")
+    assert dockerfile.index("RUN echo native-custom-layer\n") < dockerfile.index(
+        "# SkillEvaluator: original base was FROM ubuntu:24.04\n"
     )
-    assert "RUN echo native-custom-layer\n" in dockerfile
 
 
-def test_rebase_custom_dockerfile_content_without_from_is_unchanged() -> None:
+def test_rebase_custom_dockerfile_content_without_from_fails_closed() -> None:
     content = "# comment only\nRUN echo unchanged\n"
 
-    assert (
+    with pytest.raises(ValueError, match="exactly one FROM instruction"):
         _rebase_custom_dockerfile_content(
             content,
             "registry.example/eval-base:verified",
             agent_config_lines=[],
             include_input=False,
         )
-        is None
-    )
 
 
 @pytest.mark.parametrize("candidate", _GRADER_CANDIDATES, ids=str)

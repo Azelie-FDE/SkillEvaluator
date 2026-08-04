@@ -17,7 +17,7 @@ import time
 import tomllib
 from collections.abc import Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import wraps
@@ -25,6 +25,7 @@ from pathlib import Path
 from queue import Empty, SimpleQueue
 from types import MappingProxyType
 from typing import Any
+from uuid import uuid4
 
 from skillevaluator.evaluation.tier3_report import render_agent_eval_html_report
 from skillevaluator.provider_config import ProviderConfig, ProviderConfigurationError, resolve_llm_provider
@@ -34,6 +35,8 @@ from skillevaluator.tier3.harbor.adapter import (
     find_evals_file,
     generate_harbor_tasks,
     stage_native_harbor_tasks,
+    validate_output_provenance_key_location,
+    validate_results_root_location,
 )
 from skillevaluator.tier3.harbor.artifact_retention import HarborArtifactLifecycle, RetentionOutcome
 from skillevaluator.tier3.harbor.collector import collect_harbor_results, validate_harbor_job_result
@@ -49,6 +52,7 @@ from skillevaluator.tier3.harbor.progress import (
 )
 from skillevaluator.tier3.harbor.secure_copy import copytree_secure
 from skillevaluator.tier3.harbor.secure_docker_environment import SECURE_DOCKER_ENV_IMPORT_PATH
+from skillevaluator.tier3.output_provenance import mark_generated_output_root
 from skillevaluator.tier3_environments import DEFAULT_ENV_MODE, ENV_MODE_LOCAL, HARBOR_ENV_MODES
 
 logger = logging.getLogger(__name__)
@@ -56,6 +60,27 @@ logger = logging.getLogger(__name__)
 _NVIDIA_BUILD_FILE_SENTINEL = "skillevaluator-file-backed-nvidia-key"
 _NVIDIA_BUILD_KEY_FILE_ENV = "SKILLEVALUATOR_NVIDIA_API_KEY_FILE"
 _NVIDIA_BUILD_BRIDGED_AGENT_DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b"
+
+
+def _reserve_run_dir(results_root: Path, timestamp: str) -> Path:
+    """Atomically reserve and authenticate a unique run directory."""
+    results_root.mkdir(parents=True, exist_ok=True)
+    for _ in range(100):
+        run_id = f"{timestamp}_{os.getpid()}_{uuid4().hex[:12]}"
+        run_dir = results_root / run_id
+        try:
+            run_dir.mkdir()
+        except FileExistsError:
+            continue
+        try:
+            mark_generated_output_root(run_dir)
+        except Exception:
+            with suppress(OSError):
+                run_dir.rmdir()
+            raise
+        return run_dir
+    raise RuntimeError("Could not reserve a unique Tier 3 run directory")
+
 
 _HARBOR_BASE_ENV_VARS = frozenset(
     {
@@ -145,10 +170,14 @@ _RUNTIME_ENV_HOST_CONTROL_NAMES = (
             "BASHOPTS",
             "BASH_ENV",
             "CDPATH",
+            "CLAUDE_CODE_DISABLE_POLICY_SKILLS",
+            "CLAUDE_CONFIG_DIR",
             "CLASSPATH",
             "COMSPEC",
+            "CODEX_HOME",
             "ENV",
             "GCONV_PATH",
+            "GEMINI_CLI_HOME",
             "HOME",
             "HOSTALIASES",
             "HTTPS_PROXY",
@@ -156,8 +185,12 @@ _RUNTIME_ENV_HOST_CONTROL_NAMES = (
             "IFS",
             "JAVA_TOOL_OPTIONS",
             "LOCPATH",
+            "LUA_CPATH",
+            "LUA_INIT",
+            "LUA_PATH",
             "NLSPATH",
             "NO_PROXY",
+            "OPENCODE_CONFIG_DIR",
             "PATHEXT",
             "PATH",
             "PERL5LIB",
@@ -165,6 +198,7 @@ _RUNTIME_ENV_HOST_CONTROL_NAMES = (
             "REQUESTS_CA_BUNDLE",
             "RES_OPTIONS",
             "RUBYOPT",
+            "RUBYLIB",
             "SHELLOPTS",
             "SSLKEYLOGFILE",
             "SSL_CERT_DIR",
@@ -176,7 +210,9 @@ _RUNTIME_ENV_HOST_CONTROL_NAMES = (
             "TMPDIR",
             "USERPROFILE",
             "WINDIR",
+            "XDG_CONFIG_HOME",
             "XDG_RUNTIME_DIR",
+            "ZDOTDIR",
             "_JAVA_OPTIONS",
         }
     )
@@ -184,6 +220,7 @@ _RUNTIME_ENV_HOST_CONTROL_NAMES = (
     | frozenset().union(*_HARBOR_ENV_MODE_VARS.values())
 )
 _RUNTIME_ENV_HOST_CONTROL_PREFIXES = (
+    "BASH_FUNC_",
     "COMPOSE_",
     "DOCKER_",
     "DYLD_",
@@ -1716,9 +1753,30 @@ def _run_harbor_eval_impl(
         reporter.emit(ProgressEvent(stage="with-skill-tasks", state="failed", detail="invalid task source"))
         return {"error": ["harbor.task_source must be auto, evals_json, or native_harbor"]}
 
-    root = output_dir or (skill_path / "evals" / "results")
-    run_id = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
-    run_dir = root / run_id
+    root = Path(output_dir) if output_dir is not None else skill_path / "evals" / "results"
+    try:
+        validate_output_provenance_key_location(
+            skill_path,
+            root,
+            reference_skills_dir=reference_skills_dir,
+            workspace_skill_paths=workspace_skills,
+        )
+        validate_results_root_location(
+            skill_path,
+            root,
+            reference_skills_dir=reference_skills_dir,
+            workspace_skill_paths=workspace_skills,
+        )
+    except ValueError as exc:
+        reporter.emit(ProgressEvent(stage="with-skill-tasks", state="failed", detail=str(exc)))
+        return {"error": [str(exc)]}
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    try:
+        run_dir = _reserve_run_dir(root, timestamp)
+    except (OSError, RuntimeError, ValueError) as exc:
+        reporter.emit(ProgressEvent(stage="with-skill-tasks", state="failed", detail=str(exc)))
+        return {"error": [str(exc)]}
+    run_id = run_dir.name
     jobs_dir = run_dir / "_harbor-jobs"
     tasks_dir = run_dir / "_harbor-tasks"
     result_path = run_dir / "result.json"
@@ -1753,6 +1811,7 @@ def _run_harbor_eval_impl(
             skill_path.resolve(),
             reference_skills_dir,
             workspace_skill_paths=workspace_skills,
+            excluded_roots=(root,),
             force_rebuild=base_image_mode == "rebuild",
         )
         if base_image:
@@ -1792,6 +1851,7 @@ def _run_harbor_eval_impl(
                 base_image=base_image,
                 custom_dockerfile_mode=dockerfile_mode,
                 copy_repo=copy_repo,
+                repo_context_exclude_paths=(root,),
                 runtime_env=dict(runtime_plans[agent].staged_env),
                 verifier_env=staged_verifier_env,
                 pre_agent_setup=harbor_config.get("pre_agent_setup", []),
@@ -1821,6 +1881,7 @@ def _run_harbor_eval_impl(
                     base_image=base_image,
                     custom_dockerfile_mode=dockerfile_mode,
                     copy_repo=copy_repo,
+                    repo_context_exclude_paths=(root,),
                     runtime_env=dict(runtime_plans[agent].staged_env),
                     verifier_env=staged_verifier_env,
                     pre_agent_setup=harbor_config.get("pre_agent_setup", []),

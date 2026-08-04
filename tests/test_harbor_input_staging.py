@@ -178,6 +178,76 @@ class TestStageTaskInputs:
         )
         assert staged is False
 
+    def test_declared_file_symlink_to_undeclared_fixture_is_rejected(self, tmp_path: Path):
+        skill, evals, env_dir = _make_skill(tmp_path)
+        alias = evals / "files" / "alias.txt"
+        try:
+            alias.symlink_to("unrelated.txt")
+        except OSError as exc:  # pragma: no cover - host policy, primarily native Windows
+            pytest.skip(f"symlinks unavailable on this host: {exc}")
+
+        with pytest.raises(ValueError, match="symlink"):
+            _stage_task_inputs(
+                env_dir,
+                input_files_dir=evals / "files",
+                entry={"id": "t1", "files": ["files/alias.txt"]},
+                source_skill_path=skill,
+                evals_dir=evals,
+            )
+
+    def test_declared_directory_with_nested_symlink_is_rejected(self, tmp_path: Path):
+        skill, evals, env_dir = _make_skill(tmp_path)
+        declared = evals / "data" / "declared"
+        declared.mkdir()
+        alias = declared / "alias.txt"
+        try:
+            alias.symlink_to("../../files/unrelated.txt")
+        except OSError as exc:  # pragma: no cover - host policy, primarily native Windows
+            pytest.skip(f"symlinks unavailable on this host: {exc}")
+
+        with pytest.raises(ValueError, match="symlink"):
+            _stage_task_inputs(
+                env_dir,
+                input_files_dir=evals / "files",
+                entry={"id": "t1", "files": ["data/declared"]},
+                source_skill_path=skill,
+                evals_dir=evals,
+            )
+
+    def test_legacy_shared_directory_with_nested_symlink_is_rejected(self, tmp_path: Path):
+        skill, evals, env_dir = _make_skill(tmp_path)
+        alias = evals / "files" / "alias.txt"
+        try:
+            alias.symlink_to("unrelated.txt")
+        except OSError as exc:  # pragma: no cover - host policy, primarily native Windows
+            pytest.skip(f"symlinks unavailable on this host: {exc}")
+
+        with pytest.raises(ValueError, match="symlink"):
+            _stage_task_inputs(
+                env_dir,
+                input_files_dir=evals / "files",
+                entry={"id": "t1"},
+                source_skill_path=skill,
+                evals_dir=evals,
+            )
+
+    def test_declared_hardlink_is_rejected(self, tmp_path: Path):
+        skill, evals, env_dir = _make_skill(tmp_path)
+        alias = evals / "data" / "alias.txt"
+        try:
+            os.link(evals / "files" / "unrelated.txt", alias)
+        except OSError as exc:  # pragma: no cover - filesystem policy
+            pytest.skip(f"hardlinks unavailable on this host: {exc}")
+
+        with pytest.raises(ValueError, match=r"hardlink|hard link"):
+            _stage_task_inputs(
+                env_dir,
+                input_files_dir=evals / "files",
+                entry={"id": "t1", "files": ["data/alias.txt"]},
+                source_skill_path=skill,
+                evals_dir=evals,
+            )
+
 
 def test_generated_tasks_apply_per_entry_input_isolation(tmp_path: Path):
     skill, evals, _ = _make_skill(tmp_path)

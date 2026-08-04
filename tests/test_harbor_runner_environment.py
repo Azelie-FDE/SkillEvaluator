@@ -454,6 +454,37 @@ def test_run_harbor_eval_stages_per_agent_credential_trees(
     assert launched["claude-code"][2]["NVIDIA_API_KEY"] == "provider-key"
 
 
+def test_run_harbor_eval_rejects_provenance_key_inside_skill_before_creation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    skill = tmp_path / "demo"
+    skill.mkdir()
+    key_path = skill / "private-output-provenance.key"
+    monkeypatch.setenv("SKILLEVALUATOR_OUTPUT_PROVENANCE_KEY_FILE", str(key_path))
+    monkeypatch.setattr(runner, "resolve_llm_provider", lambda: _provider("nv_build"))
+    monkeypatch.setattr(
+        runner,
+        "load_evals_config",
+        lambda _path: ({"harbor": {"task_source": "evals_json"}}, None),
+    )
+    monkeypatch.setattr(runner, "find_evals_file", lambda _path: skill / "evals" / "evals.json")
+    monkeypatch.setattr(runner, "_check_prerequisites", lambda **_kwargs: [])
+
+    result = runner.run_harbor_eval(
+        skill,
+        ["opencode"],
+        output_dir=tmp_path / "results",
+        env_mode="docker",
+        agent_runtime_preflight=False,
+    )
+
+    assert "error" in result
+    assert "provenance key must be outside" in result["error"][0]
+    assert not key_path.exists()
+    assert not (tmp_path / "results").exists()
+
+
 def test_harbor_subprocess_environment_excludes_arbitrary_host_secrets(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -573,9 +604,18 @@ def test_runtime_env_rejects_host_process_control_names() -> None:
     unsafe_names = (
         "PATH",
         "PYTHONPATH",
+        "HOME",
+        "USERPROFILE",
+        "XDG_CONFIG_HOME",
+        "CLAUDE_CONFIG_DIR",
+        "CLAUDE_CODE_DISABLE_POLICY_SKILLS",
+        "CODEX_HOME",
+        "GEMINI_CLI_HOME",
+        "OPENCODE_CONFIG_DIR",
         "LD_PRELOAD",
         "DYLD_INSERT_LIBRARIES",
         "BASH_ENV",
+        "BASH_FUNC_hidden%%",
         "NODE_OPTIONS",
         "DOCKER_HOST",
         "COMPOSE_FILE",

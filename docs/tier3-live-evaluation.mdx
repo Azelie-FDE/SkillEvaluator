@@ -94,6 +94,34 @@ declared paths are staged into that task's `/workspace/input/`. An explicit
 empty list or `null` stages no task input. For backward compatibility, omitting
 the `files` field stages the entire shared `evals/files/` directory.
 
+An `evals/` directory directly owned by a skill package is evaluator-only. Tier
+3 reads datasets, graders, native Harbor tasks, and custom environments from the
+source tree, but does not install those directories from the target or any
+nested, reference, or workspace skill into agent-visible copies. `--copy-repo`
+uses the same filtering and excludes generated result roots. Runtime assets that
+the agent needs should live outside skill-owned `evals/`, or be declared as task
+inputs with `files`.
+
+`evals/environment/input/` is reserved and is not copied into generated tasks.
+Directory-level custom Docker `COPY input/` remains buildable for an empty entry
+using an empty context directory. Missing, dynamic, linked, hardlinked, aliased,
+or escaping input sources fail closed. Native Harbor tasks and Compose input
+contexts use the same omitted-versus-explicit selection rules.
+
+The final evaluator layer replaces `/workspace/input`, `/workspace/repo`, and
+supported agent skill-discovery roots. Custom Docker `preserve` mode also
+requires a statically known final `USER` so the projection can be installed and
+the original user restored. Custom Dockerfiles and base images remain trusted
+executable environment inputs: these controls isolate evaluation fixtures and
+supported discovery roots; they are not a security boundary against an image
+that intentionally changes system binaries or startup behavior.
+
+Evaluator-owned in-skill output uses a path-bound authenticity marker backed by
+a local key. A copied, forged, or stale marker cannot authorize replacement at
+another path. A custom key path set through
+`SKILLEVALUATOR_OUTPUT_PROVENANCE_KEY_FILE` must remain outside every evaluated
+skill source.
+
 ### Run the comparison
 
 ```bash title="With-skill vs. without-skill in Docker"

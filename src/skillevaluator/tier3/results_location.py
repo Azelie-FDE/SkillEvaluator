@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 ENV_RESULTS_DIR = "SKILLEVALUATOR_RESULTS_DIR"
-_RUN_TIMESTAMP_FORMATS = ("%Y%m%d_%H%M%S", "%Y-%m-%d_%H%M%S")
+_RUN_TIMESTAMP_FORMATS = (("%Y%m%d_%H%M%S", 15), ("%Y-%m-%d_%H%M%S", 17))
 
 
 def _expand(path: str | Path) -> Path:
@@ -91,9 +91,13 @@ def iter_candidate_results_roots(
 
 
 def _run_timestamp(name: str) -> datetime | None:
-    for timestamp_format in _RUN_TIMESTAMP_FORMATS:
+    for timestamp_format, prefix_length in _RUN_TIMESTAMP_FORMATS:
+        prefix = name[:prefix_length]
+        suffix = name[prefix_length:]
+        if suffix and not suffix.startswith("_"):
+            continue
         try:
-            return datetime.strptime(name, timestamp_format)  # noqa: DTZ007 -- directory names have no timezone
+            return datetime.strptime(prefix, timestamp_format)  # noqa: DTZ007 -- directory names have no timezone
         except ValueError:
             continue
     return None
@@ -106,7 +110,7 @@ def _newest_completed_run(root: Path) -> Path | None:
     except OSError:
         return None
 
-    completed: list[tuple[datetime, Path]] = []
+    completed: list[tuple[datetime, int, str, Path]] = []
     try:
         for candidate in children:
             timestamp = _run_timestamp(candidate.name)
@@ -115,14 +119,16 @@ def _newest_completed_run(root: Path) -> Path | None:
             try:
                 if not candidate.is_dir():
                     continue
-                result = json.loads((candidate / "result.json").read_text(encoding="utf-8"))
+                result_path = candidate / "result.json"
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+                completion_mtime = result_path.stat().st_mtime_ns
             except (FileNotFoundError, json.JSONDecodeError, OSError):
                 continue
             if isinstance(result, dict) and result.get("run_id") == candidate.name:
-                completed.append((timestamp, candidate))
+                completed.append((timestamp, completion_mtime, candidate.name, candidate))
     except OSError:
         return None
-    return max(completed, default=(None, None), key=lambda item: item[0])[1]
+    return max(completed, default=(None, -1, "", None), key=lambda item: (item[0], item[1], item[2]))[3]
 
 
 def resolve_latest_results(
