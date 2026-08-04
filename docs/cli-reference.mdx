@@ -9,6 +9,10 @@ layout: reference
 
 This page lists every `skillevaluator` command with its full flag set and exact defaults. If you want task-oriented guidance instead, start from the tier guides: [Tier 1: Validation](tier1-validation.mdx), [Tier 2: Deduplication](tier2-deduplication.mdx), and [Tier 3: Live Evaluation](tier3-live-evaluation.mdx).
 
+[Harbor](https://github.com/harbor-framework/harbor) is the open-source agent
+evaluation framework behind the Tier 3 task, environment, trial, and trajectory
+commands referenced below.
+
 ## Command map
 
 | Command | Purpose | Needs |
@@ -84,7 +88,7 @@ skillevaluator tier3 validate ./my-skill --strict
 
 ## validate
 
-Validate a skill, rule, workflow, or plugin. Tier 1 static, security, and quality checks gate the exit code — and so do Tier 2 deduplication findings when that pass runs (on by default, degrading gracefully without embedding access); Tier 3 live evaluation attaches as an advisory pass when enabled with `--tier3`, `--autopilot`, `--full`, or the `--agent-eval` alias.
+Validate a skill, rule, workflow, or plugin. Tier 1 static, security, and quality checks gate the exit code — and so do Tier 2 deduplication findings when that pass runs (on by default, degrading gracefully without embedding access); Tier 3 live evaluation attaches as an advisory pass when enabled with `--tier3`, `--autopilot`, `--full`, or the supported `--agent-eval` compatibility alias.
 
 ```bash title="Common invocations"
 skillevaluator validate ./my-skill                        # Tier 1 + Tier 2
@@ -147,12 +151,12 @@ Embedding + LLM dedup; on by default, skips gracefully without a provider key.
 ### Tier 3 · Live Agent Evaluation
 
 <Note>
-The following flags are forwarded to the live-eval engine **only when Tier 3 is enabled** — with `--tier3`, `--autopilot`, `--full`, or the `--agent-eval` alias. On their own they have no effect. The Dockerfile-, workspace-, resource-, preflight-, and progress-tuning flags (`--custom-dockerfile-mode`, `--skill-workspace-mode`, the `--override-*` flags, `--agent-runtime-preflight`, and `--progress`) are not forwardable — use the standalone [tier3 evaluate](#tier3-evaluate) command for those.
+The following flags are forwarded to the live-eval engine **only when Tier 3 is enabled** — with `--tier3`, `--autopilot`, `--full`, or the supported `--agent-eval` compatibility alias. On their own they have no effect. The Dockerfile-, workspace-, resource-, preflight-, and progress-tuning flags (`--custom-dockerfile-mode`, `--skill-workspace-mode`, the `--override-*` flags, `--agent-runtime-preflight`, and `--progress`) are not forwardable — use the standalone [tier3 evaluate](#tier3-evaluate) command for those.
 </Note>
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--tier3, --agent-eval` | off | Also run Tier 3 live agent evaluation (requires `evals/evals.json`). Advisory: it never changes the exit code. `--tier3` is the primary name; `--agent-eval` is a retained alias. |
+| `--tier3, --agent-eval` | off | Also run Tier 3 live agent evaluation (requires `evals/evals.json`). Advisory: it never changes the exit code. `--tier3` is the primary name; `--agent-eval` is a supported compatibility alias and is not currently deprecated. |
 | `--autopilot` | off | Generate an evaluation source automatically when missing, then run Tier 3 (implies `--tier3`). |
 | `-a, --agents TEXT` | `codex` | Comma-separated Harbor agents to evaluate. |
 | `--env-mode` | `docker` | Harbor environment backend (full list under [tier3 evaluate](#tier3-evaluate)). |

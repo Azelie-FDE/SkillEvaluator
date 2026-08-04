@@ -11,6 +11,11 @@ You can generate a starter dataset with no API key; LLM-backed generation and
 refinement need a configured provider (see
 [Providers & Credentials](configuration.mdx)).
 
+Tier 3 executes these cases through
+[Harbor](https://github.com/harbor-framework/harbor), the open-source agent
+evaluation framework. Native Harbor task bundles are the bring-your-own-task
+alternative to the `evals.json` dataset described below.
+
 ## The evals/ directory
 
 SkillEvaluator recognizes this tree inside your skill:

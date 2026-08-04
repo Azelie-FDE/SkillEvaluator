@@ -50,6 +50,10 @@ The Makefile wraps the standard tools, so you can run the underlying commands di
 
 `make test` runs the fast suite. Two pytest markers are excluded by default, so slow and credentialed tests never block the everyday loop:
 
+[Harbor](https://github.com/harbor-framework/harbor) is the open-source agent
+evaluation framework used by Tier 3; the `live` marker exercises its in-process
+backend.
+
 | Marker | What it covers | Run it with |
 | --- | --- | --- |
 | *(none)* | Fast unit tests — the default selection | `pytest` |

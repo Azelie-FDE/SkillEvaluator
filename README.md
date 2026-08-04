@@ -15,8 +15,8 @@ SkillEvaluator is part of the
 [NVIDIA Verified Skills pipeline](https://docs.nvidia.com/skills/), with
 [SkillSpector](https://github.com/NVIDIA/SkillSpector) providing the specialized
 security-scanning capability used by Tier 1 and
-[Harbor](https://github.com/harbor-framework/harbor) powering Tier 3 sandboxed
-agent evaluation.
+[Harbor](https://github.com/harbor-framework/harbor), the open-source agent
+evaluation framework, powering Tier 3 sandboxed agent evaluation.
 
 ## Quickstart
 

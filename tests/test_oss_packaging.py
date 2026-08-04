@@ -566,6 +566,54 @@ def test_tier3_docs_explain_cost_controls_and_local_mode_tradeoffs() -> None:
     assert "weaker isolation than Docker" in tier3
 
 
+def test_launch_docs_address_scanner_and_naming_ambiguities() -> None:
+    quickstart = (REPO_ROOT / "docs" / "quickstart.mdx").read_text(encoding="utf-8")
+    ci = (REPO_ROOT / "docs" / "ci-integration.mdx").read_text(encoding="utf-8")
+    environment = (REPO_ROOT / "docs" / "environment-variables.mdx").read_text(encoding="utf-8")
+    normalized_quickstart = " ".join(quickstart.split())
+
+    assert "brew install semgrep gitleaks" in quickstart
+    assert "uv tool install git+https://github.com/NVIDIA/SkillSpector.git" in quickstart
+    assert "Semgrep, SkillSpector, and Gitleaks" in quickstart
+    assert "missing scanner evidence leaves the result `INCOMPLETE` and exits `1`" in normalized_quickstart
+    assert "most often Gitleaks" not in ci
+    assert "Semgrep, SkillSpector, and Gitleaks are all separate executables" in " ".join(ci.split())
+    assert "`SKILL_EVAL_*` covers provider and model configuration" in " ".join(environment.split())
+    assert "`SKILLEVALUATOR_*` covers product-level validation" in " ".join(environment.split())
+    assert "are not interchangeable" in environment
+
+
+def test_harbor_atif_and_agent_eval_alias_are_defined() -> None:
+    harbor_url = "https://github.com/harbor-framework/harbor"
+    harbor_pages = [
+        REPO_ROOT / "README.md",
+        REPO_ROOT / "docs" / "agents-and-sandboxes.mdx",
+        REPO_ROOT / "docs" / "cli-reference.mdx",
+        REPO_ROOT / "docs" / "configuration.mdx",
+        REPO_ROOT / "docs" / "custom-graders.mdx",
+        REPO_ROOT / "docs" / "developer-guide.mdx",
+        REPO_ROOT / "docs" / "environment-variables.mdx",
+        REPO_ROOT / "docs" / "eval-datasets.mdx",
+        REPO_ROOT / "docs" / "installation.mdx",
+        REPO_ROOT / "docs" / "reports.mdx",
+        REPO_ROOT / "docs" / "tier3-live-evaluation.mdx",
+    ]
+
+    for path in harbor_pages:
+        content = path.read_text(encoding="utf-8")
+        assert f"[Harbor]({harbor_url})" in content, path
+        assert "open-source agent evaluation framework" in " ".join(content.split()), path
+
+    for name in ("custom-graders.mdx", "environment-variables.mdx"):
+        content = (REPO_ROOT / "docs" / name).read_text(encoding="utf-8")
+        assert "Agent Trajectory Interchange Format (ATIF)" in content
+
+    for name in ("tier1-validation.mdx", "ci-integration.mdx", "cli-reference.mdx", "tier3-live-evaluation.mdx"):
+        content = (REPO_ROOT / "docs" / name).read_text(encoding="utf-8")
+        assert "--agent-eval" in content
+        assert "not currently deprecated" in " ".join(content.split())
+
+
 def test_public_product_branding_uses_the_canonical_name() -> None:
     paths = [
         REPO_ROOT / "README.md",

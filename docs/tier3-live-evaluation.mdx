@@ -17,10 +17,12 @@ SkillEvaluator runs a real agent (`codex`, `claude-code`, or `opencode` —
 cases twice: once with the skill installed
 (the with-skill arm) and, unless you pass `--skip-baseline`, once without it
 (the baseline arm). Both arms execute inside a selected
-[Harbor](https://github.com/harbor-framework/harbor) environment, so the only
-variable is the skill itself. **Skill Lift** is the signed difference between
-the two arms — the direct measurement of what your skill contributes. With
-multiple attempts per case, **pass@k** adds a reliability signal alongside it.
+[Harbor](https://github.com/harbor-framework/harbor) environment. Harbor is the
+open-source agent evaluation framework that runs the trial, so the only
+experimental variable is the skill itself. **Skill Lift** is the signed
+difference between the two arms — the direct measurement of what your skill
+contributes. With multiple attempts per case, **pass@k** adds a reliability
+signal alongside it.
 
 With `default` or `default_plus_custom` grading, reports lead with five
 human-readable dimensions:
@@ -233,7 +235,8 @@ own enables Tier 3 while generating an eval case when none exists.
 `validate` forwards a dedicated Tier 3 flag group (`--agents`, `--env-mode`,
 `--grading-mode`, and the rest) to the live-eval engine whenever Tier 3 is
 enabled — via `--tier3`, `--autopilot`, `--full`, or the `--agent-eval` alias.
-See the [CLI Reference](cli-reference.mdx) for the full group.
+`--agent-eval` is a supported compatibility alias and is not currently
+deprecated. See the [CLI Reference](cli-reference.mdx) for the full group.
 </Note>
 
 ## Plan for cost

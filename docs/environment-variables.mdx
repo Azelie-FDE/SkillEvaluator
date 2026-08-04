@@ -8,6 +8,17 @@ Every environment variable SkillEvaluator reads, grouped by feature area. Each g
 
 Boolean variables accept `1`, `true`, `yes`, or `on` (case-insensitive) as true, and `0`, `false`, `no`, or `off` as false.
 
+Two historical SkillEvaluator prefixes coexist. `SKILL_EVAL_*` covers provider
+and model configuration plus a small set of Tier 3 engine knobs;
+`SKILLEVALUATOR_*` covers product-level validation, report paths, scanner
+paths, and sandbox/runtime behavior. The prefixes are part of each variable's
+literal public name and are not interchangeable. The separately documented
+`SKILLSPECTOR_*` family belongs to SkillSpector, provider credential families
+belong to their providers, and
+[Harbor](https://github.com/harbor-framework/harbor), the open-source agent
+evaluation framework used for Tier 3, owns the `HARBOR_*` in-container grader
+contract. None belongs to either SkillEvaluator prefix.
+
 ## LLM provider
 
 These variables select and configure the provider used for LLM-backed checks and judging. The setup walkthrough, including per-provider export blocks and default models, is in [Providers & Credentials](configuration.mdx).
@@ -76,7 +87,10 @@ The scanner path overrides fail closed: a value that is not an absolute, executa
 
 ## Live evaluation (Tier 3)
 
-These variables control where results land and how Harbor local mode is confined. The run workflow is [Tier 3: Live Evaluation](tier3-live-evaluation.mdx); execution environments are covered in [Agents & Sandboxes](agents-and-sandboxes.mdx).
+These variables control where results land and how Harbor confines local mode.
+The run workflow is [Tier 3: Live Evaluation](tier3-live-evaluation.mdx);
+execution environments are covered in
+[Agents & Sandboxes](agents-and-sandboxes.mdx).
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -99,7 +113,7 @@ The `HARBOR_*` variables are read by your custom grader *inside* the task contai
 | `HARBOR_REWARD_JSON` | Path where your grader writes its `reward.json` score. |
 | `HARBOR_REWARD_TXT` | Path for the compatibility `reward.txt` dual-write. |
 | `HARBOR_ENTRY_JSON` | Path to the eval case entry being graded. |
-| `HARBOR_ATIF_PATH` | Path to the agent trajectory to grade. |
+| `HARBOR_ATIF_PATH` | Path to the agent trajectory to grade, serialized in [Agent Trajectory Interchange Format (ATIF)](https://www.harborframework.com/docs/agents/trajectory-format). |
 | `HARBOR_LOGS_DIR` | Root of the in-container log tree; the agent trajectory lives under its `agent/` subdirectory. |
 | `HARBOR_TESTS_DIR` | Directory holding the staged grader and test assets. |
 | `HARBOR_GRADER` | Path to the staged `grader.py`. |

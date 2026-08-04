@@ -40,14 +40,25 @@ Get your first evaluation result in about two minutes, with no API key. This pag
 
   ### Run the complete offline Tier 1 validation
 
-  `validate` runs the full static and security check suite. Install Gitleaks once for a complete security result, and pass `--no-dedup` to skip the Tier 2 pass that needs an embeddings key:
+  `validate` runs the full static and security check suite. The `[all]` install
+  above includes the Python scanners, but complete evidence also requires the
+  separate Semgrep, SkillSpector, and Gitleaks executables. Install all three,
+  and pass `--no-dedup` to skip the Tier 2 pass that needs an embeddings key:
 
   ```bash title="Complete offline Tier 1"
-  brew install gitleaks   # macOS; other platforms: https://github.com/gitleaks/gitleaks/releases
+  brew install semgrep gitleaks   # macOS
+  uv tool install git+https://github.com/NVIDIA/SkillSpector.git
   skillevaluator validate ./my-skill --no-dedup
   ```
 
-  The terminal shows a compact pipeline view, and HTML and JSON reports land in `reports/` — pass `-r cli` explicitly for terminal-only output, or `--verbose` for the full per-check detail stream. The command exits `0` when every check passes and `1` when a check fails — ready to drop into CI as-is. See [Gate Your CI](ci-integration.mdx) for the full recipe.
+  On other platforms, follow [Installation: System tools](installation.mdx#system-tools)
+  for the Semgrep, SkillSpector, and Gitleaks setup. The terminal shows a
+  compact pipeline view, and HTML and JSON reports land in `reports/` — pass
+  `-r cli` explicitly for terminal-only output, or `--verbose` for the full
+  per-check detail stream. The command exits `0` only when every check passes
+  and every required scanner returns complete evidence. A failed check or
+  missing scanner evidence leaves the result `INCOMPLETE` and exits `1`. See
+  [Gate Your CI](ci-integration.mdx) for the full recipe.
 
   ### Add an LLM provider
 
@@ -89,9 +100,9 @@ Get your first evaluation result in about two minutes, with no API key. This pag
 
 Every tier is an independent entry point — nothing requires running the earlier tiers first.
 
-| Tier | CLI only | Provider key | Gitleaks | Docker + agent CLI |
+| Tier | CLI only | Provider key | External scanners | Docker + agent CLI |
 | --- | --- | --- | --- | --- |
-| **Tier 1** — validation | All deterministic checks | Only `rubric-eval` and the optional `--llm`/`--llm-verify` flags | For a complete security result | — |
+| **Tier 1** — validation | All deterministic checks | Only `rubric-eval` and the optional `--llm`/`--llm-verify` flags | Semgrep, SkillSpector, and Gitleaks for a complete security result | — |
 | **Tier 2** — deduplication | — | Embeddings; intra-skill analysis also needs a chat LLM | — | — |
 | **Tier 3** — live evaluation | Keyless dataset templates (`--no-llm`) and report viewing | LLM dataset generation and grading | — | Live runs need a sandbox plus the agent CLI and its credential |
 

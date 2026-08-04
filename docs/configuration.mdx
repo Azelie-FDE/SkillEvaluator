@@ -7,6 +7,11 @@ This page gets SkillEvaluator's LLM-backed features working: choosing a provider
 
 For the exhaustive variable-by-variable inventory, see [Environment Variables](environment-variables.mdx).
 
+Tier 3 executes trials through
+[Harbor](https://github.com/harbor-framework/harbor), the open-source agent
+evaluation framework. This page separates the credentials SkillEvaluator and
+the live agents need from the backend configuration Harbor itself reads.
+
 ## What needs a key
 
 Tiers describe evaluation depth; credentials are a separate axis. This is the complete map — everything not listed under "needs a provider" runs fully offline:

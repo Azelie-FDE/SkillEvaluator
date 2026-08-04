@@ -1,14 +1,16 @@
 ---
 title: "Custom Graders & Tasks"
-description: "Bring your own grader (BYOG) or a complete Harbor task (BYOT) when SkillEvaluator's default graders can't express what success means for your skill."
+description: "Bring your own grader (BYOG) or a complete native task (BYOT) when SkillEvaluator's default graders can't express what success means for your skill."
 ---
 
 When your skill's success criteria can't be expressed by the default graders —
 a domain-specific output format, a service that must end up in a particular
 state, a scoring rule only you can define — you can bring your own grader, or
-your own complete Harbor task. Scaffolding is keyless and takes one command;
-running a custom-graded evaluation needs the same Tier 3 stack as any live
-eval — see [Tier 3: Live Evaluation](tier3-live-evaluation.mdx).
+your own complete [Harbor](https://github.com/harbor-framework/harbor) task.
+Harbor is the open-source agent evaluation framework that executes Tier 3
+trials. Scaffolding is keyless and takes one command; running a custom-graded
+evaluation needs the same Tier 3 stack as any live eval — see
+[Tier 3: Live Evaluation](tier3-live-evaluation.mdx).
 
 ## Grading modes
 
@@ -41,8 +43,8 @@ custom lift you want to keep.
 
 ## Bring your own grader (BYOG)
 
-A BYOG grader is a single `evals/grader.py` (or `evals/grader.sh`) that Skill
-Evaluator stages into every generated task container and runs after the agent
+A BYOG grader is a single `evals/grader.py` (or `evals/grader.sh`) that
+SkillEvaluator stages into every generated task container and runs after the agent
 finishes.
 
 <Steps>
@@ -117,11 +119,13 @@ grader must not overwrite the reserved standard metric names — `security`,
 
 Rather than hard-coding the paths, read them from the `HARBOR_*` environment
 variables and fall back to the defaults below when a variable is unset — the
-starter grader already does:
+starter grader already does. Harbor records the interaction history as the
+[Agent Trajectory Interchange Format (ATIF)](https://www.harborframework.com/docs/agents/trajectory-format),
+a standardized JSON trajectory:
 
 | Variable | Default | Carries |
 | --- | --- | --- |
-| `HARBOR_ATIF_PATH` | `/logs/agent/trajectory.json` | Agent trajectory to grade |
+| `HARBOR_ATIF_PATH` | `/logs/agent/trajectory.json` | ATIF agent trajectory to grade |
 | `HARBOR_ENTRY_JSON` | `/tests/entry.json` | Eval case metadata |
 | `HARBOR_REWARD_JSON` | `/logs/verifier/reward.json` | Where to write your scores |
 | `HARBOR_REWARD_TXT` | `/logs/verifier/reward.txt` | Where to write the plain-text overall score |
