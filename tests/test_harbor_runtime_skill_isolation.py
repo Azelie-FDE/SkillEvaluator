@@ -440,6 +440,40 @@ def test_copy_repo_excludes_configured_in_repo_output_root(tmp_path: Path) -> No
     assert not (task / "environment" / "repo" / output_dir.name).exists()
 
 
+@pytest.mark.parametrize("stager", ["generated", "native"])
+def test_copy_repo_excludes_private_in_repo_staging_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stager: str,
+) -> None:
+    repo, target, references_dir, workspace = _write_projection_fixture(tmp_path)
+    private_canary = "PRIVATE-STAGING-CANARY"
+    entries = json.loads((target / "evals" / "evals.json").read_text(encoding="utf-8"))
+    entries[0]["ground_truth"] = private_canary
+    (target / "evals" / "evals.json").write_text(json.dumps(entries), encoding="utf-8")
+    if stager == "native":
+        _write_minimal_native_task(target)
+    in_repo_temp_root = repo / "tmp"
+    in_repo_temp_root.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", os.fspath(in_repo_temp_root))
+    stager_fn = generate_harbor_tasks if stager == "generated" else stage_native_harbor_tasks
+
+    task = stager_fn(
+        target,
+        tmp_path / f"{stager}-private-root",
+        reference_skills_dir=references_dir,
+        workspace_skill_paths=[workspace],
+        copy_repo=True,
+    )[0]
+
+    environment = task / "environment"
+    readable_environment = "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore") for path in environment.rglob("*") if path.is_file()
+    )
+    assert private_canary not in readable_environment
+    assert not (environment / "repo" / in_repo_temp_root.relative_to(repo)).exists()
+
+
 def test_runtime_skill_projection_excludes_shared_in_skill_output_root(tmp_path: Path) -> None:
     _, target, references_dir, workspace = _write_projection_fixture(tmp_path)
     output_root = target / "Custom-Results"
@@ -1254,6 +1288,49 @@ def test_linked_repo_context_excludes_skill_evals_but_keeps_unrelated_evals(tmp_
     assert (staged_repo / "docs" / "evals" / "keep.txt").is_file()
 
 
+@pytest.mark.parametrize("stager", ["generated", "native"])
+def test_linked_repo_context_prunes_excluded_artifacts_before_resolving(
+    tmp_path: Path,
+    stager: str,
+) -> None:
+    repo, target, references_dir, workspace = _write_projection_fixture(tmp_path)
+    excluded = repo / "custom-results"
+    excluded.mkdir()
+    try:
+        (excluded / "loop").symlink_to("loop")
+        (excluded / "dangling").symlink_to("missing")
+    except OSError as exc:  # pragma: no cover - host policy, primarily native Windows
+        pytest.skip(f"symlinks unavailable on this host: {exc}")
+    if hasattr(os, "mkfifo"):
+        os.mkfifo(excluded / "artifact.fifo")
+    unreadable = excluded / "unreadable.txt"
+    unreadable.write_text("private", encoding="utf-8")
+    unreadable.chmod(0)
+    links = "\n".join(
+        f"[{name}](../custom-results/{name})" for name in ("loop", "dangling", "artifact.fifo", "unreadable.txt")
+    )
+    (target / "SKILL.md").write_text(f"# Target\n\n{links}\n", encoding="utf-8")
+    if stager == "native":
+        _write_minimal_native_task(target)
+        stage = stage_native_harbor_tasks
+    else:
+        stage = generate_harbor_tasks
+
+    try:
+        task = stage(
+            target,
+            tmp_path / f"{stager}-linked-excluded",
+            reference_skills_dir=references_dir,
+            workspace_skill_paths=[workspace],
+            copy_repo=False,
+            repo_context_exclude_paths=(excluded,),
+        )[0]
+    finally:
+        unreadable.chmod(0o600)
+
+    assert not (task / "environment" / "repo" / excluded.relative_to(repo)).exists()
+
+
 @pytest.mark.parametrize("files_value", [[], ["evals/files/selected.txt"]])
 @pytest.mark.parametrize("source", ["INPUT/", "Input/fixture.txt"])
 def test_custom_dockerfile_rejects_noncanonical_input_case(
@@ -1566,6 +1643,10 @@ def test_generated_tasks_reject_unsafe_agent_workdir(tmp_path: Path, agent_workd
         "/workspace/input/subdir",
         "/workspace/repo/subdir",
         "/workspace/skills",
+        "/workspace/.gemini/extensions/nested",
+        "/etc/codex/skills/nested",
+        "/logs/agent/sessions/skills/nested",
+        "/opt/project/.claude/commands/hidden",
         "/opt/project/.claude/skills/hidden",
         "/opt/project/.cline/skills/hidden",
         "/opt/project/.config/goose/skills/hidden",

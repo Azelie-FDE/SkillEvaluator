@@ -914,19 +914,41 @@ def _git_context_files(root: Path) -> list[Path]:
     return [root / line for line in result.stdout.splitlines() if line.strip()]
 
 
-def _iter_repo_context_files(root: Path, authenticated_output_roots: set[Path]) -> list[Path]:
+def _iter_repo_context_files(
+    root: Path,
+    authenticated_output_roots: set[Path],
+    excluded_roots: Sequence[Path] = (),
+) -> list[Path]:
+    """Enumerate repository files without inspecting excluded output trees."""
     git_files = _git_context_files(root)
     if git_files:
         return sorted(
             path
             for path in git_files
-            if path.is_file() and not _repo_context_ignore_file(path, root, authenticated_output_roots)
+            if not _path_is_excluded(path, excluded_roots)
+            and path.is_file()
+            and not _repo_context_ignore_file(path, root, authenticated_output_roots)
         )
-    return sorted(
-        path
-        for path in root.rglob("*")
-        if path.is_file() and not _repo_context_ignore_file(path, root, authenticated_output_roots)
-    )
+
+    files: list[Path] = []
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                # This lexical-first check must happen before stat/is_file or
+                # descent: result trees can contain unsafe or unreadable user
+                # artifacts and are explicitly outside the staged context.
+                if _path_is_excluded(path, excluded_roots):
+                    continue
+                if _repo_context_ignore_file(path, root, authenticated_output_roots):
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
+                elif entry.is_file(follow_symlinks=False) or entry.is_symlink():
+                    files.append(path)
+    return sorted(files)
 
 
 def _stage_repo_context(
@@ -974,7 +996,11 @@ def _stage_repo_context(
     staged: list[dict[str, str]] = []
 
     if mode == "full":
-        for src in _iter_repo_context_files(repo_root, authenticated_output_roots):
+        for src in _iter_repo_context_files(
+            repo_root,
+            authenticated_output_roots,
+            resolved_excluded_roots,
+        ):
             if _is_excluded_output(src):
                 continue
             if _repo_context_ignore_file(src, repo_root, authenticated_output_roots):
@@ -1002,14 +1028,25 @@ def _stage_repo_context(
 
     for raw_target in _discover_skill_link_targets(skill_md):
         target = _strip_link_target(raw_target)
-        lexical_target_path = source_skill_path / target if not Path(target).is_absolute() else Path(target)
-        target_path = lexical_target_path.resolve()
-        if not target_path.is_file():
+        raw_target_path = source_skill_path / target if not Path(target).is_absolute() else Path(target)
+        lexical_target_path = Path(os.path.abspath(raw_target_path))  # noqa: PTH100 -- normalize without resolving
+        if _path_is_excluded(lexical_target_path, resolved_excluded_roots):
+            logger.warning("Skipping SKILL.md link into generated output: %s", raw_target)
+            continue
+        try:
+            target_path = lexical_target_path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            logger.warning("Skipping unreadable SKILL.md repo link: %s", raw_target)
+            continue
+        try:
+            if not target_path.is_file():
+                continue
+        except OSError:
             continue
         if not _is_relative_to(target_path, repo_root):
             logger.warning("Skipping SKILL.md link outside repo root: %s", raw_target)
             continue
-        if _is_excluded_output(target_path) or _path_is_excluded(lexical_target_path, resolved_excluded_roots):
+        if _is_excluded_output(target_path):
             logger.warning("Skipping SKILL.md link into generated output: %s", raw_target)
             continue
         if _repo_context_ignore_file(
@@ -1731,7 +1768,7 @@ def _copy_custom_grader(task_dir: Path, skill_path: Path, grading_mode: str) -> 
         if not resolved_evals.is_relative_to(resolved_skill) or not resolved_grader.is_relative_to(resolved_evals):
             raise ValueError(f"custom grader must be a non-symlinked regular file contained under evals/: {grader}")
 
-        shutil.copy2(resolved_grader, destination, follow_symlinks=False)
+        copy_file_secure(grader, destination, allowed_root=skill_path / "evals")
         if destination.suffix == ".sh":
             destination.chmod(0o755)
         return True
@@ -2874,6 +2911,11 @@ _PROJECT_SKILL_RELATIVE_DIRS = (
     ".opencode/skills",
     ".qwen/skills",
 )
+_RUNTIME_PROJECTION_ROOTS = ("/workspace/input", "/workspace/repo", *_RUNTIME_SKILL_DIRS)
+_RUNTIME_PROJECTION_CASE_PATTERNS = (
+    *(pattern for root in _RUNTIME_PROJECTION_ROOTS for pattern in (root, f"{root}/*")),
+    *(pattern for relative in _PROJECT_SKILL_RELATIVE_DIRS for pattern in (f"*/{relative}", f"*/{relative}/*")),
+)
 _RUNTIME_DISCOVERY_ENV_NAMES = frozenset(
     {
         "CLAUDE_CODE_DISABLE_POLICY_SKILLS",
@@ -2965,16 +3007,7 @@ _DISCOVERY_ENV_SKILL_RESET = (
     'clear_skill_root "$XDG_CONFIG_HOME/opencode/skills"; fi'
 )
 _RUNTIME_PROJECTION_OVERLAP_PREFLIGHT = (
-    'set -eu; check_path() { value=$1; case "$value" in '
-    "/workspace/input|/workspace/input/*|/workspace/repo|/workspace/repo/*|"
-    "/workspace/skills|/workspace/skills/*|"
-    "*/.agents/skills|*/.agents/skills/*|*/.claude/commands|*/.claude/commands/*|"
-    "*/.claude/skills|*/.claude/skills/*|*/.cline/skills|*/.cline/skills/*|"
-    "*/.codex/skills|*/.codex/skills/*|*/.config/goose/skills|*/.config/goose/skills/*|"
-    "*/.config/opencode/skills|*/.config/opencode/skills/*|"
-    "*/.cursor/skills|*/.cursor/skills/*|*/.gemini/skills|*/.gemini/skills/*|"
-    "*/.gemini/extensions|*/.gemini/extensions/*|"
-    "*/.opencode/skills|*/.opencode/skills/*|*/.qwen/skills|*/.qwen/skills/*) "
+    'set -eu; check_path() { value=$1; case "$value" in ' + "|".join(_RUNTIME_PROJECTION_CASE_PATTERNS) + ") "
     "echo 'SkillEvaluator agent workdir/home overlaps an evaluator-controlled runtime projection' >&2; "
     'exit 78;; esac; }; check_control_path() { value=$1; check_path "$value"; '
     'if [ -d "$value" ]; then canonical=$(CDPATH= cd -P -- "$value" 2>/dev/null && /bin/pwd -P) || exit 78; '
@@ -3020,22 +3053,10 @@ def _validated_agent_workdir(agent_workdir: str | None) -> str | None:
         or re.fullmatch(r"/[A-Za-z0-9._/-]*", normalized) is None
     ):
         raise ValueError("agent_workdir must be a normalized absolute POSIX path")
-    reserved_roots = ("/workspace/input", "/workspace/repo", "/workspace/skills")
-    if any(normalized == root or normalized.startswith(f"{root}/") for root in reserved_roots):
+    if any(normalized == root or normalized.startswith(f"{root}/") for root in _RUNTIME_PROJECTION_ROOTS):
         raise ValueError("agent_workdir must not be inside an evaluator-controlled runtime projection")
     parts = tuple(part for part in normalized.split("/") if part)
-    discovery_parts = (
-        (".agents", "skills"),
-        (".claude", "skills"),
-        (".cline", "skills"),
-        (".codex", "skills"),
-        (".config", "goose", "skills"),
-        (".config", "opencode", "skills"),
-        (".cursor", "skills"),
-        (".gemini", "skills"),
-        (".opencode", "skills"),
-        (".qwen", "skills"),
-    )
+    discovery_parts = tuple(tuple(relative.split("/")) for relative in _PROJECT_SKILL_RELATIVE_DIRS)
     if any(
         parts[index : index + len(candidate)] == candidate
         for candidate in discovery_parts
@@ -4433,7 +4454,7 @@ def stage_native_harbor_tasks(
             base_image=base_image,
             custom_dockerfile_mode=custom_dockerfile_mode,
             copy_repo=copy_repo,
-            repo_context_exclude_paths=(*repo_context_exclude_paths, output_dir),
+            repo_context_exclude_paths=(*repo_context_exclude_paths, output_dir, private_root),
             runtime_env=runtime_env,
             verifier_env=verifier_env,
             pre_agent_setup=pre_agent_setup,
@@ -4682,7 +4703,7 @@ def generate_harbor_tasks(
             base_image=base_image,
             custom_dockerfile_mode=custom_dockerfile_mode,
             copy_repo=copy_repo,
-            repo_context_exclude_paths=(*repo_context_exclude_paths, output_dir),
+            repo_context_exclude_paths=(*repo_context_exclude_paths, output_dir, private_root),
             runtime_env=runtime_env,
             verifier_env=verifier_env,
             pre_agent_setup=pre_agent_setup,

@@ -6,13 +6,19 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
-from typing import TYPE_CHECKING
+
+import pytest
 
 from skillevaluator.tier3.commands import compare_results
 
-if TYPE_CHECKING:
-    import pytest
+
+def _complete_current_run(run_dir: Path) -> None:
+    (run_dir / "result.json").write_text(
+        json.dumps({"run_id": run_dir.name, "agents": {}}),
+        encoding="utf-8",
+    )
 
 
 def test_compare_rejects_partial_scores_from_failed_summary(tmp_path: Path) -> None:
@@ -33,6 +39,7 @@ def test_compare_rejects_partial_scores_from_failed_summary(tmp_path: Path) -> N
         ),
         encoding="utf-8",
     )
+    _complete_current_run(summary_dir.parents[1])
 
     assert compare_results(skill_path, results_dir=results_root) == 1
 
@@ -55,6 +62,7 @@ def test_compare_ignores_failed_baseline_scores(
             json.dumps({"execution_status": status, "scores": {"security": score}}),
             encoding="utf-8",
         )
+    _complete_current_run(agent_dir.parent)
 
     assert compare_results(skill_path, results_dir=results_root) == 0
     assert "lift" not in capsys.readouterr().out.lower()
@@ -80,6 +88,7 @@ def test_compare_never_pairs_baseline_from_a_different_timestamp(
             json.dumps({"execution_status": status, "scores": {"security": score}}),
             encoding="utf-8",
         )
+    _complete_current_run(newest.parent)
 
     older = skill_results / "20260709_010000" / "opencode" / "with-skill"
     older.mkdir(parents=True)
@@ -87,6 +96,156 @@ def test_compare_never_pairs_baseline_from_a_different_timestamp(
         json.dumps({"execution_status": "succeeded", "scores": {"security": 1.0}}),
         encoding="utf-8",
     )
+    _complete_current_run(older.parents[1])
 
     assert compare_results(skill_path, results_dir=results_root) == 0
     assert "lift" not in capsys.readouterr().out.lower()
+
+
+def test_compare_same_timestamp_unique_runs_uses_result_completion_time(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    skill_path = tmp_path / "demo"
+    skill_path.mkdir()
+    skill_results = tmp_path / "results" / "demo"
+    lexically_later = "20260709_010000_999_ffffffffffff"
+    completed_later = "20260709_010000_111_aaaaaaaaaaaa"
+
+    for run_id, score, completed_ns in (
+        (lexically_later, 0.1, 100),
+        (completed_later, 0.9, 200),
+    ):
+        run_dir = skill_results / run_id
+        summary_dir = run_dir / "opencode" / "with-skill"
+        summary_dir.mkdir(parents=True)
+        (summary_dir / "summary.json").write_text(
+            json.dumps({"execution_status": "succeeded", "scores": {"security": score}}),
+            encoding="utf-8",
+        )
+        result_path = run_dir / "result.json"
+        result_path.write_text(json.dumps({"run_id": run_id, "agents": {}}), encoding="utf-8")
+        os.utime(result_path, ns=(completed_ns, completed_ns))
+
+    assert compare_results(skill_path, results_dir=tmp_path / "results") == 0
+    output = capsys.readouterr().out
+    assert completed_later in output
+    assert lexically_later not in output
+
+
+@pytest.mark.parametrize("partial_kind", ["missing", "malformed", "mismatched"])
+def test_compare_ignores_newer_partial_timestamp_run(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    partial_kind: str,
+) -> None:
+    skill_path = tmp_path / "demo"
+    skill_path.mkdir()
+    skill_results = tmp_path / "results" / "demo"
+    older = skill_results / "20260709_010000"
+    older_summary = older / "opencode" / "with-skill" / "summary.json"
+    older_summary.parent.mkdir(parents=True)
+    older_summary.write_text(
+        json.dumps({"execution_status": "succeeded", "scores": {"security": 0.8}}),
+        encoding="utf-8",
+    )
+    _complete_current_run(older)
+
+    newer = skill_results / "20260709_020000"
+    newer_summary = newer / "opencode" / "with-skill" / "summary.json"
+    newer_summary.parent.mkdir(parents=True)
+    newer_summary.write_text(
+        json.dumps({"execution_status": "succeeded", "scores": {"security": 0.1}}),
+        encoding="utf-8",
+    )
+    if partial_kind == "malformed":
+        (newer / "result.json").write_text("{not json", encoding="utf-8")
+    elif partial_kind == "mismatched":
+        (newer / "result.json").write_text(json.dumps({"run_id": "different"}), encoding="utf-8")
+
+    assert compare_results(skill_path, results_dir=tmp_path / "results") == 0
+    output = capsys.readouterr().out
+    assert older.name in output
+    assert newer.name not in output
+
+
+def test_compare_retains_non_timestamp_legacy_summary_directory(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    skill_path = tmp_path / "demo"
+    skill_path.mkdir()
+    legacy = tmp_path / "results" / "demo" / "legacy-run"
+    summary = legacy / "opencode" / "with-skill" / "summary.json"
+    summary.parent.mkdir(parents=True)
+    summary.write_text(
+        json.dumps({"execution_status": "succeeded", "scores": {"security": 0.7}}),
+        encoding="utf-8",
+    )
+
+    assert compare_results(skill_path, results_dir=tmp_path / "results") == 0
+    assert legacy.name in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("primary_kind", ["empty", "partial", "non-object"])
+def test_compare_falls_back_from_unusable_primary_root_to_valid_legacy_root(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    primary_kind: str,
+) -> None:
+    skill_path = tmp_path / "demo"
+    skill_path.mkdir()
+    primary = tmp_path / "results" / skill_path.name
+    primary.mkdir(parents=True)
+    if primary_kind == "partial":
+        partial = primary / "20260709_020000" / "codex" / "with-skill"
+        partial.mkdir(parents=True)
+        (partial / "summary.json").write_text(
+            json.dumps({"execution_status": "succeeded", "scores": {"security": 0.1}}),
+            encoding="utf-8",
+        )
+    elif primary_kind == "non-object":
+        completed = primary / "20260709_020000"
+        summary = completed / "codex" / "with-skill" / "summary.json"
+        summary.parent.mkdir(parents=True)
+        summary.write_text("[]\n", encoding="utf-8")
+        _complete_current_run(completed)
+
+    legacy = skill_path / "evals" / "results" / "legacy-run" / "opencode" / "with-skill"
+    legacy.mkdir(parents=True)
+    (legacy / "summary.json").write_text(
+        json.dumps({"execution_status": "succeeded", "scores": {"security": 0.9}}),
+        encoding="utf-8",
+    )
+
+    assert compare_results(skill_path, results_dir=tmp_path / "results") == 0
+    output = capsys.readouterr().out
+    assert "opencode" in output
+    assert "legacy-run" in output
+
+
+def test_compare_never_mixes_agents_across_candidate_roots(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    skill_path = tmp_path / "demo"
+    skill_path.mkdir()
+    primary_run = tmp_path / "results" / "demo" / "20260709_020000"
+    primary = primary_run / "codex" / "with-skill"
+    primary.mkdir(parents=True)
+    (primary / "summary.json").write_text(
+        json.dumps({"execution_status": "succeeded", "scores": {"security": 0.8}}),
+        encoding="utf-8",
+    )
+    _complete_current_run(primary_run)
+    legacy = skill_path / "evals" / "results" / "legacy-run" / "opencode" / "with-skill"
+    legacy.mkdir(parents=True)
+    (legacy / "summary.json").write_text(
+        json.dumps({"execution_status": "succeeded", "scores": {"security": 0.9}}),
+        encoding="utf-8",
+    )
+
+    assert compare_results(skill_path, results_dir=tmp_path / "results") == 0
+    output = capsys.readouterr().out
+    assert "codex" in output
+    assert "opencode" not in output

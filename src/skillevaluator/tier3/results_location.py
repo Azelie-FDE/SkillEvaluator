@@ -7,9 +7,12 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 ENV_RESULTS_DIR = "SKILLEVALUATOR_RESULTS_DIR"
 _RUN_TIMESTAMP_FORMATS = (("%Y%m%d_%H%M%S", 15), ("%Y-%m-%d_%H%M%S", 17))
@@ -103,32 +106,110 @@ def _run_timestamp(name: str) -> datetime | None:
     return None
 
 
-def _newest_completed_run(root: Path) -> Path | None:
-    """Return the newest complete timestamped run without relying on symlinks."""
+def _path_is_link_or_reparse(path: Path, metadata: os.stat_result) -> bool:
+    """Return whether a result path is a symlink, junction, or reparse point."""
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if stat.S_ISLNK(metadata.st_mode) or bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag):
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if not callable(is_junction):
+        return False
     try:
-        children = root.iterdir()
+        return bool(is_junction())
+    except (OSError, RuntimeError):
+        return True
+
+
+def run_directory_sort_key(
+    candidate: Path,
+    *,
+    require_completed_result: bool = False,
+) -> tuple[datetime, int, str] | None:
+    """Return shared newest-first ordering metadata for a result directory.
+
+    Timestamp-shaped directories are current runs and are visible only after
+    their final ``result.json`` identifies the directory's run id. Historical
+    non-timestamp summary directories remain available to compare workflows.
+    """
+    if candidate.name.startswith((".", "_")) or candidate.name == "latest":
+        return None
+    try:
+        candidate_metadata = candidate.lstat()
+        if _path_is_link_or_reparse(candidate, candidate_metadata) or not stat.S_ISDIR(candidate_metadata.st_mode):
+            return None
     except OSError:
         return None
 
-    completed: list[tuple[datetime, int, str, Path]] = []
+    timestamp = _run_timestamp(candidate.name)
+    is_current_run = timestamp is not None
+    if not is_current_run:
+        if require_completed_result:
+            return None
+        timestamp = datetime.min  # noqa: DTZ901 -- result directory timestamps are intentionally timezone-free
+
+    completed = False
+    completion_mtime = -1
     try:
-        for candidate in children:
-            timestamp = _run_timestamp(candidate.name)
-            if timestamp is None or candidate.name.startswith((".", "_")) or candidate.is_symlink():
-                continue
-            try:
-                if not candidate.is_dir():
-                    continue
-                result_path = candidate / "result.json"
-                result = json.loads(result_path.read_text(encoding="utf-8"))
-                completion_mtime = result_path.stat().st_mtime_ns
-            except (FileNotFoundError, json.JSONDecodeError, OSError):
-                continue
-            if isinstance(result, dict) and result.get("run_id") == candidate.name:
-                completed.append((timestamp, completion_mtime, candidate.name, candidate))
-    except OSError:
+        result_path = candidate / "result.json"
+        before = result_path.lstat()
+        if _path_is_link_or_reparse(result_path, before) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            return None
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        after = result_path.lstat()
+        if (
+            _path_is_link_or_reparse(result_path, after)
+            or not stat.S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        ):
+            return None
+        completion_mtime = after.st_mtime_ns
+        completed = isinstance(result, dict) and result.get("run_id") == candidate.name
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    if (is_current_run or require_completed_result) and not completed:
         return None
-    return max(completed, default=(None, -1, "", None), key=lambda item: (item[0], item[1], item[2]))[3]
+    if not completed:
+        completion_mtime = -1
+    return timestamp, completion_mtime, candidate.name
+
+
+def ordered_run_directories(root: Path, *, completed_only: bool = False) -> list[Path]:
+    """Return result directories in shared newest-first order."""
+    try:
+        candidates = root.iterdir()
+    except OSError:
+        return []
+
+    ordered: list[tuple[tuple[datetime, int, str], Path]] = []
+    try:
+        for candidate in candidates:
+            key = run_directory_sort_key(candidate, require_completed_result=completed_only)
+            if key is not None:
+                ordered.append((key, candidate))
+    except OSError:
+        return []
+    ordered.sort(key=lambda item: item[0], reverse=True)
+    return [candidate for _, candidate in ordered]
+
+
+def _newest_completed_run(root: Path) -> Path | None:
+    """Return the newest complete timestamped run without relying on symlinks."""
+    return next(iter(ordered_run_directories(root, completed_only=True)), None)
+
+
+def publish_latest_results(root: Path, run_id: str) -> bool:
+    """Atomically replace ``latest`` with a relative symlink to ``run_id``."""
+    temporary = root / f".latest-{os.getpid()}-{uuid4().hex}.tmp"
+    try:
+        temporary.symlink_to(run_id)
+        os.replace(temporary, root / "latest")  # noqa: PTH105 -- explicit atomic replacement is the contract
+    except OSError:
+        with suppress(OSError):
+            temporary.unlink()
+        return False
+    return True
 
 
 def resolve_latest_results(
@@ -143,14 +224,36 @@ def resolve_latest_results(
         cli_results_dir,
         environ=environ,
     )
+    first_missing_latest: Path | None = None
     for root in roots:
         latest = root / "latest"
-        if latest.exists():
-            return latest
+        if not os.path.lexists(latest) and first_missing_latest is None:
+            first_missing_latest = latest
+        if latest.is_symlink():
+            try:
+                link_target = latest.readlink()
+                if link_target.is_absolute() or len(link_target.parts) != 1 or link_target.parts[0] in {"", ".", ".."}:
+                    raise ValueError("latest must name one relative run directory")
+                resolved_root = root.resolve(strict=True)
+                target = latest.resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                pass
+            else:
+                if (
+                    link_target.name == target.name
+                    and target.parent == resolved_root
+                    and run_directory_sort_key(target, require_completed_result=True) is not None
+                ):
+                    return latest
         fallback = _newest_completed_run(root)
         if fallback is not None:
             return fallback
-    return roots[0] / "latest"
+    if first_missing_latest is not None:
+        return first_missing_latest
+    while True:
+        unavailable = roots[0] / f".latest-unavailable-{uuid4().hex}"
+        if not os.path.lexists(unavailable):
+            return unavailable
 
 
 def resolve_explicit_or_latest_results(

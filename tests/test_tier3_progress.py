@@ -723,6 +723,25 @@ def test_runner_reserves_unique_run_directories_concurrently(tmp_path: Path) -> 
     assert all((run_dir / ".skillevaluator-generated-output").is_file() for run_dir in run_dirs)
 
 
+def test_runner_publishes_latest_through_shared_atomic_helper(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner, skill = _stub_runner(monkeypatch, tmp_path)
+    published: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        runner,
+        "publish_latest_results",
+        lambda root, run_id: published.append((root, run_id)),
+        raising=False,
+    )
+    results_root = tmp_path / "results"
+
+    result = runner.run_harbor_eval(skill, ["codex"], output_dir=results_root)
+
+    assert published == [(results_root, Path(result["run_dir"]).name)]
+
+
 def test_runner_persists_compact_feedback_to_result_json(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

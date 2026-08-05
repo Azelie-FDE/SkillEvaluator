@@ -11,6 +11,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -39,8 +40,12 @@ from skillevaluator.tier3.harbor.adapter import (
     validate_results_root_location,
 )
 from skillevaluator.tier3.harbor.artifact_retention import HarborArtifactLifecycle, RetentionOutcome
-from skillevaluator.tier3.harbor.collector import collect_harbor_results, validate_harbor_job_result
-from skillevaluator.tier3.harbor.metrics import DEFAULT_METRICS, overall_score, score_definition
+from skillevaluator.tier3.harbor.collector import (
+    collect_harbor_results,
+    harbor_job_passed,
+    validate_harbor_job_result,
+)
+from skillevaluator.tier3.harbor.metrics import DEFAULT_METRICS, score_definition
 from skillevaluator.tier3.harbor.progress import (
     NullProgressReporter,
     ProgressEvent,
@@ -53,6 +58,7 @@ from skillevaluator.tier3.harbor.progress import (
 from skillevaluator.tier3.harbor.secure_copy import copytree_secure
 from skillevaluator.tier3.harbor.secure_docker_environment import SECURE_DOCKER_ENV_IMPORT_PATH
 from skillevaluator.tier3.output_provenance import mark_generated_output_root
+from skillevaluator.tier3.results_location import publish_latest_results
 from skillevaluator.tier3_environments import DEFAULT_ENV_MODE, ENV_MODE_LOCAL, HARBOR_ENV_MODES
 
 logger = logging.getLogger(__name__)
@@ -1162,20 +1168,8 @@ def _validate_harbor_job_result(
 
 
 def _job_passed(job_dir: Path, pass_threshold: float) -> bool:
-    """Return True when any reward in a one-task Harbor job reaches threshold."""
-    for reward_file in sorted(job_dir.rglob("reward.json")):
-        if reward_file.parent.name != "verifier":
-            continue
-        try:
-            reward = json.loads(reward_file.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            continue
-        if not isinstance(reward, dict):
-            continue
-        score = overall_score(reward)
-        if score is not None and score >= pass_threshold:
-            return True
-    return False
+    """Use collector-authoritative logical-attempt semantics for early stop."""
+    return harbor_job_passed(job_dir, pass_threshold)
 
 
 def _attempt_job_stats(
@@ -1228,6 +1222,31 @@ def _attempt_job_stats(
     return total, completed, errored, evals_out
 
 
+def _job_path_is_link_or_reparse(path: Path, metadata: os.stat_result) -> bool:
+    """Return whether an attempt-job root is a symlink, junction, or reparse point."""
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if stat.S_ISLNK(metadata.st_mode) or bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag):
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if not callable(is_junction):
+        return False
+    try:
+        return bool(is_junction())
+    except (OSError, RuntimeError):
+        return True
+
+
+def _job_root_fingerprint(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
 def _merge_attempt_jobs(job_dirs: list[Path], aggregate_dir: Path) -> None:
     """Merge per-attempt Harbor jobs into the job directory shape collection expects.
 
@@ -1235,61 +1254,115 @@ def _merge_attempt_jobs(job_dirs: list[Path], aggregate_dir: Path) -> None:
     per-attempt Harbor ``result.json`` statistics are combined so the merged
     job still satisfies :func:`validate_harbor_job_result`.
     """
-    if aggregate_dir.exists():
-        shutil.rmtree(aggregate_dir)
-    aggregate_dir.mkdir(parents=True, exist_ok=True)
-
-    total_trials = 0
-    completed_trials = 0
-    errored_trials = 0
-    merged_evals: dict[str, dict[str, Any]] = {}
+    aggregate_path = Path(os.path.abspath(aggregate_dir))  # noqa: PTH100 -- compare lexical publication roots
+    source_paths: list[tuple[str, Path, Path, tuple[int, int, int, int, int, int]]] = []
     for job_dir in job_dirs:
-        if not job_dir.is_dir():
+        job_path = Path(os.path.abspath(job_dir))  # noqa: PTH100 -- reject overlap before temp creation
+        if not os.path.lexists(job_path):
             continue
-        renamed: dict[str, str] = {}
-        for child in sorted(job_dir.iterdir()):
-            if not child.is_dir():
+        try:
+            metadata = job_path.lstat()
+        except OSError as exc:
+            raise ValueError(f"cannot inspect attempt Harbor job root: {job_path}") from exc
+        if _job_path_is_link_or_reparse(job_path, metadata) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"attempt Harbor job root must be a non-linked directory: {job_path}")
+        try:
+            job_resolved = job_path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"cannot resolve attempt Harbor job root: {job_path}") from exc
+        aggregate_resolved = aggregate_path.resolve(strict=False)
+        if (
+            aggregate_resolved == job_resolved
+            or aggregate_resolved.is_relative_to(job_resolved)
+            or job_resolved.is_relative_to(aggregate_resolved)
+        ):
+            raise ValueError("aggregate Harbor job directory must not overlap an attempt job directory")
+        source_paths.append((job_path.name, job_path, job_resolved, _job_root_fingerprint(metadata)))
+
+    aggregate_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{aggregate_path.name}-merge-",
+        dir=aggregate_path.parent,
+    ) as private_root_raw:
+        private_root = Path(private_root_raw)
+        snapshot_root = private_root / "attempt-jobs"
+        snapshot_root.mkdir()
+        staged_aggregate = private_root / "aggregate"
+        staged_aggregate.mkdir()
+
+        snapshots: list[tuple[str, Path]] = []
+        for index, (job_name, job_path, job_resolved, expected_fingerprint) in enumerate(source_paths):
+            snapshot = snapshot_root / f"{index:04d}-{job_name}"
+            try:
+                before = job_path.lstat()
+            except OSError as exc:
+                raise ValueError(f"attempt Harbor job root changed before snapshot: {job_path}") from exc
+            if _job_path_is_link_or_reparse(job_path, before) or _job_root_fingerprint(before) != expected_fingerprint:
+                raise ValueError(f"attempt Harbor job root changed before snapshot: {job_path}")
+            copytree_secure(job_path, snapshot, allowed_root=job_resolved)
+            try:
+                after = job_path.lstat()
+            except OSError as exc:
+                raise ValueError(f"attempt Harbor job root changed during snapshot: {job_path}") from exc
+            if _job_path_is_link_or_reparse(job_path, after) or _job_root_fingerprint(after) != expected_fingerprint:
+                raise ValueError(f"attempt Harbor job root changed during snapshot: {job_path}")
+            snapshots.append((job_name, snapshot))
+
+        total_trials = 0
+        completed_trials = 0
+        errored_trials = 0
+        merged_evals: dict[str, dict[str, Any]] = {}
+        for job_name, job_dir in snapshots:
+            renamed: dict[str, str] = {}
+            for child in sorted(job_dir.iterdir()):
+                if not child.is_dir():
+                    continue
+                dest = staged_aggregate / f"{job_name}__{child.name}"
+                suffix = 2
+                while dest.exists():
+                    dest = staged_aggregate / f"{job_name}__{child.name}-{suffix}"
+                    suffix += 1
+                copytree_secure(child, dest, allowed_root=job_dir)
+                renamed[child.name] = dest.name
+
+            stats = _attempt_job_stats(job_dir)
+            if stats is None:
                 continue
-            dest = aggregate_dir / f"{job_dir.name}__{child.name}"
-            suffix = 2
-            while dest.exists():
-                dest = aggregate_dir / f"{job_dir.name}__{child.name}-{suffix}"
-                suffix += 1
-            copytree_secure(child, dest, allowed_root=job_dir)
-            renamed[child.name] = dest.name
+            job_total, job_completed, job_errored, job_evals = stats
+            total_trials += job_total
+            completed_trials += job_completed
+            errored_trials += job_errored
+            for eval_name, (eval_trials, eval_errors, reward_stats) in job_evals.items():
+                merged = merged_evals.setdefault(eval_name, {"n_trials": 0, "n_errors": 0, "reward_stats": {}})
+                merged["n_trials"] += eval_trials
+                merged["n_errors"] += eval_errors
+                for metric, buckets in reward_stats.items():
+                    merged_buckets = merged["reward_stats"].setdefault(metric, {})
+                    for bucket, trial_names in buckets.items():
+                        merged_buckets.setdefault(bucket, []).extend(
+                            renamed.get(name, f"{job_name}__{name}") for name in trial_names
+                        )
 
-        stats = _attempt_job_stats(job_dir)
-        if stats is None:
-            continue
-        job_total, job_completed, job_errored, job_evals = stats
-        total_trials += job_total
-        completed_trials += job_completed
-        errored_trials += job_errored
-        for eval_name, (eval_trials, eval_errors, reward_stats) in job_evals.items():
-            merged = merged_evals.setdefault(eval_name, {"n_trials": 0, "n_errors": 0, "reward_stats": {}})
-            merged["n_trials"] += eval_trials
-            merged["n_errors"] += eval_errors
-            for metric, buckets in reward_stats.items():
-                merged_buckets = merged["reward_stats"].setdefault(metric, {})
-                for bucket, trial_names in buckets.items():
-                    merged_buckets.setdefault(bucket, []).extend(
-                        renamed.get(name, f"{job_dir.name}__{name}") for name in trial_names
-                    )
-
-    (aggregate_dir / "result.json").write_text(
-        json.dumps(
-            {
-                "n_total_trials": total_trials,
-                "stats": {
-                    "n_trials": completed_trials,
-                    "n_errors": errored_trials,
-                    "evals": merged_evals,
+        (staged_aggregate / "result.json").write_text(
+            json.dumps(
+                {
+                    "n_total_trials": total_trials,
+                    "stats": {
+                        "n_trials": completed_trials,
+                        "n_errors": errored_trials,
+                        "evals": merged_evals,
+                    },
                 },
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        copytree_secure(
+            staged_aggregate,
+            aggregate_path,
+            replace_existing=aggregate_path.exists(),
+            allowed_root=private_root,
+        )
 
 
 def _run_stop_on_pass_variant(
@@ -2178,13 +2251,7 @@ def _run_harbor_eval_impl(
     else:
         reporter.emit(ProgressEvent(stage="report", state="complete", detail="result and HTML reports written"))
 
-    latest = root / "latest"
-    try:
-        if latest.is_symlink() or latest.exists():
-            latest.unlink()
-        latest.symlink_to(run_id)
-    except OSError:
-        pass
+    publish_latest_results(root, run_id)
     return results
 
 
