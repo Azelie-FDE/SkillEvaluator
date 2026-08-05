@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -706,14 +707,26 @@ def test_rejects_run_config_changed_during_result_read(
     assert not _is_completed(run)
 
 
+@pytest.mark.parametrize("newest_first", [False, True], ids=("oldest-first", "newest-first"))
 def test_rejects_candidate_tree_swap_between_artifact_reads(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    *,
+    newest_first: bool,
 ) -> None:
-    run = _write_current_run(tmp_path)
+    completed = _write_current_run(tmp_path, "20260709_110000_111_aaaaaaaaaaaa")
+    unstable = _write_current_run(tmp_path, "20260709_120000_222_bbbbbbbbbbbb")
     moved = tmp_path / "moved-run"
+    real_iterdir = results_location.Path.iterdir
     real_read_bytes = results_location.SecureRoot.read_bytes
     swapped = False
+
+    candidates = (unstable, completed) if newest_first else (completed, unstable)
+
+    def stable_candidate_order(path: Path) -> Iterator[Path]:
+        if path == tmp_path:
+            return iter(candidates)
+        return real_iterdir(path)
 
     def swap_candidate(
         secure_root: results_location.SecureRoot,
@@ -723,12 +736,14 @@ def test_rejects_candidate_tree_swap_between_artifact_reads(
         expected: os.stat_result | None = None,
     ) -> tuple[bytes, os.stat_result]:
         nonlocal swapped
-        if not swapped and relative_path == Path("result.json"):
+        if not swapped and secure_root.root == unstable.absolute() and relative_path == Path("result.json"):
             swapped = True
-            run.rename(moved)
-            _write_current_run(tmp_path, run.name)
+            unstable.rename(moved)
+            _write_current_run(tmp_path, unstable.name)
         return real_read_bytes(secure_root, relative_path, max_bytes, expected=expected)
 
+    monkeypatch.setattr(results_location.Path, "iterdir", stable_candidate_order)
     monkeypatch.setattr(results_location.SecureRoot, "read_bytes", swap_candidate)
 
-    assert not _is_completed(run)
+    assert results_location._newest_run_dir(tmp_path) == completed
+    assert swapped
