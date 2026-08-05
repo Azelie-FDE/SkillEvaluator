@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
+import errno
 import importlib
 import io
 import json
 import subprocess
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -701,6 +703,54 @@ def test_runner_returns_error_when_private_evaluator_snapshot_cannot_be_created(
     assert result["error"] == [f"No evaluator source directory found at {skill / 'evals'}"]
 
 
+def test_runner_returns_structured_error_and_cleans_partial_snapshot_on_enospc(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from skillevaluator.tier3.harbor import adapter, runner
+
+    skill = tmp_path / "snapshot-enospc-skill"
+    (skill / "evals").mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# Snapshot ENOSPC\n", encoding="utf-8")
+    dataset = skill / "evals" / "evals.json"
+    dataset.write_text(json.dumps([{"id": "case-1", "question": "Use the skill."}]), encoding="utf-8")
+    temporary_root = tmp_path / "snapshot-temporary-root"
+    temporary_root.mkdir()
+    reporter = _RecordingReporter()
+    provider_resolution_calls: list[bool] = []
+
+    def fail_snapshot_copy(_source: Path, destination: Path, **_kwargs: Any) -> None:
+        destination.mkdir(parents=True)
+        (destination / "partial-copy").write_text("partial\n", encoding="utf-8")
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    def unexpected_provider_resolution() -> None:
+        provider_resolution_calls.append(True)
+        raise AssertionError("provider resolution must not start after snapshot failure")
+
+    monkeypatch.setattr(adapter, "copytree_secure", fail_snapshot_copy)
+    monkeypatch.setattr(tempfile, "tempdir", str(temporary_root))
+    monkeypatch.setattr(runner, "resolve_llm_provider", unexpected_provider_resolution)
+    results_root = tmp_path / "results"
+
+    result = runner.run_harbor_eval(
+        skill,
+        ["codex"],
+        output_dir=results_root,
+        progress_reporter=reporter,
+    )
+
+    assert result["error"] == ["[Errno 28] No space left on device"]
+    assert provider_resolution_calls == []
+    assert not results_root.exists()
+    assert list(temporary_root.iterdir()) == []
+    assert json.loads(dataset.read_text(encoding="utf-8")) == [{"id": "case-1", "question": "Use the skill."}]
+    transitions = [(event.stage, event.state) for event in reporter.events]
+    assert ("configuration", "failed") in transitions
+    assert transitions[-1] == ("run-finished", "failed")
+    assert transitions.count(("run-finished", "failed")) == 1
+
+
 @pytest.mark.parametrize("kind", ["symlink", "hardlink"])
 def test_runner_returns_error_for_unsafe_evals_config(tmp_path: Path, kind: str) -> None:
     from skillevaluator.tier3.harbor import runner
@@ -883,6 +933,66 @@ def test_default_task_staging_failure_cleans_transient_artifacts(
     assert not (run_dir / "_harbor-jobs").exists()
     assert not (run_dir / "_harbor-tasks").exists()
     assert result["harbor_jobs_retained"] is False
+
+
+@pytest.mark.parametrize("failure_arm", ["with-skill", "baseline"])
+def test_task_staging_enospc_returns_structured_error_without_launch_and_cleans_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure_arm: str,
+) -> None:
+    launches: list[dict[str, Any]] = []
+    evaluator_snapshots: list[Path] = []
+
+    def fail_staging(_skill: Path, output: Path, **kwargs: Any) -> list[Path]:
+        evaluator_snapshots.append(Path(kwargs["evaluator_skill_path"]))
+        output.mkdir(parents=True)
+        (output / "partial-copy").write_text("partial\n", encoding="utf-8")
+        should_fail = (failure_arm == "with-skill" and kwargs["with_skill"]) or (
+            failure_arm == "baseline" and not kwargs["with_skill"]
+        )
+        if should_fail:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return [output / "case-1"]
+
+    def record_launch(**kwargs: Any) -> list[str]:
+        launches.append(kwargs)
+        return []
+
+    runner, skill = _stub_runner(
+        monkeypatch,
+        tmp_path,
+        task_emitter=fail_staging,
+        run_agent=record_launch,
+    )
+    reporter = _RecordingReporter()
+
+    result = runner.run_harbor_eval(
+        skill,
+        ["codex"],
+        skip_baseline=False,
+        output_dir=tmp_path / "results",
+        progress_reporter=reporter,
+    )
+
+    run_dir = Path(result["run_dir"])
+    assert result["error"] == ["[Errno 28] No space left on device"]
+    assert launches == []
+    assert len(evaluator_snapshots) == (1 if failure_arm == "with-skill" else 2)
+    assert len(set(evaluator_snapshots)) == 1
+    assert not evaluator_snapshots[0].exists()
+    assert not (run_dir / "_harbor-jobs").exists()
+    assert not (run_dir / "_harbor-tasks").exists()
+    assert result["harbor_jobs_retained"] is False
+    transitions = [(event.stage, event.state) for event in reporter.events]
+    expected_stage = "with-skill-tasks" if failure_arm == "with-skill" else "baseline-tasks"
+    assert (expected_stage, "running") in transitions
+    assert (expected_stage, "failed") in transitions
+    if failure_arm == "baseline":
+        assert ("with-skill-tasks", "failed") not in transitions
+    assert not any(stage.startswith("agent:") and state == "running" for stage, state in transitions)
+    assert transitions[-1] == ("run-finished", "failed")
+    assert transitions.count(("run-finished", "failed")) == 1
 
 
 def test_default_collection_exception_cleans_transient_artifacts(

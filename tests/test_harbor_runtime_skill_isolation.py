@@ -28,6 +28,7 @@ from skillevaluator.tier3.harbor.adapter import (
     validate_results_root_location,
 )
 from skillevaluator.tier3.output_provenance import mark_generated_output_root
+from skillevaluator.tier3.results_location import publish_latest_results
 
 
 def _write_runtime_skill(path: Path, package: str) -> Path:
@@ -1012,6 +1013,84 @@ def test_rotated_generated_output_is_excluded_from_runtime_skill_and_repo(
         path.read_text(encoding="utf-8", errors="ignore") for path in environment.rglob("*") if path.is_file()
     )
     assert "OLD-CASE-SECRET" not in readable
+
+
+@pytest.mark.parametrize("copy_repo", [False, True])
+def test_rotated_results_latest_alias_to_authenticated_run_is_excluded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    copy_repo: bool,
+) -> None:
+    monkeypatch.setenv(
+        "SKILLEVALUATOR_OUTPUT_PROVENANCE_KEY_FILE",
+        str(tmp_path / ".skillevaluator-state" / "output-provenance.key"),
+    )
+    repo, target, _, _ = _write_projection_fixture(tmp_path)
+    old_results_root = target / "archived-results"
+    run_id = "20260805_120000_123_aaaaaaaaaaaa"
+    old_run = old_results_root / run_id
+    mark_generated_output_root(old_run)
+    (old_run / "run_config.json").write_text("{}\n", encoding="utf-8")
+    (old_run / "result.json").write_text(json.dumps({"run_id": run_id}), encoding="utf-8")
+    (old_run / "fixture-oracle.txt").write_text("HISTORICAL-RESULT-ORACLE\n", encoding="utf-8")
+    assert publish_latest_results(old_results_root, run_id)
+    (target / "evals" / "evals.json").write_text(
+        json.dumps([{"id": "case-001", "question": "Do not use historical results.", "files": []}]),
+        encoding="utf-8",
+    )
+
+    task = generate_harbor_tasks(target, tmp_path / f"current-latest-{copy_repo}", copy_repo=copy_repo)[0]
+
+    environment = task / "environment"
+    runtime_old_root = environment / "skills" / target.name / old_results_root.relative_to(target)
+    assert not (runtime_old_root / run_id).exists()
+    assert not (runtime_old_root / "latest").exists()
+    if copy_repo:
+        repo_old_root = environment / "repo" / target.relative_to(repo) / old_results_root.relative_to(target)
+        assert not (repo_old_root / run_id).exists()
+        assert not (repo_old_root / "latest").exists()
+    readable = "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore") for path in environment.rglob("*") if path.is_file()
+    )
+    assert "HISTORICAL-RESULT-ORACLE" not in readable
+
+
+@pytest.mark.parametrize("lookalike", ["unmarked-latest", "outside-latest", "non-latest-alias"])
+def test_rotated_results_symlink_lookalikes_remain_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lookalike: str,
+) -> None:
+    monkeypatch.setenv(
+        "SKILLEVALUATOR_OUTPUT_PROVENANCE_KEY_FILE",
+        str(tmp_path / ".skillevaluator-state" / "output-provenance.key"),
+    )
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    old_results_root = target / "archived-results"
+    old_results_root.mkdir()
+    if lookalike == "non-latest-alias":
+        target_dir = old_results_root / "marked-run"
+        mark_generated_output_root(target_dir)
+        alias = old_results_root / "current"
+    elif lookalike == "unmarked-latest":
+        target_dir = old_results_root / "unmarked-run"
+        target_dir.mkdir()
+        alias = old_results_root / "latest"
+    else:
+        target_dir = tmp_path / "outside-run"
+        target_dir.mkdir()
+        alias = old_results_root / "latest"
+    (target_dir / "payload.txt").write_text("UNAUTHENTICATED-LOOKALIKE\n", encoding="utf-8")
+    try:
+        alias.symlink_to(target_dir.name if target_dir.parent == old_results_root else target_dir)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    output = tmp_path / f"lookalike-{lookalike}"
+    with pytest.raises(ValueError, match="symlink"):
+        generate_harbor_tasks(target, output)
+
+    assert not output.exists()
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="requires the macOS /var root alias")

@@ -1688,7 +1688,7 @@ def _run_harbor_eval_impl(
         with ExitStack() as snapshot_stack:
             try:
                 evaluator_skill_path = snapshot_stack.enter_context(private_evaluator_skill_snapshot(skill_path))
-            except (FileNotFoundError, ValueError) as exc:
+            except (OSError, ValueError) as exc:
                 reporter.emit(ProgressEvent(stage="configuration", state="failed", detail=str(exc)))
                 return {"error": [str(exc)]}
             forwarded["_evaluator_skill_path"] = evaluator_skill_path
@@ -1930,6 +1930,7 @@ def _run_harbor_eval_impl(
             result_path=str(result_path),
         )
     )
+    staging_failure_stage = "with-skill-tasks"
     try:
         for agent in agents:
             with_dir = tasks_dir / agent / "with"
@@ -1962,6 +1963,7 @@ def _run_harbor_eval_impl(
         reporter.emit(ProgressEvent(stage="with-skill-tasks", state="ready", detail="task inputs staged"))
         if not skip_baseline:
             reporter.emit(ProgressEvent(stage="baseline-tasks", state="running"))
+            staging_failure_stage = "baseline-tasks"
         for agent in agents:
             without_dir = agent_task_dirs[agent][1]
             if without_dir is not None:
@@ -1988,8 +1990,8 @@ def _run_harbor_eval_impl(
             reporter.emit(ProgressEvent(stage="baseline-tasks", state="ready", detail="baseline inputs staged"))
         else:
             reporter.emit(ProgressEvent(stage="baseline-tasks", state="skipped", detail="baseline disabled"))
-    except (FileNotFoundError, ValueError) as exc:
-        reporter.emit(ProgressEvent(stage="with-skill-tasks", state="failed", detail=str(exc)))
+    except (OSError, ValueError) as exc:
+        reporter.emit(ProgressEvent(stage=staging_failure_stage, state="failed", detail=str(exc)))
         return {"error": [str(exc)], "run_dir": str(run_dir)}
 
     task_names = expected_task_names or []

@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from skillevaluator.tier3 import results_location
+from skillevaluator.tier3.harbor.metrics import DEFAULT_METRIC_SET
 from skillevaluator.tier3.output_provenance import GENERATED_OUTPUT_MARKER, mark_generated_output_root
 
 
@@ -26,14 +27,23 @@ def _write_legacy_run_config(run: Path, *agents: str) -> None:
     (run / "run_config.json").write_text(
         json.dumps(
             {
-                "harbor": {"n_attempts": {"value": 1, "source": "ACES default"}},
+                "harbor": {
+                    "environment": {"value": "docker", "source": "CLI"},
+                    "n_attempts": 1,
+                    "stop_on_pass": False,
+                    "n_concurrent": 1,
+                    "timeout_multiplier": 1.0,
+                    "base_image_mode": "auto",
+                    "jobs_retained": False,
+                },
+                "provider": {"name": "nvidia", "model": "test-model"},
                 "task_source": "evals_json",
+                "grading": {"mode": "default"},
                 "agents": {
                     agent: {
                         "agent": agent,
                         "model": "test-model",
                         "source": "test default",
-                        "occurrence": "1",
                     }
                     for agent in agents
                 },
@@ -77,7 +87,7 @@ def _successful_summary_payload(agent: str = "opencode") -> dict[str, object]:
         "model_source": "test default",
         "scores": {"security": 0.8},
         "custom_scores": {},
-        "metric_set": "aces-default-v2",
+        "metric_set": DEFAULT_METRIC_SET,
         "metrics": ["security"],
         "dimensions": {"safety": {"score": 0.8, "sources": {"security": 1.0}}},
         "num_trials": 1,
@@ -116,12 +126,108 @@ def test_rejects_current_run_with_list_valued_run_config(tmp_path: Path) -> None
     assert not _is_completed(run)
 
 
-def test_accepts_pre_result_run_with_valid_summary(tmp_path: Path) -> None:
+def test_accepts_pre_result_run_with_public_runner_config_shape(tmp_path: Path) -> None:
     run = _run(tmp_path)
     _write_legacy_run_config(run, "opencode")
     _write_successful_summary(run)
 
     assert _is_completed(run)
+
+
+@pytest.mark.parametrize("sidecar_name", ["harbor-run-logs", "astra-cleanup"])
+def test_accepts_opaque_pre_result_runtime_sidecar(tmp_path: Path, sidecar_name: str) -> None:
+    run = _run(tmp_path)
+    _write_legacy_run_config(run, "opencode")
+    _write_successful_summary(run)
+    sidecar = run / sidecar_name
+    sidecar.mkdir()
+    (sidecar / "unexpected.log").write_text("opaque runtime data", encoding="utf-8")
+    nested = sidecar / "unexpected-directory"
+    nested.mkdir()
+    (nested / "payload.bin").write_bytes(b"opaque")
+
+    assert _is_completed(run)
+
+
+@pytest.mark.parametrize("sidecar_name", ["harbor-run-logs", "astra-cleanup"])
+def test_accepts_link_inside_opaque_pre_result_runtime_sidecar(tmp_path: Path, sidecar_name: str) -> None:
+    run = _run(tmp_path)
+    _write_legacy_run_config(run, "opencode")
+    _write_successful_summary(run)
+    sidecar = run / sidecar_name
+    sidecar.mkdir()
+    outside = tmp_path / f"outside-{sidecar_name}.log"
+    outside.write_text("opaque runtime data", encoding="utf-8")
+    try:
+        (sidecar / "unexpected-link").symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable: {exc}")
+
+    assert _is_completed(run)
+
+
+@pytest.mark.parametrize("sibling_name", ["staged", "unknown-runtime"])
+def test_rejects_unknown_pre_result_sibling_directory(tmp_path: Path, sibling_name: str) -> None:
+    run = _run(tmp_path)
+    _write_legacy_run_config(run, "opencode")
+    _write_successful_summary(run)
+    (run / sibling_name).mkdir()
+
+    assert not _is_completed(run)
+
+
+def test_accepts_pre_result_run_with_valid_optional_occurrence(tmp_path: Path) -> None:
+    run = _run(tmp_path)
+    _write_legacy_run_config(run, "opencode")
+    config_path = run / "run_config.json"
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["agents"]["opencode"]["occurrence"] = "2"
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    _write_successful_summary(run)
+
+    assert _is_completed(run)
+
+
+@pytest.mark.parametrize(
+    "occurrence",
+    [
+        None,
+        "",
+        "0",
+        "not-a-number",
+        "\N{SUPERSCRIPT TWO}",
+        "\N{FULLWIDTH DIGIT ONE}",
+        "\N{ARABIC-INDIC DIGIT TWO}",
+        1,
+    ],
+)
+def test_rejects_pre_result_run_with_invalid_optional_occurrence(
+    tmp_path: Path,
+    occurrence: object,
+) -> None:
+    run = _run(tmp_path)
+    _write_legacy_run_config(run, "opencode")
+    config_path = run / "run_config.json"
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["agents"]["opencode"]["occurrence"] = occurrence
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    _write_successful_summary(run)
+
+    assert not _is_completed(run)
+
+
+def test_rejects_oversized_ascii_occurrence_without_raising(tmp_path: Path) -> None:
+    run = _run(tmp_path)
+    _write_legacy_run_config(run, "opencode")
+    config_path = run / "run_config.json"
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    payload["agents"]["opencode"]["occurrence"] = "9" * 5000
+
+    assert results_location._legacy_run_agents(payload) is None
+
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    _write_successful_summary(run)
+    assert not _is_completed(run)
 
 
 def test_accepts_summary_from_before_truthful_status_fields(tmp_path: Path) -> None:

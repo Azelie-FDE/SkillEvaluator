@@ -29,6 +29,12 @@ _RUN_TIMESTAMP_FORMATS = (("%Y%m%d_%H%M%S", 15), ("%Y-%m-%d_%H%M%S", 17))
 # historical summary carries status or attempt coverage, those must be complete.
 _RUN_COMPLETION_ARTIFACTS = ("run_config.json",)
 _FINAL_RESULT_ARTIFACT = "result.json"
+# The writer emits a small enumeration; this generous cap rejects pathological
+# metadata without relying on Python's bounded decimal-to-int conversion.
+_MAX_LEGACY_OCCURRENCE_DIGITS = 32
+# These runtime-owned directories predate canonical run-level ``result.json``;
+# ``staged/`` arrived with that artifact and is intentionally not legacy-safe.
+_LEGACY_RUNTIME_SIDECAR_DIRS = frozenset({"harbor-run-logs", "astra-cleanup"})
 
 
 def _expand(path: str | Path) -> Path:
@@ -218,9 +224,16 @@ def _legacy_run_agents(payload: object) -> tuple[str, ...] | None:
             or not metadata["model"].strip()
             or not isinstance(metadata.get("source"), str)
             or not metadata["source"].strip()
-            or not isinstance(metadata.get("occurrence"), str)
-            or not metadata["occurrence"].isdigit()
-            or int(metadata["occurrence"]) < 1
+            or (
+                "occurrence" in metadata
+                and (
+                    not isinstance(metadata["occurrence"], str)
+                    or not 1 <= len(metadata["occurrence"]) <= _MAX_LEGACY_OCCURRENCE_DIGITS
+                    or not metadata["occurrence"].isascii()
+                    or not metadata["occurrence"].isdigit()
+                    or not any(character != "0" for character in metadata["occurrence"])
+                )
+            )
         ):
             return None
         normalized.append(agent)
@@ -516,6 +529,8 @@ def _legacy_completion_mtime(
             if _path_is_link_or_reparse(child, child_metadata):
                 return None
             if not stat.S_ISDIR(child_metadata.st_mode):
+                continue
+            if child.name in _LEGACY_RUNTIME_SIDECAR_DIRS:
                 continue
             if child.name not in expected_agents:
                 return None

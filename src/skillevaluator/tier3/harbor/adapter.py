@@ -476,6 +476,44 @@ def _authenticated_generated_output_ancestor(
     return None
 
 
+def _authenticated_generated_output_latest_alias(
+    path: Path,
+    root: Path,
+    authenticated_roots: set[Path] | None = None,
+) -> bool:
+    """Recognize only ``latest`` links to an authenticated immediate run child."""
+    if path.name != "latest":
+        return False
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    if not stat.S_ISLNK(metadata.st_mode):
+        return False
+    try:
+        relative_target = path.readlink()
+    except OSError:
+        return False
+    target_text = os.fspath(relative_target)
+    if (
+        relative_target.is_absolute()
+        or len(relative_target.parts) != 1
+        or target_text in {"", ".", ".."}
+        or "/" in target_text
+        or "\\" in target_text
+    ):
+        return False
+    target = path.parent / relative_target
+    try:
+        target_metadata = target.lstat()
+    except OSError:
+        return False
+    if _path_is_link_or_reparse(target, target_metadata) or not stat.S_ISDIR(target_metadata.st_mode):
+        return False
+    authenticated = _authenticated_generated_output_ancestor(target, root, authenticated_roots)
+    return authenticated is not None and _paths_equivalent(authenticated, target)
+
+
 def _inside_declared_generated_dataset(path: Path, declared_roots: Sequence[Path]) -> bool:
     """Return whether *path* is below a staged dataset marker in a declared output root."""
     for declared_root in declared_roots:
@@ -655,6 +693,11 @@ def _runtime_skill_copy_ignore(skill_root: Path, excluded_roots: Sequence[Path] 
                     authenticated_output_roots,
                 )
                 is not None
+                or _authenticated_generated_output_latest_alias(
+                    candidate,
+                    skill_root,
+                    authenticated_output_roots,
+                )
             ):
                 ignored.add(name)
         return sorted(ignored)
@@ -867,6 +910,8 @@ def _repo_context_ignore_file(
     if authenticated_output_roots is None:
         authenticated_output_roots = set()
     if _authenticated_generated_output_ancestor(path, root, authenticated_output_roots) is not None:
+        return True
+    if _authenticated_generated_output_latest_alias(path, root, authenticated_output_roots):
         return True
     try:
         path.resolve().relative_to(root.resolve())
