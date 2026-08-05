@@ -654,6 +654,84 @@ def test_checked_non_posix_fallback_copies_tree_and_file(
     assert stat.S_IMODE(file_destination.stat().st_mode) == 0o640
 
 
+def test_checked_non_posix_tree_fallback_without_fchmod_preserves_file_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module("skillevaluator.tier3.harbor.secure_copy")
+    monkeypatch.setattr(module, "_DESCRIPTOR_BACKEND", False)
+    monkeypatch.setattr(module, "_ATOMIC_RENAME", None)
+    monkeypatch.delattr(module.os, "fchmod")
+    source = tmp_path / "source"
+    source.mkdir()
+    source_file = source / "safe.txt"
+    source_file.write_text("safe", encoding="utf-8")
+    source_file.chmod(0o640)
+    destination = tmp_path / "destination"
+
+    module.copytree_secure(source, destination, allowed_root=tmp_path)
+
+    staged_file = destination / "safe.txt"
+    assert staged_file.read_text(encoding="utf-8") == "safe"
+    assert stat.S_IMODE(staged_file.stat().st_mode) == 0o640
+
+
+def test_checked_non_posix_file_fallback_without_fchmod_preserves_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module("skillevaluator.tier3.harbor.secure_copy")
+    monkeypatch.setattr(module, "_DESCRIPTOR_BACKEND", False)
+    monkeypatch.setattr(module, "_ATOMIC_RENAME", None)
+    monkeypatch.delattr(module.os, "fchmod")
+    source = tmp_path / "source.txt"
+    source.write_text("safe", encoding="utf-8")
+    source.chmod(0o640)
+    destination = tmp_path / "destination.txt"
+
+    module.copy_file_secure(source, destination, allowed_root=tmp_path)
+
+    assert destination.read_text(encoding="utf-8") == "safe"
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o640
+
+
+def test_checked_windows_fallback_verifies_portable_chmod_semantics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = importlib.import_module("skillevaluator.tier3.harbor.secure_copy")
+    source = tmp_path / "source"
+    source.mkdir()
+    source_file = source / "writable.txt"
+    source_file.write_text("tree", encoding="utf-8")
+    source_file.chmod(0o640)
+    file_source = tmp_path / "read-only.txt"
+    file_source.write_text("file", encoding="utf-8")
+    file_source.chmod(0o440)
+    original_chmod = Path.chmod
+
+    def windows_chmod(path: Path, mode: int, *args: object, **kwargs: object) -> None:
+        executable = 0o111 if path.is_dir() else 0
+        portable_mode = (0o666 | executable) if mode & stat.S_IWRITE else (0o444 | executable)
+        original_chmod(path, portable_mode, *args, **kwargs)
+
+    monkeypatch.setattr(module, "_DESCRIPTOR_BACKEND", False)
+    monkeypatch.setattr(module, "_ATOMIC_RENAME", None)
+    monkeypatch.setattr(module, "_WINDOWS_CHMOD_SEMANTICS", True)
+    monkeypatch.delattr(module.os, "fchmod")
+    monkeypatch.setattr(module.Path, "chmod", windows_chmod)
+    tree_destination = tmp_path / "tree-destination"
+    file_destination = tmp_path / "file-destination.txt"
+
+    module.copytree_secure(source, tree_destination, allowed_root=tmp_path)
+    module.copy_file_secure(file_source, file_destination, allowed_root=tmp_path)
+
+    assert (tree_destination / "writable.txt").read_text(encoding="utf-8") == "tree"
+    assert (tree_destination / "writable.txt").stat().st_mode & stat.S_IWRITE
+    assert file_destination.read_text(encoding="utf-8") == "file"
+    assert not (file_destination.stat().st_mode & stat.S_IWRITE)
+
+
 def test_checked_non_posix_fallback_still_rejects_symlinks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

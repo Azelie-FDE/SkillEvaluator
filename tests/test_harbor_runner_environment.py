@@ -388,7 +388,8 @@ def test_run_harbor_eval_stages_per_agent_credential_trees(
     tmp_path,
 ) -> None:
     skill = tmp_path / "demo"
-    skill.mkdir()
+    (skill / "evals").mkdir(parents=True)
+    (skill / "evals" / "evals.json").write_text("[]\n", encoding="utf-8")
     provider = _provider("nv_build")
     emitted: list[tuple[str, bool, dict[str, str]]] = []
     launched: dict[str, tuple[str, str, dict[str, str]]] = {}
@@ -459,7 +460,8 @@ def test_run_harbor_eval_rejects_provenance_key_inside_skill_before_creation(
     tmp_path,
 ) -> None:
     skill = tmp_path / "demo"
-    skill.mkdir()
+    (skill / "evals").mkdir(parents=True)
+    (skill / "evals" / "evals.json").write_text("[]\n", encoding="utf-8")
     key_path = skill / "private-output-provenance.key"
     monkeypatch.setenv("SKILLEVALUATOR_OUTPUT_PROVENANCE_KEY_FILE", str(key_path))
     monkeypatch.setattr(runner, "resolve_llm_provider", lambda: _provider("nv_build"))

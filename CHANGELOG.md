@@ -88,7 +88,21 @@ All notable changes to SkillEvaluator are documented in this file.
   result roots outside `evals/` have no authenticity marker and cannot be
   distinguished safely from authored runtime content. Move or delete that old
   content before `--copy-repo` or other full-context evaluation, then rerun with
-  this version if replacement evidence is needed.
+  this version if replacement evidence is needed. Explicit task inputs cannot
+  select evaluator-owned datasets, configuration, graders, tests, native tasks,
+  environments, or results. Every agent and baseline arm now reads from one
+  private, selective evaluator snapshot containing the active control files,
+  task-source data, consumed fixtures and grader, and the complete authored
+  custom environment. Legacy omitted-file entries retain the full shared files
+  corpus. Unrelated evaluator subtrees and generated results stay outside the
+  snapshot. MCP configuration and completed-run artifacts are
+  read through bounded descriptor-anchored roots; on Windows, selected file
+  handles deny concurrent writes and deletes while live. Historical unmarked
+  runs created before canonical run-level `result.json` remain discoverable only
+  when their stable configuration and summaries satisfy the complete historical
+  schema. Pre-status scored summaries remain consumable, coherent status-era
+  failures remain visible without contributing scores, and marked current
+  partial runs continue to fail closed.
 - Public benchmark cards now omit policy profiles, redact absolute host paths,
   and normalize imported internal or retired metadata before publication.
 - Previous-version validation now rejects catalog-wide scalar reuse and removal

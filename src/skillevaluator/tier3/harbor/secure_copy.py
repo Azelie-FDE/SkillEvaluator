@@ -38,6 +38,7 @@ _CHUNK_SIZE = 1024 * 1024
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
+_WINDOWS_CHMOD_SEMANTICS = os.name == "nt"
 _DESCRIPTOR_BACKEND = (
     os.name == "posix"
     and hasattr(os, "O_NOFOLLOW")
@@ -1548,6 +1549,45 @@ def _safe_remove_fallback(path: Path) -> None:
         raise UnsafeStagingError(f"refusing to remove unsafe fallback staging entry: {path}")
 
 
+def _fallback_mode_matches(actual: int, expected: int) -> bool:
+    """Check the mode bits that the platform's path-based chmod can set."""
+
+    if _WINDOWS_CHMOD_SEMANTICS:
+        return bool(actual & stat.S_IWRITE) == bool(expected & stat.S_IWRITE)
+    return stat.S_IMODE(actual) & 0o777 == expected
+
+
+def _apply_fallback_open_file_mode(path: Path, descriptor: int, mode: int) -> None:
+    """Apply a mode through the strongest API available and verify identity."""
+
+    opened_before = os.fstat(descriptor)
+    named_before = path.lstat()
+    if (
+        _is_link(named_before)
+        or not stat.S_ISREG(opened_before.st_mode)
+        or not stat.S_ISREG(named_before.st_mode)
+        or opened_before.st_nlink != 1
+        or named_before.st_nlink != 1
+        or _node_identity(named_before) != _node_identity(opened_before)
+    ):
+        raise UnsafeStagingError("fallback staging file changed before its mode was applied")
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is not None:
+        fchmod(descriptor, mode)
+    else:
+        path.chmod(mode)
+    opened_after = os.fstat(descriptor)
+    named_after = path.lstat()
+    if (
+        _is_link(named_after)
+        or _node_identity(opened_after) != _node_identity(opened_before)
+        or _node_identity(named_after) != _node_identity(opened_after)
+        or not _fallback_mode_matches(opened_after.st_mode, mode)
+        or not _fallback_mode_matches(named_after.st_mode, mode)
+    ):
+        raise UnsafeStagingError("fallback staging file identity or mode changed while applying its mode")
+
+
 def _copy_manifest_file_fallback(manifest: _TreeManifest, entry: _ManifestEntry, destination: Path) -> None:
     source = manifest.source.joinpath(*entry.parts)
     before = source.lstat()
@@ -1567,7 +1607,7 @@ def _copy_manifest_file_fallback(manifest: _TreeManifest, entry: _ManifestEntry,
     destination_descriptor = -1
     try:
         destination_descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        os.fchmod(destination_descriptor, 0o600)
+        _apply_fallback_open_file_mode(destination, destination_descriptor, 0o600)
         digest = hashlib.sha256()
         while data := os.read(source_descriptor, _CHUNK_SIZE):
             digest.update(data)
@@ -1613,13 +1653,13 @@ def _apply_modes_fallback(stage: Path, manifests: tuple[_TreeManifest, ...]) -> 
     for entry in (item for item in entries.values() if item.kind == "file"):
         path = stage.joinpath(*entry.parts)
         path.chmod(entry.mode)
-        if stat.S_IMODE(path.lstat().st_mode) & 0o777 != entry.mode:
+        if not _fallback_mode_matches(path.lstat().st_mode, entry.mode):
             raise UnsafeStagingError("published fallback file mode could not be applied")
     directories = [item for item in entries.values() if item.kind == "directory"]
     for entry in sorted(directories, key=lambda item: len(item.parts), reverse=True):
         path = stage.joinpath(*entry.parts)
         path.chmod(entry.mode)
-        if stat.S_IMODE(path.lstat().st_mode) & 0o777 != entry.mode:
+        if not _fallback_mode_matches(path.lstat().st_mode, entry.mode):
             raise UnsafeStagingError("published fallback directory mode could not be applied")
 
 
@@ -1645,7 +1685,7 @@ def _validate_fallback_tree_exact_pass(
             _is_link(before)
             or not stat.S_ISDIR(before.st_mode)
             or before.st_dev != root_device
-            or stat.S_IMODE(before.st_mode) & 0o777 != expected_mode
+            or not _fallback_mode_matches(before.st_mode, expected_mode)
         ):
             raise UnsafeStagingError("fallback staging directory is unsafe")
         before_fingerprint = _fingerprint(before)
@@ -1667,7 +1707,7 @@ def _validate_fallback_tree_exact_pass(
                     not stat.S_ISREG(metadata.st_mode)
                     or metadata.st_nlink != 1
                     or metadata.st_size != child_entry.size
-                    or stat.S_IMODE(metadata.st_mode) & 0o777 != expected_file_mode
+                    or not _fallback_mode_matches(metadata.st_mode, expected_file_mode)
                 ):
                     raise UnsafeStagingError("fallback staging file is unsafe")
                 if (
@@ -1741,7 +1781,7 @@ def _expose_fallback_tree_root_exact(stage: Path, manifests: tuple[_TreeManifest
     root_mode = manifests[-1].root.mode
     stage.chmod(root_mode)
     after = stage.lstat()
-    if _node_identity(after) != _node_identity(before) or stat.S_IMODE(after.st_mode) & 0o777 != root_mode:
+    if _node_identity(after) != _node_identity(before) or not _fallback_mode_matches(after.st_mode, root_mode):
         raise UnsafeStagingError("published fallback root identity or mode changed during exposure")
 
 
@@ -1773,7 +1813,7 @@ def _prepare_fallback_moved_backup(
     private_mode = 0o700 if kind == "directory" else 0o600
     backup.chmod(private_mode)
     private = backup.lstat()
-    if _node_identity(private) != _node_identity(expected) or stat.S_IMODE(private.st_mode) & 0o777 != private_mode:
+    if _node_identity(private) != _node_identity(expected) or not _fallback_mode_matches(private.st_mode, private_mode):
         raise UnsafeStagingError("fallback destination backup could not be made private")
 
 
@@ -2076,7 +2116,7 @@ def _validate_fallback_file_exact(
         or not stat.S_ISREG(metadata.st_mode)
         or metadata.st_nlink != 1
         or metadata.st_size != manifest.entry.size
-        or stat.S_IMODE(metadata.st_mode) & 0o777 != expected_mode
+        or not _fallback_mode_matches(metadata.st_mode, expected_mode)
     ):
         raise UnsafeStagingError("fallback staging file has an unsafe type, link count, size, or mode")
     if (
@@ -2098,7 +2138,7 @@ def _stage_fallback_file(manifest: _FileManifest, stage: Path) -> None:
     destination_descriptor = -1
     try:
         destination_descriptor = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        os.fchmod(destination_descriptor, 0o600)
+        _apply_fallback_open_file_mode(stage, destination_descriptor, 0o600)
         digest = hashlib.sha256()
         while data := os.read(source_descriptor, _CHUNK_SIZE):
             digest.update(data)

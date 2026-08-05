@@ -689,6 +689,84 @@ def test_default_run_cleans_transient_harbor_artifacts(
     assert persisted["run_config"]["harbor"]["jobs_retained"] is False
 
 
+def test_runner_returns_error_when_private_evaluator_snapshot_cannot_be_created(tmp_path: Path) -> None:
+    from skillevaluator.tier3.harbor import runner
+
+    skill = tmp_path / "missing-evals-skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("# Missing evals\n", encoding="utf-8")
+
+    result = runner.run_harbor_eval(skill, ["codex"])
+
+    assert result["error"] == [f"No evaluator source directory found at {skill / 'evals'}"]
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink"])
+def test_runner_returns_error_for_unsafe_evals_config(tmp_path: Path, kind: str) -> None:
+    from skillevaluator.tier3.harbor import runner
+
+    skill = tmp_path / "unsafe-config-skill"
+    (skill / "evals").mkdir(parents=True)
+    (skill / "evals" / "evals.json").write_text("[]\n", encoding="utf-8")
+    outside = tmp_path / "outside-config.yml"
+    outside.write_text("schema_version: 1\n", encoding="utf-8")
+    config = skill / "evals" / "config.yml"
+    try:
+        if kind == "symlink":
+            config.symlink_to(outside)
+        else:
+            config.hardlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"{kind} creation is unavailable: {exc}")
+
+    result = runner.run_harbor_eval(skill, ["codex"])
+
+    assert result["error"] == [f"Eval configuration must be a regular non-linked file: {config}"]
+
+
+def test_all_agent_and_baseline_arms_share_one_private_evaluator_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshots: list[Path] = []
+    observed_questions: list[str] = []
+    skill_ref: list[Path] = []
+
+    def emit_tasks(_skill: Path, output: Path, **kwargs: Any) -> list[Path]:
+        snapshot = Path(kwargs["evaluator_skill_path"])
+        snapshots.append(snapshot)
+        entries = json.loads((snapshot / "evals" / "evals.json").read_text(encoding="utf-8"))
+        observed_questions.append(entries[0]["question"])
+        if len(snapshots) == 1:
+            (skill_ref[0] / "evals" / "evals.json").write_text(
+                json.dumps([{"id": "case-1", "question": "Mutated after snapshot."}]),
+                encoding="utf-8",
+            )
+        task = output / "case-1"
+        task.mkdir(parents=True)
+        return [task]
+
+    runner, skill = _stub_runner(monkeypatch, tmp_path, task_emitter=emit_tasks)
+    skill_ref.append(skill)
+    (skill / "evals" / "evals.json").write_text(
+        json.dumps([{"id": "case-1", "question": "Use the original fixture."}]),
+        encoding="utf-8",
+    )
+
+    result = runner.run_harbor_eval(
+        skill,
+        ["codex", "opencode"],
+        output_dir=tmp_path / "results",
+        agent_runtime_preflight=False,
+    )
+
+    assert "error" not in result
+    assert len(snapshots) == 4
+    assert len(set(snapshots)) == 1
+    assert observed_questions == ["Use the original fixture."] * 4
+    assert not snapshots[0].exists()
+
+
 def test_runner_rejects_preexisting_run_symlink_before_child_creation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -864,10 +942,17 @@ def test_cleanup_failure_degrades_terminal_progress_after_retention_finalizes(
     reporter = _RecordingReporter()
     from skillevaluator.tier3.harbor import artifact_retention
 
+    real_rmtree = artifact_retention.shutil.rmtree
+
+    def fail_harbor_artifact_cleanup(path: str | Path, *args: Any, **kwargs: Any) -> None:
+        if Path(path).name.startswith("_harbor-"):
+            raise OSError(f"busy: {path}")
+        real_rmtree(path, *args, **kwargs)
+
     monkeypatch.setattr(
         artifact_retention.shutil,
         "rmtree",
-        lambda path: (_ for _ in ()).throw(OSError(f"busy: {path}")),
+        fail_harbor_artifact_cleanup,
     )
 
     result = runner.run_harbor_eval(
@@ -1055,6 +1140,9 @@ def test_runner_reports_known_plan_without_claiming_failed_preflight_ready(
     from skillevaluator.tier3.harbor import runner
 
     reporter = _RecordingReporter()
+    skill = tmp_path / "demo"
+    (skill / "evals").mkdir(parents=True)
+    (skill / "evals" / "evals.json").write_text("[]\n", encoding="utf-8")
     monkeypatch.setattr(
         runner,
         "resolve_llm_provider",
@@ -1070,7 +1158,7 @@ def test_runner_reports_known_plan_without_claiming_failed_preflight_ready(
     )
     monkeypatch.setattr(runner, "_check_prerequisites", lambda **_kwargs: ["Docker is unavailable"])
 
-    result = runner.run_harbor_eval(tmp_path / "demo", ["codex"], progress_reporter=reporter)
+    result = runner.run_harbor_eval(skill, ["codex"], progress_reporter=reporter)
 
     assert result == {"error": ["Docker is unavailable"]}
     known_plan = reporter.plans[-1]
@@ -1090,6 +1178,9 @@ def test_runner_does_not_mark_invalid_configuration_ready(
     from skillevaluator.tier3.harbor import runner
 
     reporter = _RecordingReporter()
+    skill = tmp_path / "demo"
+    (skill / "evals").mkdir(parents=True)
+    (skill / "evals" / "evals.json").write_text("[]\n", encoding="utf-8")
     monkeypatch.setattr(
         runner,
         "resolve_llm_provider",
@@ -1101,7 +1192,7 @@ def test_runner_does_not_mark_invalid_configuration_ready(
         lambda _path: ({"harbor": {"n_attempts": 0}}, None),
     )
 
-    result = runner.run_harbor_eval(tmp_path / "demo", ["codex"], progress_reporter=reporter)
+    result = runner.run_harbor_eval(skill, ["codex"], progress_reporter=reporter)
 
     assert result == {"error": ["n_attempts must be >= 1"]}
     transitions = [(event.stage, event.state) for event in reporter.events]
@@ -1430,7 +1521,8 @@ def test_command_does_not_relabel_runtime_failure_as_configuration_failure(
     from skillevaluator.tier3 import commands
 
     skill = tmp_path / "demo"
-    skill.mkdir()
+    (skill / "evals").mkdir(parents=True)
+    (skill / "evals" / "evals.json").write_text("[]\n", encoding="utf-8")
     reporter = _RecordingReporter()
     monkeypatch.setattr(commands, "resolve_llm_provider", lambda: SimpleNamespace(provider="openai"))
 
@@ -1602,7 +1694,8 @@ def test_command_runner_terminalizes_inherited_configuration_stage(
     from skillevaluator.tier3.harbor import runner
 
     skill = tmp_path / "demo"
-    skill.mkdir()
+    (skill / "evals").mkdir(parents=True)
+    (skill / "evals" / "evals.json").write_text("[]\n", encoding="utf-8")
     reporter = _RecordingReporter()
     monkeypatch.setattr(commands, "resolve_llm_provider", lambda: SimpleNamespace(provider="openai"))
 

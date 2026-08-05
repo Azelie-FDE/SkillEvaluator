@@ -356,7 +356,7 @@ def test_custom_grader_candidates_reject_external_symlinks(tmp_path: Path, candi
     _symlink_or_skip(grader, outside)
     task_dir = tmp_path / "task"
 
-    with pytest.raises(ValueError, match="non-symlinked regular file contained under evals/"):
+    with pytest.raises(ValueError, match=r"non-symlinked regular file contained under evals/|symlink|reparse"):
         _copy_custom_grader(task_dir, skill, "custom_only")
 
     assert not (task_dir / "tests" / candidate.name).exists()
@@ -476,7 +476,7 @@ def test_task_modes_reject_custom_grader_symlink_before_copy(tmp_path: Path, tas
     _symlink_or_skip(skill / "evals" / "grader.py", outside)
     output_dir = tmp_path / "tasks"
 
-    with pytest.raises(ValueError, match="non-symlinked regular file contained under evals/"):
+    with pytest.raises(ValueError, match=r"non-symlinked regular file contained under evals/|symlink|reparse"):
         if task_source == "generated":
             generate_harbor_tasks(skill, output_dir, with_skill=False, grading_mode="custom_only")
         else:

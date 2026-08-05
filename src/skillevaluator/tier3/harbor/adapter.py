@@ -27,7 +27,9 @@ import stat
 import subprocess
 import tempfile
 import tomllib
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
@@ -44,6 +46,7 @@ from skillevaluator.tier3.output_provenance import (
 )
 from skillevaluator.tier3.toml_utils import toml_quote
 from skillevaluator.utils.process_environment import child_process_env
+from skillevaluator.utils.secure_fs import SecurePathError, SecureRoot
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +55,32 @@ _EVAL_CORE_DIR = Path(__file__).resolve().parent.parent / "eval_core"
 _BASE_IMAGE_PREFIX = "skillevaluator-base"
 _MAX_REPO_CONTEXT_FILE_BYTES = 10 * 1024 * 1024
 _MAX_REPO_CONTEXT_TOTAL_BYTES = 200 * 1024 * 1024
+_MAX_EVALUATOR_FILE_BYTES = 64 * 1024 * 1024
+_MAX_EVALS_CONFIG_BYTES = 4 * 1024 * 1024
+_MAX_MCP_CONFIG_BYTES = 1024 * 1024
+_EVALUATOR_DATASET_FILENAMES = (
+    "evals.json",
+    "evals.jsonl",
+    "evals.yaml",
+    "evals.yml",
+    "dataset.json",
+    "dataset.jsonl",
+    "dataset.yaml",
+    "dataset.yml",
+)
+_EVALUATOR_ONLY_TASK_INPUT_FILES = frozenset(
+    {
+        *(name.casefold() for name in _EVALUATOR_DATASET_FILENAMES),
+        "benchmark_" + "conversion_report.md",
+        "config.yaml",
+        "config.yml",
+        "eval.md",
+        "grader.py",
+        "grader.sh",
+        GENERATED_OUTPUT_MARKER.casefold(),
+    }
+)
+_EVALUATOR_ONLY_TASK_INPUT_ROOTS = frozenset({"environment", "harbor", "results", "tests"})
 _REPO_CONTEXT_IGNORE_NAMES = {
     ".git",
     ".hg",
@@ -1157,6 +1186,7 @@ def build_eval_base_image(
     reference_skills_dir: Path | None = None,
     *,
     workspace_skill_paths: list[Path] | None = None,
+    evaluator_skill_path: Path | None = None,
     excluded_roots: Sequence[Path] = (),
     force_rebuild: bool = False,
     action_out: list[str] | None = None,
@@ -1174,10 +1204,11 @@ def build_eval_base_image(
     Returns the image tag (e.g. ``skillevaluator-base:a1b2c3d4e5f6``) or ``""``
     on failure (callers fall back to full per-task Dockerfiles).
     """
+    evaluator_source = evaluator_skill_path or skill_path
     has_custom_dockerfile = (
-        skill_path
-        and (skill_path / "evals" / "environment" / "Dockerfile").is_file()
-        and _validate_custom_dockerfile(skill_path / "evals" / "environment" / "Dockerfile") is None
+        evaluator_source
+        and (evaluator_source / "evals" / "environment" / "Dockerfile").is_file()
+        and _validate_custom_dockerfile(evaluator_source / "evals" / "environment" / "Dockerfile") is None
     )
 
     if has_custom_dockerfile:
@@ -1422,48 +1453,101 @@ def _load_evals(evals_path: Path) -> list[dict[str, Any]]:
     return normalize_dataset_entries(data)
 
 
-def _read_regular_evals_file(path: Path) -> bytes:
-    """Read one evaluator file without following links or accepting swaps."""
+def _evaluator_node_fingerprint(metadata: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _snapshot_evaluator_parent_path(path: Path, allowed_root: Path, *, label: str) -> tuple[tuple[Path, tuple], ...]:
+    """Capture every real directory component anchoring an evaluator file."""
+    lexical_path = path.absolute()
+    lexical_root = allowed_root.absolute()
+    try:
+        lexical_path.relative_to(lexical_root)
+    except ValueError as exc:
+        raise ValueError(f"{label} resolves outside its evaluator root: {path}") from exc
+    snapshot: list[tuple[Path, tuple]] = []
+    current = lexical_path.parent
+    while True:
+        try:
+            component = current.lstat()
+        except OSError as exc:
+            raise ValueError(f"Cannot inspect {label.lower()} path: {current}") from exc
+        if _path_is_link_or_reparse(current, component):
+            raise ValueError(f"{label} path must not contain symlinks or reparse points: {current}")
+        if not stat.S_ISDIR(component.st_mode):
+            raise ValueError(f"{label} parent path must contain only directories: {current}")
+        snapshot.append((current, _evaluator_node_fingerprint(component)))
+        if current == lexical_root:
+            break
+        if lexical_root not in current.parents:
+            raise ValueError(f"{label} resolves outside its evaluator root: {path}")
+        current = current.parent
+    return tuple(snapshot)
+
+
+def _validate_evaluator_parent_snapshot(snapshot: tuple[tuple[Path, tuple], ...], *, label: str) -> None:
+    for component_path, expected in snapshot:
+        try:
+            component = component_path.lstat()
+        except OSError as exc:
+            raise ValueError(f"{label} path changed while it was read: {component_path}") from exc
+        if (
+            _path_is_link_or_reparse(component_path, component)
+            or not stat.S_ISDIR(component.st_mode)
+            or _evaluator_node_fingerprint(component) != expected
+        ):
+            raise ValueError(f"{label} path changed while it was read: {component_path}")
+
+
+def _read_regular_evals_file(
+    path: Path,
+    *,
+    label: str = "Eval dataset",
+    max_bytes: int = _MAX_EVALUATOR_FILE_BYTES,
+    allowed_root: Path | None = None,
+) -> bytes:
+    """Read one bounded evaluator file without following links or accepting swaps."""
+    parent_snapshot = (
+        _snapshot_evaluator_parent_path(path, allowed_root, label=label) if allowed_root is not None else ()
+    )
     try:
         before = path.lstat()
     except OSError as exc:
-        raise ValueError(f"Cannot inspect eval dataset file: {path}") from exc
+        raise ValueError(f"Cannot inspect {label.lower()} file: {path}") from exc
     if _path_is_link_or_reparse(path, before) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-        raise ValueError(f"Eval dataset must be a regular non-linked file: {path}")
-    if before.st_size > 64 * 1024 * 1024:
-        raise ValueError(f"Eval dataset exceeds the 64 MiB safety limit: {path}")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        raise ValueError(f"{label} must be a regular non-linked file: {path}")
+    if before.st_size > max_bytes:
+        raise ValueError(f"{label} exceeds the {max_bytes}-byte safety limit: {path}")
+    secure_root_path = allowed_root.absolute() if allowed_root is not None else path.parent.absolute()
     try:
-        descriptor = os.open(path, flags)
+        relative_path = path.absolute().relative_to(secure_root_path)
+        root_metadata = secure_root_path.lstat()
+        with SecureRoot(secure_root_path, expected=root_metadata) as secure_root:
+            payload, opened = secure_root.read_bytes(relative_path, max_bytes, expected=before)
+    except (OSError, SecurePathError, ValueError) as exc:
+        raise ValueError(f"{label} changed while it was read: {path}") from exc
+
+    try:
+        named_after = path.lstat()
     except OSError as exc:
-        raise ValueError(f"Cannot safely open eval dataset file: {path}") from exc
-    try:
-        opened = os.fstat(descriptor)
-        before_fingerprint = (before.st_dev, before.st_ino, before.st_mode, before.st_nlink, before.st_size)
-        opened_fingerprint = (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink, opened.st_size)
-        if (
-            _path_is_link_or_reparse(path, opened)
-            or not stat.S_ISREG(opened.st_mode)
-            or opened.st_nlink != 1
-            or opened_fingerprint != before_fingerprint
-        ):
-            raise ValueError(f"Eval dataset changed while it was opened: {path}")
-        chunks: list[bytes] = []
-        remaining = opened.st_size + 1
-        while remaining:
-            chunk = os.read(descriptor, min(1024 * 1024, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        payload = b"".join(chunks)
-        after = os.fstat(descriptor)
-        after_fingerprint = (after.st_dev, after.st_ino, after.st_mode, after.st_nlink, after.st_size)
-        if after_fingerprint != opened_fingerprint or len(payload) != opened.st_size:
-            raise ValueError(f"Eval dataset changed while it was read: {path}")
-        return payload
-    finally:
-        os.close(descriptor)
+        raise ValueError(f"{label} changed while it was read: {path}") from exc
+    if (
+        _path_is_link_or_reparse(path, named_after)
+        or _evaluator_node_fingerprint(named_after) != _evaluator_node_fingerprint(opened)
+        or len(payload) != opened.st_size
+    ):
+        raise ValueError(f"{label} changed while it was read: {path}")
+    if parent_snapshot:
+        _validate_evaluator_parent_snapshot(parent_snapshot, label=label)
+    return payload
 
 
 def _validate_evals_source_directory(skill_path: Path) -> None:
@@ -1519,15 +1603,30 @@ def _write_instruction(task_dir: Path, question: str) -> None:
 
 def _load_mcp_servers(skill_path: Path) -> list[dict[str, Any]]:
     """Load MCP server declarations from evals/environment/mcp_servers.toml."""
-    mcp_file = skill_path / "evals" / "environment" / "mcp_servers.toml"
-    if not mcp_file.exists():
+    evals_dir = skill_path / "evals"
+    environment_dir = evals_dir / "environment"
+    mcp_file = environment_dir / "mcp_servers.toml"
+    if not os.path.lexists(environment_dir):
+        return []
+    parent_snapshot = _snapshot_evaluator_parent_path(mcp_file, evals_dir, label="MCP server configuration")
+    if not os.path.lexists(mcp_file):
+        _validate_evaluator_parent_snapshot(parent_snapshot, label="MCP server configuration")
         return []
     try:
         import tomllib
     except ImportError:
         import tomli as tomllib  # type: ignore[no-redef]
+    payload = _read_regular_evals_file(
+        mcp_file,
+        label="MCP server configuration",
+        max_bytes=_MAX_MCP_CONFIG_BYTES,
+        allowed_root=evals_dir,
+    )
     try:
-        data = tomllib.loads(mcp_file.read_text(encoding="utf-8"))
+        data = tomllib.loads(payload.decode("utf-8"))
+        if not isinstance(data, dict):
+            logger.warning("mcp_servers.toml: expected a TOML table, got %s", type(data).__name__)
+            return []
         servers = data.get("mcp_servers", [])
         if not isinstance(servers, list):
             logger.warning("mcp_servers.toml: expected [[mcp_servers]] array, got %s", type(servers).__name__)
@@ -1547,7 +1646,7 @@ def _load_mcp_servers(skill_path: Path) -> list[dict[str, Any]]:
         if valid:
             logger.debug("Loaded %d MCP server(s) from %s", len(valid), mcp_file)
         return valid
-    except Exception as e:
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
         logger.warning("Failed to parse %s: %s", mcp_file, e)
         return []
 
@@ -1739,7 +1838,13 @@ def _has_symlink_component(path: Path, root: Path) -> bool:
     return False
 
 
-def _copy_custom_grader(task_dir: Path, skill_path: Path, grading_mode: str) -> bool:
+def _copy_custom_grader(
+    task_dir: Path,
+    skill_path: Path,
+    grading_mode: str,
+    *,
+    evals_dir: Path | None = None,
+) -> bool:
     """Copy user custom grader support into a generated task, if configured."""
     tests_dir = task_dir / "tests"
     tests_dir.mkdir(parents=True, exist_ok=True)
@@ -1748,27 +1853,27 @@ def _copy_custom_grader(task_dir: Path, skill_path: Path, grading_mode: str) -> 
     if runner_src.exists():
         shutil.copy2(runner_src, tests_dir / "custom_grader_runner.py")
 
+    evals_dir = evals_dir or skill_path / "evals"
     grader_candidates = [
-        (skill_path / "evals" / "grader.py", tests_dir / "grader.py"),
-        (skill_path / "evals" / "grader.sh", tests_dir / "grader.sh"),
-        (skill_path / "evals" / "tests" / "grader.py", tests_dir / "grader.py"),
-        (skill_path / "evals" / "tests" / "grader.sh", tests_dir / "grader.sh"),
+        (evals_dir / "grader.py", tests_dir / "grader.py"),
+        (evals_dir / "grader.sh", tests_dir / "grader.sh"),
+        (evals_dir / "tests" / "grader.py", tests_dir / "grader.py"),
+        (evals_dir / "tests" / "grader.sh", tests_dir / "grader.sh"),
     ]
     for grader, destination in grader_candidates:
-        if _has_symlink_component(grader, skill_path):
+        if _has_symlink_component(grader, evals_dir):
             raise ValueError(f"custom grader must be a non-symlinked regular file contained under evals/: {grader}")
         if not grader.exists():
             continue
         if not grader.is_file():
             raise ValueError(f"custom grader must be a non-symlinked regular file contained under evals/: {grader}")
 
-        resolved_skill = skill_path.resolve(strict=True)
-        resolved_evals = (skill_path / "evals").resolve(strict=True)
+        resolved_evals = evals_dir.resolve(strict=True)
         resolved_grader = grader.resolve(strict=True)
-        if not resolved_evals.is_relative_to(resolved_skill) or not resolved_grader.is_relative_to(resolved_evals):
+        if not resolved_grader.is_relative_to(resolved_evals):
             raise ValueError(f"custom grader must be a non-symlinked regular file contained under evals/: {grader}")
 
-        copy_file_secure(grader, destination, allowed_root=skill_path / "evals")
+        copy_file_secure(grader, destination, allowed_root=evals_dir)
         if destination.suffix == ".sh":
             destination.chmod(0o755)
         return True
@@ -3304,6 +3409,16 @@ def _entry_file_refs(entry: dict[str, Any]) -> list[str]:
     return refs
 
 
+def _is_evaluator_only_task_input(relative: Path) -> bool:
+    """Return whether an eval-relative path is evaluator control material."""
+    if not relative.parts:
+        return True
+    top_level = relative.parts[0].casefold()
+    return top_level in _EVALUATOR_ONLY_TASK_INPUT_ROOTS or (
+        len(relative.parts) == 1 and top_level in _EVALUATOR_ONLY_TASK_INPUT_FILES
+    )
+
+
 def _resolve_entry_file_ref(
     ref: str,
     *,
@@ -3323,9 +3438,9 @@ def _resolve_entry_file_ref(
         raise ValueError(f"evals.json files entry uses unsupported URI scheme: {ref}")
 
     if ref_path.parts and ref_path.parts[0] == "evals":
-        candidates = [skill_path / ref_path]
+        candidates = [evals_dir.joinpath(*ref_path.parts[1:])]
     else:
-        candidates = [evals_dir / ref_path, skill_path / ref_path]
+        candidates = [evals_dir / ref_path]
 
     source_path = next((candidate.absolute() for candidate in candidates if candidate.exists()), None)
     if source_path is None:
@@ -3335,6 +3450,9 @@ def _resolve_entry_file_ref(
     resolved_evals_dir = evals_dir.resolve()
     if source == resolved_evals_dir or not _is_relative_to(source, resolved_evals_dir):
         raise ValueError(f"evals.json files entry resolves outside evals/: {ref}")
+    source_relative = source.relative_to(resolved_evals_dir)
+    if _is_evaluator_only_task_input(source_relative):
+        raise ValueError(f"evals.json files entry selects evaluator-only material: {ref}")
     if _has_symlink_component(source_path, evals_dir.absolute()):
         raise ValueError(f"evals.json files entry must not contain symlinks: {ref}")
 
@@ -3342,7 +3460,7 @@ def _resolve_entry_file_ref(
     if resolved_input_files_dir and _is_relative_to(source, resolved_input_files_dir):
         rel = source.relative_to(resolved_input_files_dir)
     else:
-        rel = source.relative_to(resolved_evals_dir)
+        rel = source_relative
 
     return source_path, rel
 
@@ -3523,13 +3641,19 @@ def _write_dockerfile(
     include_repo = (env_dir / "repo").exists()
     include_repo_linked_root = (env_dir / "repo-linked-root").exists()
 
-    custom_env_dir = skill_path / "evals" / "environment" if skill_path else None
+    custom_env_dir = (
+        evals_dir / "environment"
+        if evals_dir is not None
+        else skill_path / "evals" / "environment"
+        if skill_path is not None
+        else None
+    )
 
     if custom_env_dir and custom_env_dir.exists():
         private_custom_env = tempfile.TemporaryDirectory(prefix="skillevaluator-custom-environment-")
         staged_custom_env = Path(private_custom_env.name) / "environment"
         try:
-            copytree_secure(custom_env_dir, staged_custom_env, allowed_root=skill_path)
+            copytree_secure(custom_env_dir, staged_custom_env, allowed_root=evals_dir)
             if not has_skill and skill_path:
                 _check_custom_environment_does_not_stage_target(staged_custom_env, skill_path)
 
@@ -4258,6 +4382,7 @@ def _stage_native_harbor_tasks_into(
     skill_path: Path,
     output_dir: Path,
     *,
+    evaluator_skill_path: Path,
     with_skill: bool = True,
     reference_skills_dir: Path | None = None,
     workspace_skill_paths: list[Path] | None = None,
@@ -4267,6 +4392,7 @@ def _stage_native_harbor_tasks_into(
     custom_dockerfile_mode: str = "rebase",
     copy_repo: bool = False,
     repo_context_exclude_paths: Sequence[Path] = (),
+    private_repo_context_exclude_paths: Sequence[Path] = (),
     runtime_env: dict[str, str] | None = None,
     verifier_env: dict[str, str] | None = None,
     pre_agent_setup: list[str] | None = None,
@@ -4280,7 +4406,8 @@ def _stage_native_harbor_tasks_into(
     """
     _validate_runtime_discovery_env(runtime_env)
     _validate_runtime_loader_env(runtime_env)
-    native_dir = skill_path / "evals" / "harbor"
+    evals_dir = evaluator_skill_path / "evals"
+    native_dir = evals_dir / "harbor"
     if not native_dir.exists():
         raise FileNotFoundError(f"No native Harbor task source found at {native_dir}")
     _validate_staging_output_location(
@@ -4291,7 +4418,7 @@ def _stage_native_harbor_tasks_into(
     )
     _validate_output_roots_outside_evaluator_sources(skill_path, repo_context_exclude_paths)
     _check_native_source_does_not_stage_target(native_dir, skill_path, with_skill=with_skill)
-    entries_by_id = _load_entries_by_id(skill_path)
+    entries_by_id = _load_entries_by_id(evaluator_skill_path)
     source_task_dirs = _native_task_dirs(native_dir, ignore=_NATIVE_SOURCE_IGNORE)
     if not source_task_dirs:
         raise ValueError(f"No Harbor task directories with task.toml found in {native_dir}")
@@ -4340,7 +4467,7 @@ def _stage_native_harbor_tasks_into(
         if (not custom_grader and grading_mode != "custom_only") or (
             not custom_grader and not (tests_dir / "test.sh").exists()
         ):
-            custom_grader = _copy_custom_grader(task_dir, skill_path, grading_mode)
+            custom_grader = _copy_custom_grader(task_dir, skill_path, grading_mode, evals_dir=evals_dir)
 
         if grading_mode in ("default", "default_plus_custom"):
             _ensure_skill_evaluator_verifier_env(
@@ -4373,13 +4500,13 @@ def _stage_native_harbor_tasks_into(
                 f"custom_only native Harbor task '{entry_id}' requires tests/grader.py or tests/test.sh"
             )
 
-        if entry is not None and _entry_declares_task_input(entry, skill_path / "evals" / "files"):
+        if entry is not None and _entry_declares_task_input(entry, evals_dir / "files"):
             _stage_task_inputs(
                 task_dir / "environment",
-                input_files_dir=skill_path / "evals" / "files",
+                input_files_dir=evals_dir / "files",
                 entry=entry,
                 source_skill_path=skill_path,
-                evals_dir=skill_path / "evals",
+                evals_dir=evals_dir,
             )
         _prepare_native_environment(
             task_dir,
@@ -4392,7 +4519,7 @@ def _stage_native_harbor_tasks_into(
             grading_mode=grading_mode,
             repo_context_mode="full" if copy_repo else "linked",
             compose_env_names=set(runtime_env or {}),
-            repo_context_exclude_paths=repo_context_exclude_paths,
+            repo_context_exclude_paths=(*repo_context_exclude_paths, *private_repo_context_exclude_paths),
             agent_workdir=native_agent_workdir,
         )
 
@@ -4400,6 +4527,32 @@ def _stage_native_harbor_tasks_into(
         _write_dataset_toml(output_dir, [p.name for p in task_dirs])
     _copy_metric_py(output_dir)
     return task_dirs
+
+
+def _private_task_staging_parent(
+    skill_path: Path,
+    *,
+    reference_skills_dir: Path | None,
+    workspace_skill_paths: Sequence[Path],
+) -> Path:
+    """Choose a temp parent outside every runtime skill source.
+
+    Preserve the normal system temporary location unless TMPDIR places task
+    staging inside a runtime skill source. In that case, use a sibling of the
+    target skill and ascend only when that location is itself inside a
+    configured reference or workspace source.
+    """
+    external_sources = [*workspace_skill_paths]
+    if reference_skills_dir is not None:
+        external_sources.append(reference_skills_dir)
+    candidate = Path(tempfile.gettempdir())
+    if not any(_path_is_excluded(candidate, (source,)) for source in (skill_path, *external_sources)):
+        return candidate
+
+    candidate = skill_path.parent
+    while candidate.parent != candidate and any(_path_is_excluded(candidate, (source,)) for source in external_sources):
+        candidate = candidate.parent
+    return candidate
 
 
 def stage_native_harbor_tasks(
@@ -4420,8 +4573,31 @@ def stage_native_harbor_tasks(
     pre_agent_setup: list[str] | None = None,
     task_resources: dict[str, int] | None = None,
     agent_workdir: str | None = None,
+    evaluator_skill_path: Path | None = None,
 ) -> list[Path]:
     """Stage native tasks privately, then publish one exact output snapshot."""
+
+    if evaluator_skill_path is None:
+        with private_evaluator_skill_snapshot(skill_path, task_source="native_harbor") as private_skill_path:
+            return stage_native_harbor_tasks(
+                skill_path,
+                output_dir,
+                with_skill=with_skill,
+                reference_skills_dir=reference_skills_dir,
+                workspace_skill_paths=workspace_skill_paths,
+                workspace_mode=workspace_mode,
+                grading_mode=grading_mode,
+                base_image=base_image,
+                custom_dockerfile_mode=custom_dockerfile_mode,
+                copy_repo=copy_repo,
+                repo_context_exclude_paths=repo_context_exclude_paths,
+                runtime_env=runtime_env,
+                verifier_env=verifier_env,
+                pre_agent_setup=pre_agent_setup,
+                task_resources=task_resources,
+                agent_workdir=agent_workdir,
+                evaluator_skill_path=private_skill_path,
+            )
 
     validate_output_provenance_key_location(
         skill_path,
@@ -4440,12 +4616,21 @@ def stage_native_harbor_tasks(
     if output_requires_provenance:
         validate_generated_output_replacement(output_dir)
 
-    with tempfile.TemporaryDirectory(prefix="skillevaluator-native-tasks-") as temporary:
+    private_staging_parent = _private_task_staging_parent(
+        skill_path,
+        reference_skills_dir=reference_skills_dir,
+        workspace_skill_paths=workspace_skill_paths or (),
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="skillevaluator-native-tasks-",
+        dir=private_staging_parent,
+    ) as temporary:
         private_root = Path(temporary).resolve(strict=True)
         private_output = private_root / "dataset"
         private_tasks = _stage_native_harbor_tasks_into(
             skill_path,
             private_output,
+            evaluator_skill_path=evaluator_skill_path,
             with_skill=with_skill,
             reference_skills_dir=reference_skills_dir,
             workspace_skill_paths=workspace_skill_paths,
@@ -4454,7 +4639,12 @@ def stage_native_harbor_tasks(
             base_image=base_image,
             custom_dockerfile_mode=custom_dockerfile_mode,
             copy_repo=copy_repo,
-            repo_context_exclude_paths=(*repo_context_exclude_paths, output_dir, private_root),
+            repo_context_exclude_paths=(
+                *repo_context_exclude_paths,
+                output_dir,
+                private_root,
+            ),
+            private_repo_context_exclude_paths=(evaluator_skill_path.parent,),
             runtime_env=runtime_env,
             verifier_env=verifier_env,
             pre_agent_setup=pre_agent_setup,
@@ -4501,6 +4691,7 @@ def _generate_harbor_tasks_into(
     skill_path: Path,
     output_dir: Path,
     *,
+    evaluator_skill_path: Path,
     with_skill: bool = True,
     reference_skills_dir: Path | None = None,
     workspace_skill_paths: list[Path] | None = None,
@@ -4510,6 +4701,7 @@ def _generate_harbor_tasks_into(
     custom_dockerfile_mode: str = "rebase",
     copy_repo: bool = False,
     repo_context_exclude_paths: Sequence[Path] = (),
+    private_repo_context_exclude_paths: Sequence[Path] = (),
     runtime_env: dict[str, str] | None = None,
     verifier_env: dict[str, str] | None = None,
     pre_agent_setup: list[str] | None = None,
@@ -4550,8 +4742,8 @@ def _generate_harbor_tasks_into(
     _validate_runtime_discovery_env(runtime_env)
     _validate_runtime_loader_env(runtime_env)
     agent_workdir = _validated_agent_workdir(agent_workdir)
-    evals_dir = skill_path / "evals"
-    evals_file = find_evals_file(skill_path)
+    evals_dir = evaluator_skill_path / "evals"
+    evals_file = find_evals_file(evaluator_skill_path)
     _validate_staging_output_location(
         skill_path,
         output_dir,
@@ -4573,7 +4765,7 @@ def _generate_harbor_tasks_into(
     if not input_files_dir.exists():
         input_files_dir = None
 
-    mcp_servers = _load_mcp_servers(skill_path)
+    mcp_servers = _load_mcp_servers(evaluator_skill_path)
     prepared_entries = _preflight_generated_tasks(entries, output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     task_dirs: list[str] = []
@@ -4604,7 +4796,7 @@ def _generate_harbor_tasks_into(
             agent_workdir=agent_workdir,
         )
         _copy_verifier(task_dir)
-        custom_grader = _copy_custom_grader(task_dir, skill_path, grading_mode)
+        custom_grader = _copy_custom_grader(task_dir, skill_path, grading_mode, evals_dir=evals_dir)
         _write_entry_json(
             task_dir,
             normalized_entry,
@@ -4631,7 +4823,7 @@ def _generate_harbor_tasks_into(
             repo_context_skill_path=skill_path,
             repo_context_mode="full" if copy_repo else "linked",
             compose_env_names=set(runtime_env or {}),
-            repo_context_exclude_paths=repo_context_exclude_paths,
+            repo_context_exclude_paths=(*repo_context_exclude_paths, *private_repo_context_exclude_paths),
             agent_workdir=agent_workdir,
         )
 
@@ -4649,6 +4841,361 @@ def _generate_harbor_tasks_into(
         with_skill,
     )
     return task_paths
+
+
+@dataclass(frozen=True)
+class _EvaluatorProjectionSelection:
+    """Evaluator paths selected before the single secure-copy transaction."""
+
+    exact_paths: frozenset[tuple[str, ...]]
+    whole_roots: frozenset[tuple[str, ...]]
+    signature: tuple[Any, ...]
+
+
+def _projection_path_exists(path: Path) -> bool:
+    """Check lexical presence without silently dropping a broken link."""
+    return os.path.lexists(path)
+
+
+def _selected_environment_projection(evals_dir: Path) -> tuple[set[tuple[str, ...]], set[tuple[str, ...]]]:
+    """Select the custom environment as one compatibility-preserving unit."""
+    exact: set[tuple[str, ...]] = set()
+    whole: set[tuple[str, ...]] = set()
+    environment = evals_dir / "environment"
+    if not _projection_path_exists(environment):
+        return exact, whole
+    # Custom Docker handling first creates a secure copy of this complete tree
+    # before it validates Dockerfile/Compose and selects sidecars. Keeping the
+    # directory whole preserves authored environment behavior while unrelated
+    # evals/ siblings remain outside the snapshot.
+    whole.add(("environment",))
+    return exact, whole
+
+
+def _selected_grader_paths(evals_dir: Path) -> tuple[tuple[str, ...], ...]:
+    candidates = (("grader.py",), ("grader.sh",), ("tests", "grader.py"), ("tests", "grader.sh"))
+    return tuple(relative for relative in candidates if _projection_path_exists(evals_dir.joinpath(*relative)))
+
+
+def _resolved_projection_task_source(
+    requested_task_source: str | None,
+    evals_config: dict[str, Any],
+    *,
+    dataset_path: Path | None,
+    native_dir: Path,
+) -> str:
+    configured = requested_task_source
+    if configured is None:
+        harbor_config = evals_config.get("harbor", {})
+        configured = harbor_config.get("task_source", "auto") if isinstance(harbor_config, dict) else "auto"
+    if configured not in {"auto", "evals_json", "native_harbor"}:
+        configured = "auto"
+    if configured == "auto":
+        if dataset_path is not None:
+            return "evals_json"
+        if native_dir.exists():
+            return "native_harbor"
+    return configured
+
+
+def _native_projection_entry_ids(native_dir: Path) -> tuple[str, ...]:
+    """Read native task IDs without following unsafe authored nodes.
+
+    The secure projection copy validates the complete selected ``harbor/`` tree
+    as one transaction. Selection only needs immediate task identities so it
+    can avoid fixtures referenced exclusively by generated entries.
+    """
+    try:
+        native_metadata = native_dir.lstat()
+        parent_metadata = native_dir.parent.lstat()
+    except OSError:
+        return ()
+    if (
+        _path_is_link_or_reparse(native_dir, native_metadata)
+        or not stat.S_ISDIR(native_metadata.st_mode)
+        or not stat.S_ISDIR(parent_metadata.st_mode)
+        or native_metadata.st_dev != parent_metadata.st_dev
+    ):
+        return ()
+    try:
+        children = sorted(native_dir.iterdir())
+    except OSError:
+        return ()
+    ignored = set(_NATIVE_SOURCE_IGNORE(os.fspath(native_dir), [path.name for path in children]))
+    entry_ids: list[str] = []
+    for task_dir in children:
+        if task_dir.name in ignored or task_dir.name.startswith((".", "_")):
+            continue
+        try:
+            task_metadata = task_dir.lstat()
+        except OSError:
+            continue
+        if (
+            _path_is_link_or_reparse(task_dir, task_metadata)
+            or not stat.S_ISDIR(task_metadata.st_mode)
+            or task_metadata.st_dev != native_metadata.st_dev
+        ):
+            continue
+        task_toml = task_dir / "task.toml"
+        if not _projection_path_exists(task_toml):
+            continue
+        entry_id = task_dir.name
+        try:
+            payload = _read_regular_evals_file(
+                task_toml,
+                label="Native Harbor task configuration",
+                allowed_root=native_dir,
+            )
+            data = tomllib.loads(payload.decode("utf-8"))
+            metadata = data.get("metadata", {}) if isinstance(data, dict) else {}
+            if isinstance(metadata, dict) and metadata.get("entry_id"):
+                entry_id = str(metadata["entry_id"])
+        except (UnicodeError, ValueError):
+            # Staging owns the detailed invalid-task diagnostic after the secure
+            # snapshot exists. Directory-name fallback remains non-invasive.
+            pass
+        entry_ids.append(entry_id)
+    return tuple(sorted(entry_ids))
+
+
+def _decode_projection_config(payload: bytes) -> tuple[dict[str, Any], bool]:
+    """Decode only the source-selection hint from already-secured config bytes."""
+    import yaml
+
+    try:
+        raw = yaml.safe_load(payload.decode("utf-8"))
+    except (UnicodeError, yaml.YAMLError):
+        return {}, False
+    if not isinstance(raw, dict):
+        return {}, False
+    harbor = raw.get("harbor")
+    if harbor is not None and not isinstance(harbor, dict):
+        return {}, False
+    return raw, True
+
+
+def _evaluator_projection_selection(
+    skill_path: Path,
+    *,
+    task_source: str | None,
+    bind_full_evidence_sources: bool,
+) -> _EvaluatorProjectionSelection:
+    """Resolve the evaluator projection and a post-copy selection signature."""
+    import yaml
+
+    from skillevaluator.tier3.dataset_utils import normalize_dataset_entries
+    from skillevaluator.tier3.evals_config import CONFIG_FILENAMES
+
+    evals_dir = skill_path / "evals"
+    config_path = next(
+        (evals_dir / name for name in CONFIG_FILENAMES if _projection_path_exists(evals_dir / name)),
+        None,
+    )
+    evals_config: dict[str, Any] = {}
+    config_valid = True
+    config_digest: str | None = None
+    if config_path is not None:
+        config_payload = _read_regular_evals_file(
+            config_path,
+            label="Eval configuration",
+            max_bytes=_MAX_EVALS_CONFIG_BYTES,
+            allowed_root=evals_dir,
+        )
+        config_digest = hashlib.sha256(config_payload).hexdigest()
+        evals_config, config_valid = _decode_projection_config(config_payload)
+
+    dataset_path = find_evals_file(skill_path)
+    dataset_valid = True
+    entries: list[dict[str, Any]] = []
+    dataset_digest: str | None = None
+    if dataset_path is not None:
+        dataset_payload = _read_regular_evals_file(dataset_path, allowed_root=evals_dir)
+        dataset_digest = hashlib.sha256(dataset_payload).hexdigest()
+        try:
+            decoded = dataset_payload.decode("utf-8")
+            suffix = dataset_path.suffix.casefold()
+            if suffix == ".jsonl":
+                raw_entries: Any = [json.loads(line) for raw_line in decoded.splitlines() if (line := raw_line.strip())]
+            elif suffix in {".yaml", ".yml"}:
+                raw_entries = yaml.safe_load(decoded)
+            elif suffix == ".json":
+                raw_entries = json.loads(decoded)
+            else:
+                raise ValueError(f"Unsupported dataset format: {suffix}")
+            entries = normalize_dataset_entries(raw_entries)
+        except (UnicodeError, TypeError, ValueError, yaml.YAMLError):
+            # Invalid datasets do not have a meaningful fixture selection. Copy
+            # the dataset itself and let normal task staging report its error.
+            dataset_valid = False
+
+    resolved_task_source = _resolved_projection_task_source(
+        task_source,
+        evals_config,
+        dataset_path=dataset_path,
+        native_dir=evals_dir / "harbor",
+    )
+    native_entry_ids: tuple[str, ...] = ()
+    native_dir = evals_dir / "harbor"
+    if resolved_task_source == "native_harbor" and _projection_path_exists(native_dir):
+        native_entry_ids = _native_projection_entry_ids(native_dir)
+    exact_paths: set[tuple[str, ...]] = set()
+    whole_roots: set[tuple[str, ...]] = set()
+    if config_path is not None:
+        exact_paths.add((config_path.name,))
+    if dataset_path is not None:
+        exact_paths.add((dataset_path.name,))
+    if resolved_task_source == "native_harbor" and _projection_path_exists(evals_dir / "harbor"):
+        whole_roots.add(("harbor",))
+
+    environment_exact, environment_whole = _selected_environment_projection(evals_dir)
+    exact_paths.update(environment_exact)
+    whole_roots.update(environment_whole)
+
+    available_grader_paths = _selected_grader_paths(evals_dir)
+    grader_paths = (
+        available_grader_paths
+        if bind_full_evidence_sources and resolved_task_source == "evals_json"
+        else available_grader_paths[:1]
+    )
+    exact_paths.update(grader_paths)
+
+    fixture_signature: tuple[Any, ...] = ("invalid-or-absent-dataset",)
+    if dataset_path is not None and dataset_valid:
+        files_dir = evals_dir / "files"
+        native_entry_id_set = set(native_entry_ids)
+        fixture_entries = (
+            [entry for entry in entries if str(entry.get("id")) in native_entry_id_set]
+            if resolved_task_source == "native_harbor"
+            else entries
+        )
+        implicit_shared_files = (
+            (bind_full_evidence_sources and resolved_task_source == "evals_json")
+            or any("files" not in entry for entry in fixture_entries)
+        ) and _projection_path_exists(files_dir)
+        selected_refs: set[tuple[str, ...]] = set()
+        if implicit_shared_files:
+            whole_roots.add(("files",))
+        for entry in fixture_entries:
+            for ref in _entry_file_refs(entry):
+                source, _staged_relative = _resolve_entry_file_ref(
+                    ref,
+                    skill_path=skill_path,
+                    evals_dir=evals_dir,
+                    input_files_dir=files_dir if files_dir.exists() else None,
+                )
+                relative = source.absolute().relative_to(evals_dir.absolute()).parts
+                try:
+                    source_metadata = source.lstat()
+                except OSError:
+                    exact_paths.add(relative)
+                    selected_refs.add(relative)
+                    continue
+                if stat.S_ISDIR(source_metadata.st_mode) and not _path_is_link_or_reparse(source, source_metadata):
+                    whole_roots.add(relative)
+                else:
+                    exact_paths.add(relative)
+                selected_refs.add(relative)
+        fixture_signature = (
+            "all-files" if implicit_shared_files else "declared-only",
+            tuple(sorted(selected_refs)),
+        )
+
+    signature = (
+        config_path.name if config_path is not None else None,
+        config_valid,
+        config_digest,
+        resolved_task_source,
+        dataset_path.name if dataset_path is not None else None,
+        dataset_valid,
+        dataset_digest,
+        bind_full_evidence_sources,
+        native_entry_ids,
+        fixture_signature,
+        grader_paths,
+        tuple(sorted(environment_exact)),
+        tuple(sorted(environment_whole)),
+    )
+    return _EvaluatorProjectionSelection(
+        exact_paths=frozenset(exact_paths),
+        whole_roots=frozenset(whole_roots),
+        signature=signature,
+    )
+
+
+def _projection_includes(
+    relative: tuple[str, ...],
+    *,
+    exact_paths: frozenset[tuple[str, ...]],
+    whole_roots: frozenset[tuple[str, ...]],
+) -> bool:
+    if any(relative == exact[: len(relative)] for exact in exact_paths):
+        return True
+    return any(relative == whole[: len(relative)] or whole == relative[: len(whole)] for whole in whole_roots)
+
+
+@contextmanager
+def private_evaluator_skill_snapshot(
+    skill_path: Path,
+    *,
+    task_source: str | None = None,
+    bind_full_evidence_sources: bool = False,
+) -> Iterator[Path]:
+    """Yield one selective, immutable evaluator projection for a complete run."""
+    source_evals_dir = skill_path / "evals"
+    _validate_evals_source_directory(skill_path)
+    if not source_evals_dir.is_dir():
+        raise FileNotFoundError(f"No evaluator source directory found at {source_evals_dir}")
+
+    selection = _evaluator_projection_selection(
+        skill_path,
+        task_source=task_source,
+        bind_full_evidence_sources=bind_full_evidence_sources,
+    )
+    source_evals_canonical = source_evals_dir.resolve(strict=True)
+
+    with tempfile.TemporaryDirectory(prefix="skillevaluator-evals-snapshot-") as snapshot_root_text:
+        snapshot_root = Path(snapshot_root_text)
+        evaluator_skill_path = snapshot_root / skill_path.name
+        evaluator_skill_path.mkdir()
+        try:
+            snapshot_source_relative = snapshot_root.resolve(strict=True).relative_to(source_evals_canonical).parts
+        except (OSError, ValueError):
+            snapshot_source_relative = ()
+
+        def _ignore_unselected_evaluator_paths(current: str, names: list[str]) -> set[str]:
+            try:
+                current_relative = Path(current).resolve(strict=True).relative_to(source_evals_canonical).parts
+            except (OSError, ValueError):
+                return set(names)
+            ignored = {
+                name
+                for name in names
+                if not _projection_includes(
+                    (*current_relative, name),
+                    exact_paths=selection.exact_paths,
+                    whole_roots=selection.whole_roots,
+                )
+            }
+            if snapshot_source_relative:
+                ignored.update(name for name in names if (*current_relative, name) == snapshot_source_relative)
+            if current_relative and current_relative[0].casefold() == "harbor":
+                ignored.update(_NATIVE_SOURCE_IGNORE(current, names))
+            return ignored
+
+        copytree_secure(
+            source_evals_dir,
+            evaluator_skill_path / "evals",
+            ignore=_ignore_unselected_evaluator_paths,
+            allowed_root=source_evals_dir,
+        )
+        copied_selection = _evaluator_projection_selection(
+            evaluator_skill_path,
+            task_source=task_source,
+            bind_full_evidence_sources=bind_full_evidence_sources,
+        )
+        if copied_selection.signature != selection.signature:
+            raise ValueError("Evaluator source selection changed while its private snapshot was created")
+        yield evaluator_skill_path
 
 
 def generate_harbor_tasks(
@@ -4669,8 +5216,35 @@ def generate_harbor_tasks(
     pre_agent_setup: list[str] | None = None,
     task_resources: dict[str, int] | None = None,
     agent_workdir: str | None = None,
+    evaluator_skill_path: Path | None = None,
 ) -> list[Path]:
-    """Generate tasks privately, then publish one exact output snapshot."""
+    """Generate tasks from one private evals snapshot, then publish exactly."""
+
+    if evaluator_skill_path is None:
+        if find_evals_file(skill_path) is None:
+            raise FileNotFoundError(f"No evals dataset found in {skill_path / 'evals'}")
+        with private_evaluator_skill_snapshot(skill_path, task_source="evals_json") as private_skill_path:
+            return generate_harbor_tasks(
+                skill_path,
+                output_dir,
+                with_skill=with_skill,
+                reference_skills_dir=reference_skills_dir,
+                workspace_skill_paths=workspace_skill_paths,
+                workspace_mode=workspace_mode,
+                grading_mode=grading_mode,
+                base_image=base_image,
+                custom_dockerfile_mode=custom_dockerfile_mode,
+                copy_repo=copy_repo,
+                repo_context_exclude_paths=repo_context_exclude_paths,
+                runtime_env=runtime_env,
+                verifier_env=verifier_env,
+                pre_agent_setup=pre_agent_setup,
+                task_resources=task_resources,
+                agent_workdir=agent_workdir,
+                evaluator_skill_path=private_skill_path,
+            )
+    if find_evals_file(evaluator_skill_path) is None:
+        raise FileNotFoundError(f"No evals dataset found in {evaluator_skill_path / 'evals'}")
 
     validate_output_provenance_key_location(
         skill_path,
@@ -4689,12 +5263,21 @@ def generate_harbor_tasks(
     if output_requires_provenance:
         validate_generated_output_replacement(output_dir)
 
-    with tempfile.TemporaryDirectory(prefix="skillevaluator-generated-tasks-") as temporary:
+    private_staging_parent = _private_task_staging_parent(
+        skill_path,
+        reference_skills_dir=reference_skills_dir,
+        workspace_skill_paths=workspace_skill_paths or (),
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="skillevaluator-generated-tasks-",
+        dir=private_staging_parent,
+    ) as temporary:
         private_root = Path(temporary).resolve(strict=True)
         private_output = private_root / "dataset"
         private_tasks = _generate_harbor_tasks_into(
             skill_path,
             private_output,
+            evaluator_skill_path=evaluator_skill_path,
             with_skill=with_skill,
             reference_skills_dir=reference_skills_dir,
             workspace_skill_paths=workspace_skill_paths,
@@ -4703,7 +5286,12 @@ def generate_harbor_tasks(
             base_image=base_image,
             custom_dockerfile_mode=custom_dockerfile_mode,
             copy_repo=copy_repo,
-            repo_context_exclude_paths=(*repo_context_exclude_paths, output_dir, private_root),
+            repo_context_exclude_paths=(
+                *repo_context_exclude_paths,
+                output_dir,
+                private_root,
+            ),
+            private_repo_context_exclude_paths=(evaluator_skill_path.parent,),
             runtime_env=runtime_env,
             verifier_env=verifier_env,
             pre_agent_setup=pre_agent_setup,

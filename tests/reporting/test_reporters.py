@@ -702,6 +702,7 @@ class TestTier3HarborCanonicalPayload:
             ),
             encoding="utf-8",
         )
+        (run_dir / "run_config.json").write_text("{}", encoding="utf-8")
         (run_dir / "result.json").write_text(json.dumps({"run_id": run_id}), encoding="utf-8")
         (results_root / "latest").symlink_to(run_id)
 

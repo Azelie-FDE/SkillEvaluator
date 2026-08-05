@@ -28,6 +28,7 @@ def test_discover_trajectories_uses_env_results_root(tmp_path, monkeypatch):
     trial.mkdir(parents=True)
     trajectory = {"steps": [{"type": "assistant", "content": "done"}]}
     trial.joinpath("trajectory.json").write_text(json.dumps(trajectory), encoding="utf-8")
+    (run_dir / "run_config.json").write_text("{}", encoding="utf-8")
     (run_dir / "result.json").write_text(json.dumps({"run_id": run_id}), encoding="utf-8")
     (skill_results / "latest").symlink_to(run_id)
 
@@ -48,6 +49,7 @@ def test_discover_trajectories_results_dir_overrides_env(tmp_path, monkeypatch):
     trial.mkdir(parents=True)
     trajectory = {"steps": [{"type": "assistant", "content": "done"}]}
     trial.joinpath("trajectory.json").write_text(json.dumps(trajectory), encoding="utf-8")
+    (run_dir / "run_config.json").write_text("{}", encoding="utf-8")
     (run_dir / "result.json").write_text(json.dumps({"run_id": run_id}), encoding="utf-8")
     (skill_results / "latest").symlink_to(run_id)
 

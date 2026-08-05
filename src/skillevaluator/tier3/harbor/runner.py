@@ -18,7 +18,7 @@ import time
 import tomllib
 from collections.abc import Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import wraps
@@ -35,6 +35,7 @@ from skillevaluator.tier3.harbor.adapter import (
     build_eval_base_image,
     find_evals_file,
     generate_harbor_tasks,
+    private_evaluator_skill_snapshot,
     stage_native_harbor_tasks,
     validate_output_provenance_key_location,
     validate_results_root_location,
@@ -1658,9 +1659,12 @@ def _run_harbor_eval_impl(
     override_memory_mb: int | None = None,
     override_storage_mb: int | None = None,
     progress_reporter: ProgressReporter | None = None,
+    _evaluator_skill_path: Path | None = None,
+    _monotonic_start: float | None = None,
 ) -> dict[str, Any]:
     """Run a public Harbor evaluation with and without the target skill."""
-    started_at = time.monotonic()
+    forwarded = dict(locals()) if _evaluator_skill_path is None else None
+    started_at = _monotonic_start if _monotonic_start is not None else time.monotonic()
     reporter = safe_progress_reporter(progress_reporter or NullProgressReporter())
     if env_mode not in HARBOR_ENV_MODES:
         reporter.emit(ProgressEvent(stage="configuration", state="failed", detail="unsupported environment"))
@@ -1677,9 +1681,25 @@ def _run_harbor_eval_impl(
             reporter.emit(ProgressEvent(stage="configuration", state="failed", detail=str(exc)))
             return {"error": [str(exc)]}
 
+    if _evaluator_skill_path is None:
+        assert forwarded is not None
+        forwarded.pop("skill_path")
+        forwarded.pop("agents")
+        with ExitStack() as snapshot_stack:
+            try:
+                evaluator_skill_path = snapshot_stack.enter_context(private_evaluator_skill_snapshot(skill_path))
+            except (FileNotFoundError, ValueError) as exc:
+                reporter.emit(ProgressEvent(stage="configuration", state="failed", detail=str(exc)))
+                return {"error": [str(exc)]}
+            forwarded["_evaluator_skill_path"] = evaluator_skill_path
+            forwarded["_monotonic_start"] = started_at
+            return _run_harbor_eval_impl(skill_path, agents, **forwarded)
+
+    evaluator_skill_path = _evaluator_skill_path
+
     try:
         provider = resolve_llm_provider()
-        config, config_path = load_evals_config(skill_path)
+        config, config_path = load_evals_config(evaluator_skill_path)
     except (ProviderConfigurationError, EvalsConfigError) as exc:
         reporter.emit(ProgressEvent(stage="configuration", state="failed", detail=str(exc)))
         return {"error": [str(exc)]}
@@ -1812,8 +1832,8 @@ def _run_harbor_eval_impl(
         reporter.emit(ProgressEvent(stage="with-skill-tasks", state="failed", detail=str(exc)))
         return {"error": [str(exc)]}
 
-    evals_exists = find_evals_file(skill_path) is not None
-    native_exists = (skill_path / "evals" / "harbor").exists()
+    evals_exists = find_evals_file(evaluator_skill_path) is not None
+    native_exists = (evaluator_skill_path / "evals" / "harbor").exists()
     if task_source == "auto":
         task_source = "evals_json" if evals_exists else "native_harbor" if native_exists else ""
     if task_source == "evals_json" and not evals_exists:
@@ -1884,6 +1904,7 @@ def _run_harbor_eval_impl(
             skill_path.resolve(),
             reference_skills_dir,
             workspace_skill_paths=workspace_skills,
+            evaluator_skill_path=evaluator_skill_path,
             excluded_roots=(root,),
             force_rebuild=base_image_mode == "rebuild",
         )
@@ -1930,6 +1951,7 @@ def _run_harbor_eval_impl(
                 pre_agent_setup=harbor_config.get("pre_agent_setup", []),
                 task_resources=resource_config,
                 agent_workdir=harbor_config.get("agent_workdir"),
+                evaluator_skill_path=evaluator_skill_path,
             )
             task_names = [task.name for task in task_paths]
             if expected_task_names is None:
@@ -1960,6 +1982,7 @@ def _run_harbor_eval_impl(
                     pre_agent_setup=harbor_config.get("pre_agent_setup", []),
                     task_resources=resource_config,
                     agent_workdir=harbor_config.get("agent_workdir"),
+                    evaluator_skill_path=evaluator_skill_path,
                 )
         if not skip_baseline:
             reporter.emit(ProgressEvent(stage="baseline-tasks", state="ready", detail="baseline inputs staged"))
@@ -2166,7 +2189,7 @@ def _run_harbor_eval_impl(
         raise
     reporter.emit(ProgressEvent(stage="collection", state="complete", detail="Harbor results collected"))
     run_config = {
-        "config_file": str(config_path.relative_to(skill_path)) if config_path else "none",
+        "config_file": str(config_path.relative_to(evaluator_skill_path)) if config_path else "none",
         "harbor": {
             "environment": {"value": env_mode, "source": env_mode_source},
             "n_attempts": n_attempts,

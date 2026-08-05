@@ -15,10 +15,82 @@ from skillevaluator.tier3.commands import compare_results
 
 
 def _complete_current_run(run_dir: Path) -> None:
+    (run_dir / "run_config.json").write_text("{}", encoding="utf-8")
     (run_dir / "result.json").write_text(
         json.dumps({"run_id": run_dir.name, "agents": {}}),
         encoding="utf-8",
     )
+
+
+def _write_authentic_pre_status_run(root: Path, run_id: str, *, score: float = 0.8) -> Path:
+    run_dir = root / run_id
+    summary_dir = run_dir / "opencode" / "with-skill"
+    summary_dir.mkdir(parents=True)
+    (run_dir / "run_config.json").write_text(
+        json.dumps(
+            {
+                "harbor": {"n_attempts": {"value": 1, "source": "ACES default"}},
+                "task_source": "evals_json",
+                "agents": {
+                    "opencode": {
+                        "agent": "opencode",
+                        "model": "test-model",
+                        "source": "test default",
+                        "occurrence": "1",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (summary_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "agent": "opencode",
+                "model": "test-model",
+                "model_source": "test default",
+                "scores": {"security": score},
+                "custom_scores": {},
+                "metric_set": "aces-default-v2",
+                "metrics": ["security"],
+                "dimensions": {"safety": {"score": score, "sources": {"security": 1.0}}},
+                "num_trials": 1,
+                "pass_at_k": {
+                    "k": 1,
+                    "pass_threshold": 0.5,
+                    "stop_on_pass": False,
+                    "passed_cases": 1,
+                    "failed_cases": 0,
+                    "total_cases": 1,
+                    "rate": 1.0,
+                    "attempts_used": 1,
+                    "max_attempts_possible": 1,
+                    "avg_attempts_used": 1.0,
+                    "extra_cases": [],
+                    "cases": {
+                        "case": {
+                            "passed": True,
+                            "first_pass_attempt": 1,
+                            "attempts_used": 1,
+                            "attempts_skipped": 0,
+                            "attempts_missing": 0,
+                            "best_score": score,
+                            "attempts": [
+                                {
+                                    "attempt": 1,
+                                    "trial": "case__attempt1",
+                                    "score": score,
+                                    "passed": True,
+                                }
+                            ],
+                        }
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return run_dir
 
 
 def test_compare_rejects_partial_scores_from_failed_summary(tmp_path: Path) -> None:
@@ -124,6 +196,7 @@ def test_compare_same_timestamp_unique_runs_uses_result_completion_time(
             encoding="utf-8",
         )
         result_path = run_dir / "result.json"
+        (run_dir / "run_config.json").write_text("{}", encoding="utf-8")
         result_path.write_text(json.dumps({"run_id": run_id, "agents": {}}), encoding="utf-8")
         os.utime(result_path, ns=(completed_ns, completed_ns))
 
@@ -185,6 +258,21 @@ def test_compare_retains_non_timestamp_legacy_summary_directory(
 
     assert compare_results(skill_path, results_dir=tmp_path / "results") == 0
     assert legacy.name in capsys.readouterr().out
+
+
+def test_compare_consumes_authenticated_timestamped_pre_status_run(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    skill_path = tmp_path / "demo"
+    skill_path.mkdir()
+    run_id = "20260709_010000_111_aaaaaaaaaaaa"
+    _write_authentic_pre_status_run(tmp_path / "results" / skill_path.name, run_id)
+
+    assert compare_results(skill_path, results_dir=tmp_path / "results") == 0
+    output = capsys.readouterr().out
+    assert run_id in output
+    assert "opencode" in output
 
 
 @pytest.mark.parametrize("primary_kind", ["empty", "partial", "non-object"])

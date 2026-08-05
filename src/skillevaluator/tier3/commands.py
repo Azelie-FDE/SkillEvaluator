@@ -49,6 +49,8 @@ from skillevaluator.tier3.harbor.runner import (
 )
 from skillevaluator.tier3.harbor.secure_copy import copytree_secure
 from skillevaluator.tier3.results_location import (
+    _run_timestamp,
+    is_legacy_completed_run_dir,
     iter_candidate_results_roots,
     ordered_run_directories,
     resolve_latest_results,
@@ -944,6 +946,7 @@ def compare_results(skill_path: Path, *, results_dir: Path | None = None) -> int
         root_without: dict[str, dict[str, float]] = {}
         root_meta: dict[str, dict[str, Any]] = {}
         for ts_dir in ordered_run_directories(candidate_root):
+            allow_missing_status = _run_timestamp(ts_dir.name) is None or is_legacy_completed_run_dir(ts_dir)
             try:
                 agent_dirs = sorted(ts_dir.iterdir())
             except OSError:
@@ -963,7 +966,7 @@ def compare_results(skill_path: Path, *, results_dir: Path | None = None) -> int
                     data = json.loads(summary.read_text(encoding="utf-8"))
                 except (ValueError, OSError):
                     continue
-                scores = _summary_scores(data)
+                scores = _summary_scores(data, allow_missing_status=allow_missing_status)
                 if scores:
                     root_with[agent_name] = scores
                     root_meta[agent_name] = {
@@ -974,7 +977,10 @@ def compare_results(skill_path: Path, *, results_dir: Path | None = None) -> int
                     wo_summary = agent_dir / "without-skill" / "summary.json"
                     if wo_summary.exists():
                         try:
-                            wo_scores = _summary_scores(json.loads(wo_summary.read_text(encoding="utf-8")))
+                            wo_scores = _summary_scores(
+                                json.loads(wo_summary.read_text(encoding="utf-8")),
+                                allow_missing_status=allow_missing_status,
+                            )
                             if wo_scores:
                                 root_without[agent_name] = wo_scores
                         except (ValueError, OSError):
@@ -1040,10 +1046,11 @@ def compare_results(skill_path: Path, *, results_dir: Path | None = None) -> int
     return 0
 
 
-def _summary_scores(data: dict[str, Any]) -> dict[str, float]:
+def _summary_scores(data: dict[str, Any], *, allow_missing_status: bool = False) -> dict[str, float]:
     if not isinstance(data, dict):
         return {}
-    if data.get("execution_status") != "succeeded":
+    status = data.get("execution_status")
+    if status != "succeeded" and not (allow_missing_status and status is None):
         return {}
     scores: dict[str, float] = {}
     raw_scores = data.get("scores", data)

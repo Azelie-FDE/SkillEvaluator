@@ -19,6 +19,7 @@ from skillevaluator.tier3.results_location import external_results_root, resolve
 def _write_completed_run(root: Path, run_id: str) -> Path:
     run_dir = root / run_id
     run_dir.mkdir(parents=True)
+    (run_dir / "run_config.json").write_text("{}", encoding="utf-8")
     (run_dir / "result.json").write_text(
         json.dumps({"run_id": run_id, "agents": {}}),
         encoding="utf-8",

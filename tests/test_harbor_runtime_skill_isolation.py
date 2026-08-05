@@ -23,6 +23,7 @@ from skillevaluator.tier3.harbor.adapter import (
     _path_is_excluded,
     generate_harbor_tasks,
     prebuild_task_environments,
+    private_evaluator_skill_snapshot,
     stage_native_harbor_tasks,
     validate_results_root_location,
 )
@@ -213,6 +214,55 @@ def test_native_tasks_project_runtime_skills_without_root_evals(tmp_path: Path) 
     assert (task / "tests" / "grader.py").is_file()
 
 
+def test_native_task_staging_uses_one_private_evals_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    _write_minimal_native_task(target)
+    evals = target / "evals"
+    moved = tmp_path / "evals-A"
+    real_load = adapter_module._load_entries_by_id
+    swapped = False
+
+    def swap_original_evals_after_metadata_read(path: Path) -> dict[str, dict[str, object]]:
+        nonlocal swapped
+        entries = real_load(path)
+        if not swapped:
+            swapped = True
+            evals.rename(moved)
+            shutil.copytree(moved, evals)
+            (evals / "evals.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "id": "case-001",
+                            "question": "metadata-B",
+                            "files": ["evals/files/selected.txt"],
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (evals / "files" / "selected.txt").write_text("fixture-B\n", encoding="utf-8")
+            (evals / "harbor" / "case-001" / "instruction.md").write_text(
+                "native-B\n",
+                encoding="utf-8",
+            )
+        return entries
+
+    monkeypatch.setattr(adapter_module, "_load_entries_by_id", swap_original_evals_after_metadata_read)
+
+    task = stage_native_harbor_tasks(target, tmp_path / "native-snapshot", with_skill=False)[0]
+    entry = json.loads((task / "tests" / "entry.json").read_text(encoding="utf-8"))
+
+    assert swapped
+    assert (task / "instruction.md").read_text(encoding="utf-8") == "Run the native case.\n"
+    assert entry["question"] == "Use only the selected fixture."
+    assert (task / "environment" / "input" / "selected.txt").read_text(encoding="utf-8") == "SELECTED-FIXTURE\n"
+    assert (task / "tests" / "grader.py").is_file()
+
+
 def test_base_image_dependency_collection_ignores_only_root_evals(tmp_path: Path) -> None:
     _, target, references_dir, workspace = _write_projection_fixture(tmp_path)
 
@@ -365,7 +415,7 @@ def test_copy_repo_rejects_hardlink_alias(tmp_path: Path) -> None:
     except OSError as exc:  # pragma: no cover - filesystem policy
         pytest.skip(f"hardlinks unavailable on this host: {exc}")
 
-    with pytest.raises(ValueError, match=r"hardlink|hard link"):
+    with pytest.raises(ValueError, match=r"hard.?link"):
         generate_harbor_tasks(
             target,
             tmp_path / "generated-hardlink",
@@ -1416,7 +1466,8 @@ def test_readonly_custom_environment_snapshot_stays_outside_docker_context(
     original_copytree = adapter_module.copytree_secure
 
     def record_custom_snapshot(source: Path, destination: Path, *args: object, **kwargs: object) -> None:
-        if Path(source) == custom_environment:
+        source_path = Path(source)
+        if source_path.name == "environment" and source_path.parent.name == "evals":
             snapshot_destinations.append(Path(destination))
         original_copytree(source, destination, *args, **kwargs)
 
@@ -2672,3 +2723,350 @@ def test_eval_dataset_file_must_be_regular_and_unlinked(tmp_path: Path, kind: st
 
     with pytest.raises(ValueError, match="regular non-linked file"):
         generate_harbor_tasks(target, tmp_path / f"unsafe-dataset-{kind}")
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo"])
+def test_selective_evaluator_snapshot_does_not_copy_unselected_unsafe_fixture(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    files = target / "evals" / "files"
+    unselected = files / "unselected-unsafe"
+    outside = tmp_path / "outside-unselected.txt"
+    outside.write_text("must not be inspected or copied\n", encoding="utf-8")
+    try:
+        if kind == "symlink":
+            unselected.symlink_to(outside)
+        elif kind == "hardlink":
+            unselected.hardlink_to(outside)
+        elif hasattr(os, "mkfifo"):
+            os.mkfifo(unselected)
+        else:
+            pytest.skip("FIFO creation is unavailable")
+    except OSError as exc:
+        pytest.skip(f"{kind} creation is unavailable: {exc}")
+
+    # A sparse large sibling models the ENOSPC/performance regression without
+    # making the test consume the corresponding amount of disk.
+    (files / "unselected-large.bin").touch()
+    os.truncate(files / "unselected-large.bin", 256 * 1024 * 1024)
+
+    with private_evaluator_skill_snapshot(target, task_source="evals_json") as snapshot:
+        projected_files = snapshot / "evals" / "files"
+        assert (projected_files / "selected.txt").read_text(encoding="utf-8") == "SELECTED-FIXTURE\n"
+        assert not (projected_files / "hidden.txt").exists()
+        assert not os.path.lexists(projected_files / "unselected-unsafe")
+        assert not (projected_files / "unselected-large.bin").exists()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo"])
+def test_selective_evaluator_snapshot_fails_closed_for_referenced_unsafe_fixture(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    files = target / "evals" / "files"
+    selected = files / "selected.txt"
+    selected.unlink()
+    outside = tmp_path / "outside-selected.txt"
+    outside.write_text("must never be copied\n", encoding="utf-8")
+    try:
+        if kind == "symlink":
+            selected.symlink_to(outside)
+        elif kind == "hardlink":
+            selected.hardlink_to(outside)
+        elif hasattr(os, "mkfifo"):
+            os.mkfifo(selected)
+        else:
+            pytest.skip("FIFO creation is unavailable")
+    except OSError as exc:
+        pytest.skip(f"{kind} creation is unavailable: {exc}")
+
+    with (
+        pytest.raises((FileNotFoundError, ValueError), match=r"outside evals|symlink|hard.?link|regular file"),
+        private_evaluator_skill_snapshot(target, task_source="evals_json"),
+    ):
+        pass
+
+
+def test_selective_evaluator_snapshot_preserves_legacy_implicit_files_corpus(tmp_path: Path) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    (target / "evals" / "evals.json").write_text(
+        json.dumps([{"id": "case-001", "question": "Use the shared fixtures."}]),
+        encoding="utf-8",
+    )
+
+    with private_evaluator_skill_snapshot(target, task_source="evals_json") as snapshot:
+        projected_files = snapshot / "evals" / "files"
+        assert (projected_files / "selected.txt").is_file()
+        assert (projected_files / "hidden.txt").is_file()
+
+
+def test_native_snapshot_ignores_generated_only_entries_when_selecting_fixtures(tmp_path: Path) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    _write_minimal_native_task(target)
+    evals = target / "evals"
+    (evals / "evals.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "case-001",
+                    "question": "Use only the selected fixture.",
+                    "files": ["evals/files/selected.txt"],
+                },
+                {
+                    "id": "generated-only",
+                    "question": "This entry has legacy implicit shared files.",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+    unsafe = evals / "files" / "unselected-unsafe"
+    outside = tmp_path / "outside-native-fixtures.txt"
+    outside.write_text("must not be inspected or copied\n", encoding="utf-8")
+    try:
+        unsafe.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    with private_evaluator_skill_snapshot(target, task_source="native_harbor") as snapshot:
+        projected_files = snapshot / "evals" / "files"
+        assert (projected_files / "selected.txt").read_text(encoding="utf-8") == "SELECTED-FIXTURE\n"
+        assert not (projected_files / "hidden.txt").exists()
+        assert not os.path.lexists(projected_files / "unselected-unsafe")
+
+    task = stage_native_harbor_tasks(target, tmp_path / "native-selected-fixtures", with_skill=False)[0]
+    staged_input = task / "environment" / "input"
+    assert (staged_input / "selected.txt").read_text(encoding="utf-8") == "SELECTED-FIXTURE\n"
+    assert not (staged_input / "hidden.txt").exists()
+    assert not os.path.lexists(staged_input / "unselected-unsafe")
+
+
+def test_evidence_snapshot_binds_complete_files_corpus_for_explicit_entries(tmp_path: Path) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+
+    with private_evaluator_skill_snapshot(
+        target,
+        task_source="evals_json",
+        bind_full_evidence_sources=True,
+    ) as snapshot:
+        projected_files = snapshot / "evals" / "files"
+        assert (projected_files / "selected.txt").is_file()
+        assert (projected_files / "hidden.txt").is_file()
+
+
+def test_selective_snapshot_ignores_shadowed_grader_but_evidence_binds_it(tmp_path: Path) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    shadowed = target / "evals" / "tests" / "grader.py"
+    shadowed.parent.mkdir()
+    outside = tmp_path / "outside-shadowed-grader.py"
+    outside.write_text("raise RuntimeError('must not run')\n", encoding="utf-8")
+    try:
+        shadowed.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    with private_evaluator_skill_snapshot(target, task_source="evals_json") as snapshot:
+        assert (snapshot / "evals" / "grader.py").is_file()
+        assert not os.path.lexists(snapshot / "evals" / "tests" / "grader.py")
+
+    with (
+        pytest.raises(ValueError, match="symlink"),
+        private_evaluator_skill_snapshot(
+            target,
+            task_source="evals_json",
+            bind_full_evidence_sources=True,
+        ),
+    ):
+        pass
+
+
+def test_evidence_snapshot_rejects_unselected_unsafe_file_it_must_bind(tmp_path: Path) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    hidden = target / "evals" / "files" / "hidden.txt"
+    hidden.unlink()
+    outside = tmp_path / "evidence-hardlink.txt"
+    outside.write_text("bound evidence\n", encoding="utf-8")
+    try:
+        hidden.hardlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"hardlinks unavailable: {exc}")
+
+    with (
+        pytest.raises(ValueError, match=r"hard.?link"),
+        private_evaluator_skill_snapshot(
+            target,
+            task_source="evals_json",
+            bind_full_evidence_sources=True,
+        ),
+    ):
+        pass
+
+
+@pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo"])
+def test_selective_evaluator_snapshot_ignores_unsafe_unconsumed_evals_subtree(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    archive = target / "evals" / "historical-archive"
+    archive.mkdir()
+    unsafe = archive / "unsafe"
+    outside = tmp_path / "outside-archive.txt"
+    outside.write_text("unconsumed\n", encoding="utf-8")
+    try:
+        if kind == "symlink":
+            unsafe.symlink_to(outside)
+        elif kind == "hardlink":
+            unsafe.hardlink_to(outside)
+        elif hasattr(os, "mkfifo"):
+            os.mkfifo(unsafe)
+        else:
+            pytest.skip("FIFO creation is unavailable")
+    except OSError as exc:
+        pytest.skip(f"{kind} creation is unavailable: {exc}")
+
+    with private_evaluator_skill_snapshot(target, task_source="evals_json") as snapshot:
+        assert not (snapshot / "evals" / "historical-archive").exists()
+
+
+def test_selective_evaluator_snapshot_rejects_fixture_selection_change_during_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    dataset = target / "evals" / "evals.json"
+    original_copytree = adapter_module.copytree_secure
+    mutated = False
+
+    def mutate_selection_then_copy(source: Path, destination: Path, *args: object, **kwargs: object) -> None:
+        nonlocal mutated
+        if Path(source) == target / "evals" and not mutated:
+            dataset.write_text(
+                json.dumps([{"id": "case-001", "question": "Now use every shared fixture."}]),
+                encoding="utf-8",
+            )
+            mutated = True
+        original_copytree(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(adapter_module, "copytree_secure", mutate_selection_then_copy)
+
+    with (
+        pytest.raises(ValueError, match="selection changed"),
+        private_evaluator_skill_snapshot(target, task_source="evals_json"),
+    ):
+        pass
+
+    assert mutated
+
+
+def test_in_repo_temp_evaluator_snapshot_is_excluded_from_copy_repo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, target, _, _ = _write_projection_fixture(tmp_path)
+    in_repo_temp = repo / "in-repo-temp"
+    in_repo_temp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(in_repo_temp))
+
+    task = generate_harbor_tasks(
+        target,
+        tmp_path / "in-repo-temp-output",
+        with_skill=True,
+        copy_repo=True,
+    )[0]
+
+    staged_repo = task / "environment" / "repo"
+    assert staged_repo.is_dir()
+    assert not list(staged_repo.rglob("evals.json"))
+    readable = "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore") for path in staged_repo.rglob("*") if path.is_file()
+    )
+    assert "GROUND-TRUTH-SECRET" not in readable
+
+
+def test_temp_snapshot_inside_legacy_files_does_not_recurse_into_itself(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    (target / "evals" / "evals.json").write_text(
+        json.dumps([{"id": "case-001", "question": "Use every shared fixture."}]),
+        encoding="utf-8",
+    )
+    nested_temp = target / "evals" / "files" / "nested-temp-root"
+    nested_temp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(nested_temp))
+
+    task = generate_harbor_tasks(target, tmp_path / "nested-temp-output", with_skill=False)[0]
+
+    staged_input = task / "environment" / "input"
+    assert (staged_input / "selected.txt").is_file()
+    assert (staged_input / "hidden.txt").is_file()
+    assert not list(staged_input.rglob("evals.json"))
+
+
+def test_native_projection_does_not_enumerate_symlinked_harbor_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    outside_skill = tmp_path / "outside-skill"
+    _write_minimal_native_task(outside_skill)
+    outside = outside_skill / "evals" / "harbor"
+    native_root = target / "evals" / "harbor"
+    try:
+        native_root.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlink creation is unavailable: {exc}")
+
+    original_iterdir = Path.iterdir
+    enumerated_source = False
+
+    def record_iterdir(path: Path):
+        nonlocal enumerated_source
+        if path.absolute() == native_root.absolute():
+            enumerated_source = True
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", record_iterdir)
+
+    with pytest.raises(ValueError, match="symlink"):
+        stage_native_harbor_tasks(target, tmp_path / "symlinked-native-root")
+
+    assert not enumerated_source
+
+
+def test_native_projection_does_not_read_task_directory_on_another_device(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    _write_minimal_native_task(target)
+    native_root = target / "evals" / "harbor"
+    task_dir = native_root / "case-001"
+    original_lstat = Path.lstat
+    original_read = adapter_module._read_regular_evals_file
+    read_task_config = False
+
+    def cross_device_lstat(path: Path):
+        metadata = original_lstat(path)
+        if path.absolute() != task_dir.absolute():
+            return metadata
+        fields = list(metadata)
+        fields[2] = metadata.st_dev + 1
+        return os.stat_result(fields)
+
+    def record_read(path: Path, **kwargs: object) -> bytes:
+        nonlocal read_task_config
+        if path.absolute() == (task_dir / "task.toml").absolute():
+            read_task_config = True
+        return original_read(path, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", cross_device_lstat)
+    monkeypatch.setattr(adapter_module, "_read_regular_evals_file", record_read)
+
+    assert adapter_module._native_projection_entry_ids(native_root) == ()
+    assert not read_task_config
