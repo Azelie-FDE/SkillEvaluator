@@ -27,7 +27,7 @@ import stat
 import subprocess
 import tempfile
 import tomllib
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
@@ -81,6 +81,8 @@ _REPO_CONTEXT_IGNORE_NAMES = {
 }
 _REPO_CONTEXT_IGNORE_PARTS = {("evals", "results")}
 _REPO_CONTEXT_IGNORE_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
+_NATIVE_SOURCE_IGNORE_NAMES = ("results", "__pycache__", ".git", GENERATED_OUTPUT_MARKER)
+_NATIVE_SOURCE_IGNORE = shutil.ignore_patterns(*_NATIVE_SOURCE_IGNORE_NAMES)
 _REPO_CONTEXT_PUBLIC_ENV_SUFFIXES = (".dist", ".example", ".sample", ".template")
 _REPO_CONTEXT_SENSITIVE_NAMES = {
     ".git-credentials",
@@ -291,6 +293,7 @@ def _find_target_manifest_payload(
     runtime_projection: bool = False,
     excluded_roots: Sequence[Path] = (),
     ignored_parts: frozenset[str] = frozenset(),
+    ignored_path_predicate: Callable[[Path], bool] | None = None,
 ) -> Path | None:
     """Find a renamed file containing the exact evaluated-skill instructions."""
     target_manifest = _skill_manifest(target_skill)
@@ -299,6 +302,8 @@ def _find_target_manifest_payload(
     target_payload = target_manifest.read_bytes()
     runtime_ignore = _runtime_skill_copy_ignore(root, excluded_roots) if runtime_projection else None
     for candidate in root.rglob("*"):
+        if ignored_path_predicate is not None and ignored_path_predicate(candidate):
+            continue
         relative_parts = candidate.relative_to(root).parts
         if ignored_parts.intersection(relative_parts):
             continue
@@ -3500,9 +3505,10 @@ def _write_dockerfile(
     custom_env_dir = skill_path / "evals" / "environment" if skill_path else None
 
     if custom_env_dir and custom_env_dir.exists():
-        staged_custom_env = env_dir / ".skillevaluator-custom-environment"
-        copytree_secure(custom_env_dir, staged_custom_env, allowed_root=skill_path)
+        private_custom_env = tempfile.TemporaryDirectory(prefix="skillevaluator-custom-environment-")
+        staged_custom_env = Path(private_custom_env.name) / "environment"
         try:
+            copytree_secure(custom_env_dir, staged_custom_env, allowed_root=skill_path)
             if not has_skill and skill_path:
                 _check_custom_environment_does_not_stage_target(staged_custom_env, skill_path)
 
@@ -3571,7 +3577,7 @@ def _write_dockerfile(
                     )
                 return
         finally:
-            shutil.rmtree(staged_custom_env, ignore_errors=True)
+            private_custom_env.cleanup()
 
     if base_image:
         dockerfile_lines = [
@@ -3899,13 +3905,29 @@ def _prepare_native_environment(
     )
 
 
-def _native_task_dirs(dataset_dir: Path) -> list[Path]:
+def _native_task_dirs(
+    dataset_dir: Path,
+    *,
+    ignore: Callable[[str, list[str]], Iterable[str]] | None = None,
+) -> list[Path]:
     """Return native Harbor task directories from a copied dataset."""
+    children = sorted(dataset_dir.iterdir())
+    ignored = set(ignore(os.fspath(dataset_dir), [path.name for path in children])) if ignore is not None else set()
     return [
         p
-        for p in sorted(dataset_dir.iterdir())
-        if p.is_dir() and not p.name.startswith((".", "_")) and (p / "task.toml").exists()
+        for p in children
+        if p.name not in ignored and p.is_dir() and not p.name.startswith((".", "_")) and (p / "task.toml").exists()
     ]
+
+
+def _native_source_path_is_ignored(path: Path, native_dir: Path) -> bool:
+    """Apply the native copy ignore callback to every lexical path component."""
+    parent = native_dir
+    for part in path.relative_to(native_dir).parts:
+        if part in _NATIVE_SOURCE_IGNORE(os.fspath(parent), [part]):
+            return True
+        parent /= part
+    return False
 
 
 def _native_entry_id(task_dir: Path) -> str:
@@ -4163,10 +4185,8 @@ def _check_native_source_does_not_stage_target(
     *,
     with_skill: bool,
 ) -> None:
-    ignored_parts = frozenset({"results", "__pycache__", ".git"})
-
     def _is_ignored(path: Path) -> bool:
-        return bool(ignored_parts.intersection(path.relative_to(native_dir).parts))
+        return _native_source_path_is_ignored(path, native_dir)
 
     target_skill_name = target_skill.name
     for skill_md in _iter_skill_manifests(native_dir):
@@ -4191,7 +4211,7 @@ def _check_native_source_does_not_stage_target(
             payload = _find_target_manifest_payload(
                 environment_dir,
                 target_skill,
-                ignored_parts=ignored_parts,
+                ignored_path_predicate=_is_ignored,
             )
             if payload is not None:
                 raise ValueError(
@@ -4251,7 +4271,7 @@ def _stage_native_harbor_tasks_into(
     _validate_output_roots_outside_evaluator_sources(skill_path, repo_context_exclude_paths)
     _check_native_source_does_not_stage_target(native_dir, skill_path, with_skill=with_skill)
     entries_by_id = _load_entries_by_id(skill_path)
-    source_task_dirs = _native_task_dirs(native_dir)
+    source_task_dirs = _native_task_dirs(native_dir, ignore=_NATIVE_SOURCE_IGNORE)
     if not source_task_dirs:
         raise ValueError(f"No Harbor task directories with task.toml found in {native_dir}")
     validate_case_ids(path.name for path in source_task_dirs)
@@ -4265,7 +4285,7 @@ def _stage_native_harbor_tasks_into(
     copytree_secure(
         native_dir,
         output_dir,
-        ignore=shutil.ignore_patterns("results", "__pycache__", ".git", GENERATED_OUTPUT_MARKER),
+        ignore=_NATIVE_SOURCE_IGNORE,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     task_dirs = _native_task_dirs(output_dir)

@@ -101,7 +101,11 @@ nested, reference, or workspace skill into agent-visible copies. `--copy-repo`
 uses the same filtering and excludes generated result roots. Authenticated
 historical result roots remain excluded after the configured output location is
 changed; a present marker that is copied, stale, or cannot be authenticated
-fails staging closed instead of copying that tree. Runtime assets that
+fails staging closed instead of copying that tree. Custom result roots created
+outside `evals/` by a pre-marker version cannot be identified safely after the
+configured location changes. Move or delete that old content before
+`--copy-repo` or another full-context evaluation, then rerun with the current
+version if replacement evidence is needed. Runtime assets that
 the agent needs should live outside skill-owned `evals/`, or be declared as task
 inputs with `files`.
 

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+import skillevaluator.tier3.harbor.adapter as adapter_module
 from skillevaluator.tier3.harbor.adapter import (
     _collect_all_skill_deps,
     _dockerfile_resolved_build_context_sources,
@@ -1322,6 +1323,62 @@ def test_explicit_empty_input_keeps_authored_copy_input_buildable(
     assert copy_instruction in (task / "environment" / "Dockerfile").read_text(encoding="utf-8")
 
 
+def test_readonly_custom_environment_snapshot_stays_outside_docker_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX directory modes required")
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    (target / "evals" / "evals.json").write_text(
+        json.dumps([{"id": "case-001", "question": "No fixture.", "files": []}]),
+        encoding="utf-8",
+    )
+    custom_environment = target / "evals" / "environment"
+    snapshot_destinations: list[Path] = []
+    original_copytree = adapter_module.copytree_secure
+
+    def record_custom_snapshot(source: Path, destination: Path, *args: object, **kwargs: object) -> None:
+        if Path(source) == custom_environment:
+            snapshot_destinations.append(Path(destination))
+        original_copytree(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(adapter_module, "copytree_secure", record_custom_snapshot)
+    authored_input = custom_environment / "input"
+    authored_input.mkdir()
+    (authored_input / "hidden.txt").write_text("UNDECLARED-CUSTOM-INPUT\n", encoding="utf-8")
+    (custom_environment / "Dockerfile").write_text(
+        "FROM python:3.12-slim\nCOPY . /context\n",
+        encoding="utf-8",
+    )
+    sidecar = custom_environment / "sidecar"
+    sidecar.chmod(0o555)
+    custom_environment.chmod(0o555)
+    try:
+        task = generate_harbor_tasks(
+            target,
+            tmp_path / "readonly-custom-environment",
+            custom_dockerfile_mode="preserve",
+            grading_mode="custom_only",
+        )[0]
+    finally:
+        custom_environment.chmod(0o755)
+        sidecar.chmod(0o755)
+
+    environment = task / "environment"
+    assert len(snapshot_destinations) == 1
+    assert not snapshot_destinations[0].absolute().is_relative_to(environment.absolute())
+    assert not any(path.name == ".skillevaluator-custom-environment" for path in environment.rglob("*"))
+    assert "COPY . /context" in (environment / "Dockerfile").read_text(encoding="utf-8")
+    assert (environment / "input").is_dir()
+    assert list((environment / "input").iterdir()) == []
+    assert not (environment / "input" / "hidden.txt").exists()
+    readable_environment = "\n".join(
+        path.read_text(encoding="utf-8", errors="ignore") for path in environment.rglob("*") if path.is_file()
+    )
+    assert "UNDECLARED-CUSTOM-INPUT" not in readable_environment
+
+
 def test_native_copy_input_without_fixtures_gets_empty_build_context_directory(tmp_path: Path) -> None:
     _, target, _, _ = _write_projection_fixture(tmp_path)
     (target / "evals" / "evals.json").write_text(
@@ -1668,6 +1725,49 @@ def test_native_baseline_ignores_target_payload_in_unstaged_results(tmp_path: Pa
     )[0]
 
     assert not (task / "environment" / "results").exists()
+
+
+def test_native_task_discovery_ignores_unstaged_root_results(tmp_path: Path) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    _write_minimal_native_task(target)
+    archived_task = target / "evals" / "harbor" / "results"
+    archived_task.mkdir()
+    (archived_task / "task.toml").write_text(
+        'schema_version = "1.3"\n\n[task]\nname = "nvidia/archived"\n\n'
+        '[metadata]\nentry_id = "archived"\n\n[environment]\nworkdir = "relative"\n',
+        encoding="utf-8",
+    )
+
+    tasks = stage_native_harbor_tasks(target, tmp_path / "native-ignored-root-results")
+
+    assert [task.name for task in tasks] == ["case-001"]
+    assert not (tmp_path / "native-ignored-root-results" / "results").exists()
+
+
+def test_native_contamination_scan_uses_shared_ignore_callback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    _write_minimal_native_task(target)
+    ignored = target / "evals" / "harbor" / "case-001" / "environment" / "RESULTS"
+    ignored.mkdir(parents=True)
+    (ignored / "archived.txt").write_bytes((target / "SKILL.md").read_bytes())
+
+    ignored_casefolded = frozenset(name.casefold() for name in adapter_module._NATIVE_SOURCE_IGNORE_NAMES)
+
+    def _casefolding_ignore(_directory: str, names: list[str]) -> set[str]:
+        return {name for name in names if name.casefold() in ignored_casefolded}
+
+    monkeypatch.setattr(adapter_module, "_NATIVE_SOURCE_IGNORE", _casefolding_ignore)
+
+    task = stage_native_harbor_tasks(
+        target,
+        tmp_path / "native-shared-ignore-callback",
+        with_skill=False,
+    )[0]
+
+    assert not (task / "environment" / "RESULTS").exists()
 
 
 @pytest.mark.parametrize(

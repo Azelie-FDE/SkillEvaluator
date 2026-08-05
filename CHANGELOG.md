@@ -84,7 +84,11 @@ All notable changes to SkillEvaluator are documented in this file.
   environments, and declared inputs continue to load from the source dataset.
   Authenticated historical result trees are also excluded after output rotation,
   invalid markers fail closed, and late Codex, Cline, Goose, and Qwen
-  skill-discovery roots are reset before agent execution.
+  skill-discovery roots are reset before agent execution. Pre-upgrade custom
+  result roots outside `evals/` have no authenticity marker and cannot be
+  distinguished safely from authored runtime content. Move or delete that old
+  content before `--copy-repo` or other full-context evaluation, then rerun with
+  this version if replacement evidence is needed.
 - Public benchmark cards now omit policy profiles, redact absolute host paths,
   and normalize imported internal or retired metadata before publication.
 - Previous-version validation now rejects catalog-wide scalar reuse and removal
