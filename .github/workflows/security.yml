@@ -15,6 +15,23 @@ permissions:
 # Private/internal repositories can opt in after GitHub Advanced Security is
 # enabled by setting ENABLE_GITHUB_ADVANCED_SECURITY=true.
 jobs:
+  classify-changes:
+    name: Classify changes
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.changes.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Classify pull-request paths
+        id: changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python scripts/classify_ci_changes.py --base "$BASE_SHA" --head "$HEAD_SHA"
+
   gitleaks:
     name: Gitleaks
     runs-on: ubuntu-latest
@@ -35,8 +52,11 @@ jobs:
 
   dependency-review:
     name: Dependency review
+    needs: classify-changes
     if: >-
-      ${{ github.event_name == 'pull_request' &&
+      ${{ always() &&
+          needs.classify-changes.outputs.docs_only != 'true' &&
+          github.event_name == 'pull_request' &&
           (github.event.repository.private == false || vars.ENABLE_GITHUB_ADVANCED_SECURITY == 'true') }}
     runs-on: ubuntu-latest
     steps:
@@ -45,7 +65,11 @@ jobs:
 
   codeql:
     name: CodeQL
-    if: ${{ github.event.repository.private == false || vars.ENABLE_GITHUB_ADVANCED_SECURITY == 'true' }}
+    needs: classify-changes
+    if: >-
+      ${{ always() &&
+          needs.classify-changes.outputs.docs_only != 'true' &&
+          (github.event.repository.private == false || vars.ENABLE_GITHUB_ADVANCED_SECURITY == 'true') }}
     runs-on: ubuntu-latest
     permissions:
       actions: read
