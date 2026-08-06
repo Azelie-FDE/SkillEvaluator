@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from scripts.classify_ci_changes import is_docs_only, main, parse_name_status_z
+from scripts.classify_ci_changes import changed_paths, is_docs_only, main, parse_name_status_z
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -33,8 +33,8 @@ def git_repo(tmp_path: Path) -> tuple[Path, str]:
     _git(tmp_path, "config", "user.email", "ci-test@example.com")
     _git(tmp_path, "config", "user.name", "CI Test")
     (tmp_path / "docs").mkdir()
-    (tmp_path / "docs" / "index.mdx").write_text("initial\n", encoding="utf-8")
-    (tmp_path / "README.md").write_text("initial\n", encoding="utf-8")
+    (tmp_path / "docs" / "index.mdx").write_text("docs source\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("root source\n", encoding="utf-8")
     return tmp_path, _commit(tmp_path, "initial")
 
 
@@ -197,6 +197,20 @@ def test_main_checks_the_source_of_a_rename_into_docs(
 
     assert _classify(repo, base, head, tmp_path / "github-output", monkeypatch) == 0
     assert (tmp_path / "github-output").read_text(encoding="utf-8") == "docs_only=false\n"
+
+
+def test_changed_paths_detects_an_unmodified_copy_source_outside_docs(
+    git_repo: tuple[Path, str],
+) -> None:
+    repo, base = git_repo
+    (repo / "docs" / "copied-readme.mdx").write_bytes((repo / "README.md").read_bytes())
+    head = _commit(repo, "copy root file into docs")
+
+    paths = changed_paths(repo, base, head)
+
+    assert b"README.md" in paths
+    assert b"docs/copied-readme.mdx" in paths
+    assert is_docs_only(paths) is False
 
 
 def test_main_uses_the_merge_base_when_the_base_branch_advances(

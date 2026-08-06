@@ -30,7 +30,16 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python3 scripts/classify_ci_changes.py --base "$BASE_SHA" --head "$HEAD_SHA"
+        shell: bash
+        run: |
+          set -euo pipefail
+          classifier="$RUNNER_TEMP/classify_ci_changes.py"
+          if ! git show "$BASE_SHA:scripts/classify_ci_changes.py" > "$classifier"; then
+            echo "::notice::Trusted classifier is not present on the base branch; running full CI."
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 "$classifier" --base "$BASE_SHA" --head "$HEAD_SHA"
 
   test-python-312:
     name: Tests (Python 3.12)

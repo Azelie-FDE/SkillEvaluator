@@ -75,8 +75,11 @@ def test_ci_classifier_is_pull_request_only_and_exports_docs_only() -> None:
     assert classifier["steps"][0]["with"]["fetch-depth"] == "0"
     assert classifier["steps"][0]["with"]["persist-credentials"] == "false"
     assert classifier["steps"][1]["id"] == "changes"
-    assert "scripts/classify_ci_changes.py" in classifier["steps"][1]["run"]
-    assert classifier["steps"][1]["run"].startswith("python3 ")
+    classifier_run = classifier["steps"][1]["run"]
+    assert 'git show "$BASE_SHA:scripts/classify_ci_changes.py"' in classifier_run
+    assert 'python3 "$classifier"' in classifier_run
+    assert 'echo "docs_only=false" >> "$GITHUB_OUTPUT"' in classifier_run
+    assert "python3 scripts/classify_ci_changes.py" not in classifier_run
     assert classifier["steps"][1]["env"] == {
         "BASE_SHA": "${{ github.event.pull_request.base.sha }}",
         "HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
@@ -151,7 +154,11 @@ def test_security_keeps_gitleaks_always_on_and_skips_only_nonessential_jobs() ->
     assert jobs["classify-changes"]["if"] == "${{ github.event_name == 'pull_request' }}"
     assert jobs["classify-changes"]["outputs"]["docs_only"] == "${{ steps.changes.outputs.docs_only }}"
     assert jobs["classify-changes"]["steps"][0]["with"]["persist-credentials"] == "false"
-    assert jobs["classify-changes"]["steps"][1]["run"].startswith("python3 ")
+    classifier_run = jobs["classify-changes"]["steps"][1]["run"]
+    assert 'git show "$BASE_SHA:scripts/classify_ci_changes.py"' in classifier_run
+    assert 'python3 "$classifier"' in classifier_run
+    assert 'echo "docs_only=false" >> "$GITHUB_OUTPUT"' in classifier_run
+    assert "python3 scripts/classify_ci_changes.py" not in classifier_run
 
     dependency_if = " ".join(jobs["dependency-review"]["if"].split())
     codeql_if = " ".join(jobs["codeql"]["if"].split())
@@ -173,6 +180,16 @@ def test_dco_stays_unconditional_and_has_no_path_filter() -> None:
     _assert_no_path_filter(dco)
     assert "if" not in dco["jobs"]["dco"]
     assert "needs" not in dco["jobs"]["dco"]
+
+
+def test_non_pr_workflow_triggers_are_preserved() -> None:
+    ci = _load("ci.yml")
+    security = _load("security.yml")
+
+    assert ci["on"]["push"] == {"branches": ["main"]}
+    assert security["on"]["push"] == {"branches": ["main"]}
+    assert security["on"]["schedule"] == [{"cron": "23 7 * * 1"}]
+    assert "workflow_dispatch" in security["on"]
 
 
 def test_changed_workflows_pin_every_action_to_a_commit() -> None:

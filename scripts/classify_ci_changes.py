@@ -79,7 +79,7 @@ def changed_paths(repo: Path, base: str, head: str) -> list[bytes]:
             "--name-status",
             "-z",
             "--find-renames",
-            "--find-copies",
+            "--find-copies-harder",
             f"{base}...{head}",
             "--",
         ],
