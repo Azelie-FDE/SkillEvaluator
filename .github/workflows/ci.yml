@@ -25,7 +25,7 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: python scripts/classify_ci_changes.py --base "$BASE_SHA" --head "$HEAD_SHA"
+        run: python3 scripts/classify_ci_changes.py --base "$BASE_SHA" --head "$HEAD_SHA"
 
   test-python-312:
     name: Tests (Python 3.12)

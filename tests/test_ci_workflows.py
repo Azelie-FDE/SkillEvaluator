@@ -59,6 +59,7 @@ def test_ci_classifier_is_pull_request_only_and_exports_docs_only() -> None:
     assert classifier["steps"][0]["with"]["fetch-depth"] == "0"
     assert classifier["steps"][1]["id"] == "changes"
     assert "scripts/classify_ci_changes.py" in classifier["steps"][1]["run"]
+    assert classifier["steps"][1]["run"].startswith("python3 ")
     assert classifier["steps"][1]["env"] == {
         "BASE_SHA": "${{ github.event.pull_request.base.sha }}",
         "HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
@@ -131,6 +132,7 @@ def test_security_keeps_gitleaks_always_on_and_skips_only_nonessential_jobs() ->
     assert "needs" not in jobs["gitleaks"]
     assert jobs["classify-changes"]["if"] == "${{ github.event_name == 'pull_request' }}"
     assert jobs["classify-changes"]["outputs"]["docs_only"] == "${{ steps.changes.outputs.docs_only }}"
+    assert jobs["classify-changes"]["steps"][1]["run"].startswith("python3 ")
 
     dependency_if = " ".join(jobs["dependency-review"]["if"].split())
     codeql_if = " ".join(jobs["codeql"]["if"].split())
