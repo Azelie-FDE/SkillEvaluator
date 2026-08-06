@@ -1,0 +1,198 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import pytest
+from scripts.classify_ci_changes import is_docs_only, main, parse_name_status_z
+
+
+def _git(repo: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def _commit(repo: Path, message: str) -> str:
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "--quiet", "-m", message)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+@pytest.fixture
+def git_repo(tmp_path: Path) -> tuple[Path, str]:
+    _git(tmp_path, "init", "--quiet")
+    _git(tmp_path, "config", "user.email", "ci-test@example.com")
+    _git(tmp_path, "config", "user.name", "CI Test")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "index.mdx").write_text("initial\n", encoding="utf-8")
+    (tmp_path / "README.md").write_text("initial\n", encoding="utf-8")
+    return tmp_path, _commit(tmp_path, "initial")
+
+
+@pytest.mark.parametrize(
+    ("paths", "expected"),
+    [
+        ([b"docs/index.mdx"], True),
+        ([b"fern/docs.yml", b"docs/assets/logo.svg"], True),
+        ([b"README.md"], False),
+        ([b"src/skillevaluator/tier3/reference_skills/demo/SKILL.md"], False),
+        ([b"tests/golden/benchmark_tier1.md"], False),
+        ([b"docs/index.mdx", b"src/skillevaluator/cli.py"], False),
+        ([], False),
+    ],
+)
+def test_is_docs_only(paths: list[bytes], expected: bool) -> None:
+    assert is_docs_only(paths) is expected
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (b"M\0docs/index.mdx\0", [b"docs/index.mdx"]),
+        (b"D\0docs/old.mdx\0", [b"docs/old.mdx"]),
+        (
+            b"R100\0docs/old.mdx\0src/new.py\0",
+            [b"docs/old.mdx", b"src/new.py"],
+        ),
+        (
+            b"C075\0docs/source.mdx\0fern/copied.yml\0",
+            [b"docs/source.mdx", b"fern/copied.yml"],
+        ),
+        (b"", []),
+    ],
+)
+def test_parse_name_status_z_returns_every_changed_path(payload: bytes, expected: list[bytes]) -> None:
+    assert parse_name_status_z(payload) == expected
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"R100\0docs/old.mdx\0",
+        b"M\0",
+        b"Z\0docs/index.mdx\0",
+        b"\0docs/index.mdx\0",
+        b"M\0docs/index.mdx",
+    ],
+)
+def test_parse_name_status_z_rejects_malformed_records(payload: bytes) -> None:
+    with pytest.raises(ValueError, match="Git status record"):
+        parse_name_status_z(payload)
+
+
+def _classify(
+    repo: Path,
+    base: str,
+    head: str,
+    output: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> int:
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    return main(["--repo", str(repo), "--base", base, "--head", head])
+
+
+def test_main_classifies_a_real_docs_only_diff(
+    git_repo: tuple[Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo, base = git_repo
+    (repo / "docs" / "index.mdx").write_text("updated\n", encoding="utf-8")
+    head = _commit(repo, "docs")
+    output = tmp_path / "github-output"
+
+    assert _classify(repo, base, head, output, monkeypatch) == 0
+
+    assert capsys.readouterr().out == "docs_only=true\n"
+    assert output.read_text(encoding="utf-8") == "docs_only=true\n"
+
+
+def test_main_classifies_a_real_mixed_diff_as_full_ci(
+    git_repo: tuple[Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo, base = git_repo
+    (repo / "docs" / "index.mdx").write_text("updated\n", encoding="utf-8")
+    (repo / "source.py").write_text("print('changed')\n", encoding="utf-8")
+    head = _commit(repo, "mixed")
+    output = tmp_path / "github-output"
+
+    assert _classify(repo, base, head, output, monkeypatch) == 0
+
+    assert capsys.readouterr().out == "docs_only=false\n"
+    assert output.read_text(encoding="utf-8") == "docs_only=false\n"
+
+
+def test_main_treats_a_deleted_docs_file_as_docs_only(
+    git_repo: tuple[Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, base = git_repo
+    (repo / "docs" / "index.mdx").unlink()
+    head = _commit(repo, "delete docs")
+
+    assert _classify(repo, base, head, tmp_path / "github-output", monkeypatch) == 0
+    assert (tmp_path / "github-output").read_text(encoding="utf-8") == "docs_only=true\n"
+
+
+def test_main_checks_both_sides_of_a_rename(
+    git_repo: tuple[Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, base = git_repo
+    (repo / "src").mkdir()
+    _git(repo, "mv", "docs/index.mdx", "src/index.py")
+    head = _commit(repo, "rename out of docs")
+
+    assert _classify(repo, base, head, tmp_path / "github-output", monkeypatch) == 0
+    assert (tmp_path / "github-output").read_text(encoding="utf-8") == "docs_only=false\n"
+
+
+@pytest.mark.parametrize("revision", ["0" * 40, "not-a-sha"])
+def test_main_fails_closed_for_invalid_revisions(
+    git_repo: tuple[Path, str],
+    revision: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo, head = git_repo
+    output = tmp_path / "github-output"
+
+    assert _classify(repo, revision, head, output, monkeypatch) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "docs_only=false\n"
+    assert "falling back to full CI" in captured.err
+    assert output.read_text(encoding="utf-8") == "docs_only=false\n"
+
+
+def test_main_fails_closed_for_an_empty_diff(
+    git_repo: tuple[Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo, head = git_repo
+    output = tmp_path / "github-output"
+    output.write_text("existing=value\n", encoding="utf-8")
+
+    assert _classify(repo, head, head, output, monkeypatch) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "docs_only=false\n"
+    assert "no changed paths" in captured.err
+    assert output.read_text(encoding="utf-8") == "existing=value\ndocs_only=false\n"
