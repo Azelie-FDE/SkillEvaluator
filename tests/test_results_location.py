@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from skillevaluator.tier3 import results_location
+from skillevaluator.tier3.output_provenance import mark_generated_output_root
 from skillevaluator.tier3.results_location import external_results_root, resolve_latest_results
 
 
@@ -22,6 +24,93 @@ def _write_completed_run(root: Path, run_id: str) -> Path:
     (run_dir / "run_config.json").write_text("{}", encoding="utf-8")
     (run_dir / "result.json").write_text(
         json.dumps({"run_id": run_id, "agents": {}}),
+        encoding="utf-8",
+    )
+    return run_dir
+
+
+def _write_authenticated_current_run(
+    root: Path,
+    run_id: str,
+    *,
+    skill_name: str = "demo",
+    recorded_run_dir: str | None = None,
+    recorded_result_path: str | None = None,
+) -> Path:
+    run_dir = root / run_id
+    run_dir.mkdir(parents=True)
+    mark_generated_output_root(run_dir)
+    run_config = {
+        "config_file": "none",
+        "harbor": {
+            "environment": {"value": "local", "source": "test"},
+            "n_attempts": 1,
+            "stop_on_pass": False,
+            "n_concurrent": 1,
+            "timeout_multiplier": 1.0,
+            "base_image_mode": "disabled",
+            "jobs_retained": False,
+        },
+        "provider": {"name": "nvidia", "model": "test-model"},
+        "task_source": "evals_json",
+        "grading": {"mode": "default"},
+        "agents": {
+            "opencode": {
+                "agent": "opencode",
+                "model": "test-model",
+                "source": "test default",
+            }
+        },
+    }
+    agent_dir = run_dir / "opencode"
+    agent_result = {
+        "model": "test-model",
+        "model_source": "test default",
+        "model_resolution": {"model": "test-model", "source": "test default"},
+        "with_skill": {"security": 0.8},
+        "without_skill": {},
+        "custom_with_skill": {},
+        "custom_without_skill": {},
+        "dimensions_with_skill": {},
+        "dimensions_without_skill": {},
+        "lift": {},
+        "custom_lift": {},
+        "pass_at_k": {"with_skill": {}, "without_skill": {}, "lift": {}},
+        "security_attribution": {},
+        "agent_runtime_failures": {"with_skill": [], "without_skill": []},
+        "trial_failures": {"with_skill": [], "without_skill": []},
+        "job_failures": {"with_skill": "", "without_skill": ""},
+        "conditions": {"with_skill": {}, "without_skill": {}},
+        "execution_status": "succeeded",
+        "execution_errors": [],
+        "expected_attempts": 1,
+        "scored_attempts": 1,
+        "num_trials_with": 1,
+        "num_trials_without": 0,
+        "output_dir": str(agent_dir.resolve()),
+    }
+    (run_dir / "run_config.json").write_text(json.dumps(run_config), encoding="utf-8")
+    (run_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "skill_name": skill_name,
+                "run_id": run_id,
+                "run_dir": recorded_run_dir or str(run_dir),
+                "result_path": recorded_result_path or str((run_dir / "result.json").resolve()),
+                "run_config": run_config,
+                "agents": {"opencode": agent_result},
+                "attempt_policy": {
+                    "max_attempts": 1,
+                    "pass_threshold": 0.5,
+                    "stop_on_pass": False,
+                    "score_definition": "test",
+                },
+                "execution_status": "succeeded",
+                "execution_errors": [],
+                "report_status": "complete",
+                "duration_seconds": 1.0,
+            }
+        ),
         encoding="utf-8",
     )
     return run_dir
@@ -46,12 +135,157 @@ def test_latest_results_fallback_accepts_unique_suffixed_run_ids(tmp_path: Path)
     skill_path.mkdir()
     cli_results_dir = tmp_path / "results"
     root = external_results_root(cli_results_dir, skill_path)
-    _write_completed_run(root, "20260705_120000_111_aaaaaaaaaaaa")
-    newest = _write_completed_run(root, "20260705_130000_222_bbbbbbbbbbbb")
+    _write_authenticated_current_run(root, "20260705_120000_111_aaaaaaaaaaaa")
+    newest = _write_authenticated_current_run(root, "20260705_130000_222_bbbbbbbbbbbb")
 
     resolved = resolve_latest_results(skill_path, cli_results_dir, environ={})
 
     assert resolved == newest
+
+
+def test_latest_results_rejects_unmarked_suffixed_run_that_would_shadow_historical_run(tmp_path: Path) -> None:
+    skill_path = tmp_path / "demo"
+    skill_path.mkdir()
+    cli_results_dir = tmp_path / "results"
+    root = external_results_root(cli_results_dir, skill_path)
+    historical = _write_completed_run(root, "20260705_120000")
+    _write_completed_run(root, "20260705_130000_222_bbbbbbbbbbbb")
+
+    resolved = resolve_latest_results(skill_path, cli_results_dir, environ={})
+
+    assert resolved == historical
+
+
+def test_latest_results_rejects_current_run_copied_across_results_roots(tmp_path: Path) -> None:
+    skill_path = tmp_path / "demo"
+    skill_path.mkdir()
+    cli_results_dir = tmp_path / "primary"
+    primary_root = external_results_root(cli_results_dir, skill_path)
+    historical = _write_completed_run(skill_path / "evals" / "results", "20260705_120000")
+    authentic = _write_authenticated_current_run(
+        tmp_path / "source" / skill_path.name,
+        "20260705_130000_222_bbbbbbbbbbbb",
+    )
+    copied = shutil.copytree(authentic, primary_root / authentic.name)
+    copied_result_path = copied / "result.json"
+    copied_result = json.loads(copied_result_path.read_text(encoding="utf-8"))
+    copied_result["run_dir"] = str(copied)
+    copied_result_path.write_text(json.dumps(copied_result), encoding="utf-8")
+
+    resolved = resolve_latest_results(skill_path, cli_results_dir, environ={})
+
+    assert resolved == historical
+
+
+@pytest.mark.parametrize(
+    "mutate_result",
+    [
+        lambda result: result["run_config"].update({"task_source": "native_harbor"}),
+        lambda result: result.update({"run_dir": "/tmp/different-run"}),
+    ],
+    ids=("run-config", "run-directory"),
+)
+def test_latest_results_rejects_authenticated_current_run_with_inconsistent_identity(
+    tmp_path: Path,
+    mutate_result,
+) -> None:
+    skill_path = tmp_path / "demo"
+    skill_path.mkdir()
+    cli_results_dir = tmp_path / "results"
+    root = external_results_root(cli_results_dir, skill_path)
+    historical = _write_completed_run(root, "20260705_120000")
+    current = _write_authenticated_current_run(root, "20260705_130000_222_bbbbbbbbbbbb")
+    result_path = current / "result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    mutate_result(result)
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+
+    resolved = resolve_latest_results(skill_path, cli_results_dir, environ={})
+
+    assert resolved == historical
+
+
+@pytest.mark.parametrize(
+    "mutate_config",
+    [
+        lambda config: config.clear(),
+        lambda config: config.update({"agents": {}}),
+        lambda config: config["agents"]["opencode"].update({"model": ""}),
+        lambda config: config["harbor"].pop("n_attempts"),
+    ],
+    ids=("empty", "empty-agents", "empty-agent-model", "missing-harbor-field"),
+)
+def test_latest_results_rejects_authenticated_current_run_with_malformed_config_schema(
+    tmp_path: Path,
+    mutate_config,
+) -> None:
+    skill_path = tmp_path / "demo"
+    skill_path.mkdir()
+    cli_results_dir = tmp_path / "results"
+    root = external_results_root(cli_results_dir, skill_path)
+    historical = _write_completed_run(root, "20260705_120000")
+    current = _write_authenticated_current_run(root, "20260705_130000_222_bbbbbbbbbbbb")
+    config_path = current / "run_config.json"
+    result_path = current / "result.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    mutate_config(config)
+    result["run_config"] = config
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+
+    assert resolve_latest_results(skill_path, cli_results_dir, environ={}) == historical
+
+
+@pytest.mark.parametrize(
+    "mutate_result",
+    [
+        lambda result: result.update({"agents": {}}),
+        lambda result: result["agents"].update({"unexpected": result["agents"]["opencode"]}),
+        lambda result: result["agents"].update({"opencode": []}),
+        lambda result: result["agents"]["opencode"].update({"with_skill": []}),
+        lambda result: result["agents"]["opencode"]["model_resolution"].update({"model": "other-model"}),
+        lambda result: result.pop("execution_status"),
+    ],
+    ids=("empty", "extra-agent", "non-object-agent", "non-object-scores", "model-mismatch", "missing-status"),
+)
+def test_latest_results_rejects_authenticated_current_run_with_malformed_result_schema(
+    tmp_path: Path,
+    mutate_result,
+) -> None:
+    skill_path = tmp_path / "demo"
+    skill_path.mkdir()
+    cli_results_dir = tmp_path / "results"
+    root = external_results_root(cli_results_dir, skill_path)
+    historical = _write_completed_run(root, "20260705_120000")
+    current = _write_authenticated_current_run(root, "20260705_130000_222_bbbbbbbbbbbb")
+    result_path = current / "result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    mutate_result(result)
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+
+    assert resolve_latest_results(skill_path, cli_results_dir, environ={}) == historical
+
+
+def test_latest_results_accepts_authenticated_current_run_with_relative_recorded_path_after_cwd_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    creation_cwd = tmp_path / "created-from"
+    creation_cwd.mkdir()
+    root = creation_cwd / "relative-results" / "demo"
+    run_id = "20260705_130000_222_bbbbbbbbbbbb"
+    current = _write_authenticated_current_run(
+        root,
+        run_id,
+        recorded_run_dir=str(Path("relative-results") / "demo" / run_id),
+        recorded_result_path=str(Path("relative-results") / "demo" / run_id / "result.json"),
+    )
+    different_cwd = tmp_path / "different-cwd"
+    different_cwd.mkdir()
+    monkeypatch.chdir(different_cwd)
+
+    assert results_location.run_directory_sort_key(current, require_completed_result=True) is not None
 
 
 def test_latest_results_same_timestamp_uses_completion_mtime(tmp_path: Path) -> None:
@@ -59,8 +293,8 @@ def test_latest_results_same_timestamp_uses_completion_mtime(tmp_path: Path) -> 
     skill_path.mkdir()
     cli_results_dir = tmp_path / "results"
     root = external_results_root(cli_results_dir, skill_path)
-    lexically_later = _write_completed_run(root, "20260705_130000_999_ffffffffffff")
-    completed_later = _write_completed_run(root, "20260705_130000_111_aaaaaaaaaaaa")
+    lexically_later = _write_authenticated_current_run(root, "20260705_130000_999_ffffffffffff")
+    completed_later = _write_authenticated_current_run(root, "20260705_130000_111_aaaaaaaaaaaa")
     os.utime(lexically_later / "result.json", ns=(100, 100))
     os.utime(completed_later / "result.json", ns=(200, 200))
 
@@ -74,8 +308,8 @@ def test_latest_results_same_completion_time_uses_deterministic_name_order(tmp_p
     skill_path.mkdir()
     cli_results_dir = tmp_path / "results"
     root = external_results_root(cli_results_dir, skill_path)
-    lexically_first = _write_completed_run(root, "20260705_130000_111_aaaaaaaaaaaa")
-    lexically_last = _write_completed_run(root, "20260705_130000_999_ffffffffffff")
+    lexically_first = _write_authenticated_current_run(root, "20260705_130000_111_aaaaaaaaaaaa")
+    lexically_last = _write_authenticated_current_run(root, "20260705_130000_999_ffffffffffff")
     os.utime(lexically_first / "result.json", ns=(100, 100))
     os.utime(lexically_last / "result.json", ns=(100, 100))
 

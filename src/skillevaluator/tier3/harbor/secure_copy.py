@@ -39,6 +39,7 @@ _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
 _WINDOWS_CHMOD_SEMANTICS = os.name == "nt"
+_PATH_DESCRIPTOR_IDENTITIES_COMPARABLE = os.name == "posix"
 _DESCRIPTOR_BACKEND = (
     os.name == "posix"
     and hasattr(os, "O_NOFOLLOW")
@@ -209,6 +210,25 @@ def _node_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
         metadata.st_nlink,
         metadata.st_size,
     )
+
+
+def _fallback_opened_matches_named(opened: os.stat_result, named: os.stat_result) -> bool:
+    """Compare fallback file metadata without assuming Windows stat identities."""
+    if _PATH_DESCRIPTOR_IDENTITIES_COMPARABLE:
+        return _fingerprint(opened) == _fingerprint(named)
+    return (
+        stat.S_IFMT(opened.st_mode) == stat.S_IFMT(named.st_mode)
+        and opened.st_nlink == named.st_nlink
+        and opened.st_size == named.st_size
+    )
+
+
+def _portable_fingerprint_mode(mode: int) -> int:
+    """Normalize mode bits to the semantics the active copier preserves."""
+    normalized = stat.S_IMODE(mode) & 0o777
+    if _WINDOWS_CHMOD_SEMANTICS:
+        return int(bool(normalized & stat.S_IWRITE))
+    return normalized
 
 
 def _entry_from_stat(
@@ -501,8 +521,13 @@ def _open_fallback_regular(
         raise UnsafeStagingError(f"cannot safely open {role} file {path}: {exc}") from exc
     try:
         opened = os.fstat(descriptor)
-        _validate_type(opened, path=path, role=role, root_device=root_device)
-        if _fingerprint(opened) != _fingerprint(before):
+        _validate_type(
+            opened,
+            path=path,
+            role=role,
+            root_device=root_device if _PATH_DESCRIPTOR_IDENTITIES_COMPARABLE else None,
+        )
+        if not _fallback_opened_matches_named(opened, before):
             raise _changed(path, "file was replaced")
         return descriptor
     except BaseException:
@@ -513,6 +538,7 @@ def _open_fallback_regular(
 def _hash_path_checked(path: Path, before: os.stat_result, *, role: str, root_device: int) -> str:
     descriptor = _open_fallback_regular(path, before, role=role, root_device=root_device)
     try:
+        opened = os.fstat(descriptor)
         digest = _hash_descriptor(descriptor)
         after = os.fstat(descriptor)
     finally:
@@ -521,7 +547,11 @@ def _hash_path_checked(path: Path, before: os.stat_result, *, role: str, root_de
         named = path.lstat()
     except OSError as exc:
         raise _changed(path, "file disappeared after reading") from exc
-    if _fingerprint(after) != _fingerprint(before) or _fingerprint(named) != _fingerprint(before):
+    if (
+        _fingerprint(after) != _fingerprint(opened)
+        or _fingerprint(named) != _fingerprint(before)
+        or not _fallback_opened_matches_named(after, named)
+    ):
         raise _changed(path, "file changed while it was validated")
     return digest
 
@@ -606,6 +636,32 @@ def _build_tree_manifest(
     if _DESCRIPTOR_BACKEND:
         return _build_tree_manifest_posix(source_path, root_path, role=role, ignore=ignore)
     return _build_tree_manifest_fallback(source_path, root_path, role=role, ignore=ignore)
+
+
+def tree_content_fingerprint_secure(
+    source: Path | str,
+    *,
+    allowed_root: Path | str | None = None,
+    ignore: IgnoreCallback | None = None,
+) -> str:
+    """Return a deterministic content fingerprint for one securely validated tree.
+
+    Filesystem identity and timestamps intentionally do not participate: a
+    securely copied tree has different inodes and may have different directory
+    metadata.  Relative paths, node kinds, and regular-file bytes do, so the
+    result can bind source selection to the exact tree later staged elsewhere.
+    """
+    manifest = _build_tree_manifest(source, allowed_root=allowed_root, ignore=ignore)
+    digest = hashlib.sha256()
+    for entry in sorted((manifest.root, *manifest.entries), key=lambda item: item.parts):
+        path = os.fsencode("/".join(entry.parts))
+        kind = entry.kind.encode("ascii")
+        mode = _portable_fingerprint_mode(entry.mode).to_bytes(2, "big")
+        content = (entry.digest or "").encode("ascii")
+        for field in (path, kind, mode, content):
+            digest.update(len(field).to_bytes(8, "big"))
+            digest.update(field)
+    return digest.hexdigest()
 
 
 def _verify_entry(entry: _ManifestEntry, metadata: os.stat_result, path: Path) -> None:
@@ -1568,7 +1624,7 @@ def _apply_fallback_open_file_mode(path: Path, descriptor: int, mode: int) -> No
         or not stat.S_ISREG(named_before.st_mode)
         or opened_before.st_nlink != 1
         or named_before.st_nlink != 1
-        or _node_identity(named_before) != _node_identity(opened_before)
+        or not _fallback_opened_matches_named(opened_before, named_before)
     ):
         raise UnsafeStagingError("fallback staging file changed before its mode was applied")
     fchmod = getattr(os, "fchmod", None)
@@ -1581,7 +1637,8 @@ def _apply_fallback_open_file_mode(path: Path, descriptor: int, mode: int) -> No
     if (
         _is_link(named_after)
         or _node_identity(opened_after) != _node_identity(opened_before)
-        or _node_identity(named_after) != _node_identity(opened_after)
+        or _node_identity(named_after) != _node_identity(named_before)
+        or not _fallback_opened_matches_named(opened_after, named_after)
         or not _fallback_mode_matches(opened_after.st_mode, mode)
         or not _fallback_mode_matches(named_after.st_mode, mode)
     ):
@@ -1606,6 +1663,7 @@ def _copy_manifest_file_fallback(manifest: _TreeManifest, entry: _ManifestEntry,
     )
     destination_descriptor = -1
     try:
+        source_opened = os.fstat(source_descriptor)
         destination_descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         _apply_fallback_open_file_mode(destination, destination_descriptor, 0o600)
         digest = hashlib.sha256()
@@ -1615,8 +1673,13 @@ def _copy_manifest_file_fallback(manifest: _TreeManifest, entry: _ManifestEntry,
             while view:
                 written = os.write(destination_descriptor, view)
                 view = view[written:]
-        _verify_entry(entry, os.fstat(source_descriptor), source)
-        _verify_entry(entry, source.lstat(), source)
+        source_after = os.fstat(source_descriptor)
+        named_after = source.lstat()
+        if _fingerprint(source_after) != _fingerprint(source_opened) or not _fallback_opened_matches_named(
+            source_after, named_after
+        ):
+            raise _changed(source, "file changed while it was copied")
+        _verify_entry(entry, named_after, source)
         if digest.hexdigest() != entry.digest:
             raise _changed(source, "file contents changed")
     finally:
@@ -2137,6 +2200,7 @@ def _stage_fallback_file(manifest: _FileManifest, stage: Path) -> None:
     )
     destination_descriptor = -1
     try:
+        source_opened = os.fstat(source_descriptor)
         destination_descriptor = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         _apply_fallback_open_file_mode(stage, destination_descriptor, 0o600)
         digest = hashlib.sha256()
@@ -2146,8 +2210,13 @@ def _stage_fallback_file(manifest: _FileManifest, stage: Path) -> None:
             while view:
                 written = os.write(destination_descriptor, view)
                 view = view[written:]
-        _verify_entry(manifest.entry, os.fstat(source_descriptor), manifest.source)
-        _verify_entry(manifest.entry, manifest.source.lstat(), manifest.source)
+        source_after = os.fstat(source_descriptor)
+        named_after = manifest.source.lstat()
+        if _fingerprint(source_after) != _fingerprint(source_opened) or not _fallback_opened_matches_named(
+            source_after, named_after
+        ):
+            raise _changed(manifest.source, "file changed while it was copied")
+        _verify_entry(manifest.entry, named_after, manifest.source)
         if digest.hexdigest() != manifest.entry.digest:
             raise _changed(manifest.source, "file contents changed")
     finally:

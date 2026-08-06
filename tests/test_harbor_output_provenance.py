@@ -11,6 +11,7 @@ import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -57,6 +58,170 @@ def _in_skill_output(skill: Path, name: str) -> tuple[Path, Path]:
     return declared_root, declared_root / "dataset"
 
 
+def _simulate_windows_crt_fstat_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Return valid descriptor metadata with a Windows-incompatible identity."""
+    original_fstat = output_provenance.os.fstat
+
+    def incompatible_fstat(descriptor: int) -> object:
+        opened = original_fstat(descriptor)
+        return SimpleNamespace(
+            st_dev=opened.st_dev + 10_000,
+            st_ino=opened.st_ino + 10_000,
+            st_mode=opened.st_mode,
+            st_nlink=opened.st_nlink,
+            st_size=opened.st_size,
+            st_uid=opened.st_uid,
+            st_mtime_ns=opened.st_mtime_ns,
+            st_ctime_ns=opened.st_ctime_ns,
+        )
+
+    monkeypatch.setattr(output_provenance, "_PATH_DESCRIPTOR_IDENTITIES_COMPARABLE", False, raising=False)
+    monkeypatch.setattr(output_provenance.os, "fstat", incompatible_fstat)
+
+
+def test_atomic_output_accepts_windows_crt_descriptor_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "result.json"
+    destination.write_bytes(b"old")
+    _simulate_windows_crt_fstat_identity(monkeypatch)
+
+    output_provenance.write_output_file_atomically(destination, b"complete")
+
+    assert destination.read_bytes() == b"complete"
+    assert not list(tmp_path.glob(".result.json.*.tmp"))
+
+
+def test_marker_failure_cleanup_accepts_windows_crt_descriptor_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "generated"
+    root.mkdir()
+    original_fdopen = output_provenance.os.fdopen
+
+    class _FailingWriter:
+        def __init__(self, handle: object) -> None:
+            self._handle = handle
+
+        def __enter__(self) -> _FailingWriter:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self._handle.close()  # type: ignore[attr-defined]
+
+        def write(self, payload: bytes) -> int:
+            self._handle.write(payload[:1])  # type: ignore[attr-defined]
+            self._handle.flush()  # type: ignore[attr-defined]
+            raise OSError("injected marker write failure")
+
+        def flush(self) -> None:
+            self._handle.flush()  # type: ignore[attr-defined]
+
+        def fileno(self) -> int:
+            return self._handle.fileno()  # type: ignore[attr-defined,no-any-return]
+
+    monkeypatch.setattr(output_provenance, "_load_or_create_key", lambda: b"k" * 32)
+    monkeypatch.setattr(
+        output_provenance.os,
+        "fdopen",
+        lambda descriptor, *args, **kwargs: _FailingWriter(original_fdopen(descriptor, *args, **kwargs)),
+    )
+    _simulate_windows_crt_fstat_identity(monkeypatch)
+
+    with pytest.raises(OSError, match="injected marker write failure"):
+        output_provenance.write_generated_output_marker(root)
+
+    assert list(root.iterdir()) == []
+
+
+@pytest.mark.parametrize("failure_point", ["fstat", "lstat"])
+def test_marker_metadata_failure_closes_descriptor_without_unproven_name_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    root = tmp_path / "generated"
+    root.mkdir()
+    marker = root / GENERATED_OUTPUT_MARKER
+    original_close = output_provenance.os.close
+    original_fstat = output_provenance.os.fstat
+    original_lstat = output_provenance.Path.lstat
+    original_unlink_if_same_file = output_provenance._unlink_if_same_file
+    closed_descriptors: list[int] = []
+    cleanup_attempts: list[Path] = []
+    failure_injected = False
+
+    def tracked_close(descriptor: int) -> None:
+        closed_descriptors.append(descriptor)
+        original_close(descriptor)
+
+    def injected_fstat(descriptor: int) -> os.stat_result:
+        nonlocal failure_injected
+        if failure_point == "fstat" and not failure_injected:
+            failure_injected = True
+            raise OSError("injected marker fstat failure")
+        return original_fstat(descriptor)
+
+    def injected_lstat(path: Path) -> os.stat_result:
+        nonlocal failure_injected
+        if failure_point == "lstat" and path == marker and not failure_injected:
+            failure_injected = True
+            raise OSError("injected marker lstat failure")
+        return original_lstat(path)
+
+    def track_cleanup(path: Path, expected: os.stat_result) -> bool:
+        cleanup_attempts.append(path)
+        return original_unlink_if_same_file(path, expected)
+
+    monkeypatch.setattr(output_provenance, "_load_or_create_key", lambda: b"k" * 32)
+    monkeypatch.setattr(output_provenance.os, "close", tracked_close)
+    monkeypatch.setattr(output_provenance.os, "fstat", injected_fstat)
+    monkeypatch.setattr(output_provenance.Path, "lstat", injected_lstat)
+    monkeypatch.setattr(output_provenance, "_unlink_if_same_file", track_cleanup)
+
+    with pytest.raises(OSError, match=rf"injected marker {failure_point} failure"):
+        output_provenance.write_generated_output_marker(root)
+
+    assert failure_injected
+    assert closed_descriptors
+    assert cleanup_attempts == []
+    assert marker.is_file()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX rename-while-open behavior")
+def test_marker_lstat_failure_never_unlinks_a_substituted_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "generated"
+    root.mkdir()
+    marker = root / GENERATED_OUTPUT_MARKER
+    original_partial = root / ".original-partial-marker"
+    original_lstat = output_provenance.Path.lstat
+    substituted = False
+
+    def substitute_then_fail(path: Path) -> os.stat_result:
+        nonlocal substituted
+        if path == marker and not substituted:
+            substituted = True
+            marker.rename(original_partial)
+            marker.write_text("preserve replacement\n", encoding="utf-8")
+            raise OSError("injected marker lstat failure after substitution")
+        return original_lstat(path)
+
+    monkeypatch.setattr(output_provenance, "_load_or_create_key", lambda: b"k" * 32)
+    monkeypatch.setattr(output_provenance.Path, "lstat", substitute_then_fail)
+
+    with pytest.raises(OSError, match="injected marker lstat failure after substitution"):
+        output_provenance.write_generated_output_marker(root)
+
+    assert substituted
+    assert marker.read_text(encoding="utf-8") == "preserve replacement\n"
+    assert original_partial.is_file()
+
+
 def test_concurrent_first_key_creation_publishes_one_complete_key(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -99,6 +264,113 @@ def test_interrupted_hardlink_publish_is_recovered(tmp_path: Path) -> None:
     assert payload.startswith(b"SkillEvaluator generated output v2\n")
     assert not temporary.exists()
     assert key_path.stat().st_nlink == 1
+
+
+@pytest.mark.parametrize("failure_point", ["write", "fsync"])
+def test_marker_publication_failure_removes_only_its_partial_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    """A failed marker claim must not leave a plausible owned reservation."""
+    root = tmp_path / "generated"
+    root.mkdir()
+    output_provenance.generated_output_marker_payload(tmp_path / "seed")
+    original_fdopen = output_provenance.os.fdopen
+    original_fsync = output_provenance.os.fsync
+
+    class _PartialWriter:
+        def __init__(self, handle: object) -> None:
+            self._handle = handle
+
+        def __enter__(self) -> _PartialWriter:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self._handle.close()  # type: ignore[attr-defined]
+
+        def write(self, payload: bytes) -> int:
+            self._handle.write(payload[: len(payload) // 2])  # type: ignore[attr-defined]
+            self._handle.flush()  # type: ignore[attr-defined]
+            raise OSError("injected marker write failure")
+
+        def flush(self) -> None:
+            self._handle.flush()  # type: ignore[attr-defined]
+
+        def fileno(self) -> int:
+            return self._handle.fileno()  # type: ignore[attr-defined,no-any-return]
+
+    if failure_point == "write":
+        monkeypatch.setattr(
+            output_provenance.os,
+            "fdopen",
+            lambda descriptor, *args, **kwargs: _PartialWriter(original_fdopen(descriptor, *args, **kwargs)),
+        )
+        expected_error = "injected marker write failure"
+    else:
+        monkeypatch.setattr(
+            output_provenance.os,
+            "fsync",
+            lambda _descriptor: (_ for _ in ()).throw(OSError("injected marker fsync failure")),
+        )
+        expected_error = "injected marker fsync failure"
+
+    with pytest.raises(OSError, match=expected_error):
+        output_provenance.write_generated_output_marker(root)
+
+    assert not (root / GENERATED_OUTPUT_MARKER).exists()
+    assert list(root.iterdir()) == []
+    monkeypatch.setattr(output_provenance.os, "fdopen", original_fdopen)
+    monkeypatch.setattr(output_provenance.os, "fsync", original_fsync)
+
+
+def test_owned_output_cleanup_refuses_a_path_substituted_after_authentication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "reserved-run"
+    moved_root = tmp_path / "moved-reserved-run"
+    mark_generated_output_root(root)
+    original_identity = root.stat().st_dev, root.stat().st_ino
+    original_fingerprint = output_provenance._node_fingerprint
+    root_fingerprint_calls = 0
+
+    def substitute_after_identity_check(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+        nonlocal root_fingerprint_calls
+        fingerprint = original_fingerprint(metadata)
+        if (metadata.st_dev, metadata.st_ino) == original_identity:
+            root_fingerprint_calls += 1
+            if root_fingerprint_calls == 2:
+                root.rename(moved_root)
+                root.mkdir()
+                (root / "preserve.txt").write_text("replacement\n", encoding="utf-8")
+        return fingerprint
+
+    monkeypatch.setattr(output_provenance, "_node_fingerprint", substitute_after_identity_check)
+
+    removed = output_provenance.remove_generated_output_root_if_owned(root)
+
+    assert removed is False
+    assert (root / "preserve.txt").read_text(encoding="utf-8") == "replacement\n"
+    assert moved_root.is_dir()
+
+
+def test_fallback_owned_output_cleanup_never_recursively_deletes_contents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "reserved-run"
+    mark_generated_output_root(root)
+    sentinel = root / "preserve.txt"
+    sentinel.write_text("preserve\n", encoding="utf-8")
+    identity = root.stat().st_dev, root.stat().st_ino
+    monkeypatch.setattr(output_provenance, "_DESCRIPTOR_BACKEND", False)
+
+    removed = output_provenance.remove_generated_output_root_if_owned(root, expected_identity=identity)
+
+    assert removed is False
+    assert sentinel.read_text(encoding="utf-8") == "preserve\n"
+    assert (root / GENERATED_OUTPUT_MARKER).is_file()
 
 
 def test_fixed_marker_cannot_authorize_authored_source_replacement(tmp_path: Path) -> None:

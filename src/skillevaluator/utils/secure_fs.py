@@ -259,7 +259,12 @@ class SecureRoot:
 
         try:
             opened = os.fstat(descriptor)
-            _validate_opened_file(opened, relative_path, expected)
+            # Windows path stat and CRT descriptor stat do not expose a
+            # reliably comparable st_dev/st_ino pair. _open_windows rechecks
+            # the declared name with path lstat around its native no-follow
+            # handle open; only POSIX compares the descriptor to discovery
+            # metadata here.
+            _validate_opened_file(opened, relative_path, expected if os.name == "posix" else None)
             if opened.st_size > max_bytes:
                 raise SecurePathError(
                     "file_size_limit",
@@ -361,6 +366,7 @@ class SecureRoot:
 
         directory_handles: list[int] = []
         parent_handle = self._windows_root_handles[-1]
+        declared_path = self.root / relative_path
         descriptor = -1
         native_file_handle = -1
         try:
@@ -382,6 +388,20 @@ class SecureRoot:
                 directory_handles.append(native_directory_handle)
                 parent_handle = native_directory_handle
 
+            # Revalidate with the same path-stat family used during discovery,
+            # then pin that name through a native handle which denies write and
+            # delete sharing. CRT fstat identity is not comparable to lstat on
+            # Windows, so name stability is established before conversion.
+            try:
+                before_open = declared_path.lstat()
+            except OSError as exc:
+                raise SecurePathError(
+                    "unsafe_path",
+                    f"Cannot inspect selected file securely: {relative_path.as_posix()}: {exc}",
+                    relative_path=relative_path.as_posix(),
+                ) from exc
+            _validate_opened_file(before_open, relative_path, expected)
+
             native_file_handle = _windows_open_relative_handle(
                 parent_handle,
                 relative_path.name,
@@ -395,13 +415,22 @@ class SecureRoot:
                 create_options=_WINDOWS_FILE_OPEN_OPTIONS,
             )
             _validate_windows_read_file_handle(native_file_handle, relative_path)
+            try:
+                after_open = declared_path.lstat()
+            except OSError as exc:
+                raise SecurePathError(
+                    "unsafe_path",
+                    f"Cannot revalidate selected file securely: {relative_path.as_posix()}: {exc}",
+                    relative_path=relative_path.as_posix(),
+                ) from exc
+            _validate_opened_file(after_open, relative_path, before_open)
             descriptor = msvcrt.open_osfhandle(
                 native_file_handle,
                 os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0),
             )
             native_file_handle = -1
             opened = os.fstat(descriptor)
-            _validate_opened_file(opened, relative_path, expected)
+            _validate_opened_file(opened, relative_path, None)
             return descriptor
         except OSError as exc:
             if descriptor >= 0:

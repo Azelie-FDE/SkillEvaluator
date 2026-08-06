@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from skillevaluator.tier3.commands import compare_results
+from skillevaluator.tier3.output_provenance import mark_generated_output_root
 
 
 def _complete_current_run(run_dir: Path) -> None:
@@ -189,6 +190,8 @@ def test_compare_same_timestamp_unique_runs_uses_result_completion_time(
         (completed_later, 0.9, 200),
     ):
         run_dir = skill_results / run_id
+        run_dir.mkdir(parents=True)
+        mark_generated_output_root(run_dir)
         summary_dir = run_dir / "opencode" / "with-skill"
         summary_dir.mkdir(parents=True)
         (summary_dir / "summary.json").write_text(
@@ -196,8 +199,72 @@ def test_compare_same_timestamp_unique_runs_uses_result_completion_time(
             encoding="utf-8",
         )
         result_path = run_dir / "result.json"
-        (run_dir / "run_config.json").write_text("{}", encoding="utf-8")
-        result_path.write_text(json.dumps({"run_id": run_id, "agents": {}}), encoding="utf-8")
+        run_config: dict[str, object] = {
+            "config_file": "none",
+            "harbor": {
+                "environment": {"value": "local", "source": "test"},
+                "n_attempts": 1,
+                "stop_on_pass": False,
+                "n_concurrent": 1,
+                "timeout_multiplier": 1.0,
+                "base_image_mode": "disabled",
+                "jobs_retained": False,
+            },
+            "provider": {"name": "nvidia", "model": "test-model"},
+            "task_source": "evals_json",
+            "grading": {"mode": "default"},
+            "agents": {"opencode": {"agent": "opencode", "model": "test-model", "source": "test default"}},
+        }
+        agent_result = {
+            "model": "test-model",
+            "model_source": "test default",
+            "model_resolution": {"model": "test-model", "source": "test default"},
+            "with_skill": {"security": score},
+            "without_skill": {},
+            "custom_with_skill": {},
+            "custom_without_skill": {},
+            "dimensions_with_skill": {},
+            "dimensions_without_skill": {},
+            "lift": {},
+            "custom_lift": {},
+            "pass_at_k": {"with_skill": {}, "without_skill": {}, "lift": {}},
+            "security_attribution": {},
+            "agent_runtime_failures": {"with_skill": [], "without_skill": []},
+            "trial_failures": {"with_skill": [], "without_skill": []},
+            "job_failures": {"with_skill": "", "without_skill": ""},
+            "conditions": {"with_skill": {}, "without_skill": {}},
+            "execution_status": "succeeded",
+            "execution_errors": [],
+            "expected_attempts": 1,
+            "scored_attempts": 1,
+            "num_trials_with": 1,
+            "num_trials_without": 0,
+            "output_dir": str((run_dir / "opencode").resolve()),
+        }
+        (run_dir / "run_config.json").write_text(json.dumps(run_config), encoding="utf-8")
+        result_path.write_text(
+            json.dumps(
+                {
+                    "skill_name": skill_path.name,
+                    "run_id": run_id,
+                    "run_dir": str(run_dir),
+                    "result_path": str(result_path.resolve()),
+                    "run_config": run_config,
+                    "agents": {"opencode": agent_result},
+                    "attempt_policy": {
+                        "max_attempts": 1,
+                        "pass_threshold": 0.5,
+                        "stop_on_pass": False,
+                        "score_definition": "test",
+                    },
+                    "execution_status": "succeeded",
+                    "execution_errors": [],
+                    "report_status": "complete",
+                    "duration_seconds": 1.0,
+                }
+            ),
+            encoding="utf-8",
+        )
         os.utime(result_path, ns=(completed_ns, completed_ns))
 
     assert compare_results(skill_path, results_dir=tmp_path / "results") == 0
@@ -266,7 +333,7 @@ def test_compare_consumes_authenticated_timestamped_pre_status_run(
 ) -> None:
     skill_path = tmp_path / "demo"
     skill_path.mkdir()
-    run_id = "20260709_010000_111_aaaaaaaaaaaa"
+    run_id = "20260709_010000"
     _write_authentic_pre_status_run(tmp_path / "results" / skill_path.name, run_id)
 
     assert compare_results(skill_path, results_dir=tmp_path / "results") == 0

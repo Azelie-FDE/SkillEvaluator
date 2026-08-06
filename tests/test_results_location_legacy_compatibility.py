@@ -9,15 +9,16 @@ import json
 import os
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from skillevaluator.tier3 import results_location
+from skillevaluator.tier3 import output_provenance, results_location
 from skillevaluator.tier3.harbor.metrics import DEFAULT_METRIC_SET
 from skillevaluator.tier3.output_provenance import GENERATED_OUTPUT_MARKER, mark_generated_output_root
 
 
-def _run(root: Path, name: str = "20260709_120000_1_aaaaaa") -> Path:
+def _run(root: Path, name: str = "20260709_120000") -> Path:
     candidate = root / name
     candidate.mkdir(parents=True)
     return candidate
@@ -108,15 +109,114 @@ def _write_successful_summary(run: Path, *, agent: str = "opencode") -> Path:
     return summary
 
 
-def _write_current_run(root: Path, name: str = "20260709_120000_1_aaaaaa") -> Path:
+def _write_current_run(root: Path, name: str = "20260709_120000_1_aaaaaaaaaaaa") -> Path:
     run = _run(root, name)
-    (run / "run_config.json").write_text("{}", encoding="utf-8")
-    (run / "result.json").write_text(json.dumps({"run_id": name, "agents": {}}), encoding="utf-8")
+    mark_generated_output_root(run)
+    run_config: dict[str, object] = {
+        "config_file": "none",
+        "harbor": {
+            "environment": {"value": "local", "source": "test"},
+            "n_attempts": 1,
+            "stop_on_pass": False,
+            "n_concurrent": 1,
+            "timeout_multiplier": 1.0,
+            "base_image_mode": "disabled",
+            "jobs_retained": False,
+        },
+        "provider": {"name": "nvidia", "model": "test-model"},
+        "task_source": "evals_json",
+        "grading": {"mode": "default"},
+        "agents": {"opencode": {"agent": "opencode", "model": "test-model", "source": "test default"}},
+    }
+    agent_result = {
+        "model": "test-model",
+        "model_source": "test default",
+        "model_resolution": {"model": "test-model", "source": "test default"},
+        "with_skill": {"security": 0.8},
+        "without_skill": {},
+        "custom_with_skill": {},
+        "custom_without_skill": {},
+        "dimensions_with_skill": {},
+        "dimensions_without_skill": {},
+        "lift": {},
+        "custom_lift": {},
+        "pass_at_k": {"with_skill": {}, "without_skill": {}, "lift": {}},
+        "security_attribution": {},
+        "agent_runtime_failures": {"with_skill": [], "without_skill": []},
+        "trial_failures": {"with_skill": [], "without_skill": []},
+        "job_failures": {"with_skill": "", "without_skill": ""},
+        "conditions": {"with_skill": {}, "without_skill": {}},
+        "execution_status": "succeeded",
+        "execution_errors": [],
+        "expected_attempts": 1,
+        "scored_attempts": 1,
+        "num_trials_with": 1,
+        "num_trials_without": 0,
+        "output_dir": str((run / "opencode").resolve()),
+    }
+    (run / "run_config.json").write_text(json.dumps(run_config), encoding="utf-8")
+    (run / "result.json").write_text(
+        json.dumps(
+            {
+                "skill_name": "demo",
+                "run_id": name,
+                "run_dir": str(run),
+                "result_path": str((run / "result.json").resolve()),
+                "run_config": run_config,
+                "agents": {"opencode": agent_result},
+                "attempt_policy": {
+                    "max_attempts": 1,
+                    "pass_threshold": 0.5,
+                    "stop_on_pass": False,
+                    "score_definition": "test",
+                },
+                "execution_status": "succeeded",
+                "execution_errors": [],
+                "report_status": "complete",
+                "duration_seconds": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
     return run
 
 
 def _is_completed(run: Path) -> bool:
     return results_location.run_directory_sort_key(run, require_completed_result=True) is not None
+
+
+def test_current_run_discovery_accepts_windows_crt_descriptor_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows path and CRT descriptor stat identities are not comparable."""
+    run = _write_current_run(tmp_path)
+    original_read_bytes = results_location.SecureRoot.read_bytes
+
+    def read_with_windows_crt_identity(
+        secure_root: results_location.SecureRoot,
+        relative_path: Path,
+        max_bytes: int,
+        *,
+        expected: os.stat_result | None = None,
+    ) -> tuple[bytes, object]:
+        raw, opened = original_read_bytes(secure_root, relative_path, max_bytes, expected=expected)
+        return raw, SimpleNamespace(
+            st_dev=opened.st_dev + 10_000,
+            st_ino=opened.st_ino + 10_000,
+            st_mode=opened.st_mode,
+            st_nlink=opened.st_nlink,
+            st_size=opened.st_size,
+            st_uid=opened.st_uid,
+            st_mtime_ns=opened.st_mtime_ns,
+            st_ctime_ns=opened.st_ctime_ns,
+        )
+
+    monkeypatch.setattr(results_location, "_PATH_DESCRIPTOR_IDENTITIES_COMPARABLE", False, raising=False)
+    monkeypatch.setattr(output_provenance, "_PATH_DESCRIPTOR_IDENTITIES_COMPARABLE", False)
+    monkeypatch.setattr(results_location.SecureRoot, "read_bytes", read_with_windows_crt_identity)
+
+    assert _is_completed(run)
 
 
 def test_rejects_current_run_with_list_valued_run_config(tmp_path: Path) -> None:

@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 
 from skillevaluator.tier3.case_ids import validate_output_directory_path
+from skillevaluator.tier3.harbor.secure_copy import _DESCRIPTOR_BACKEND, _DIRECTORY_FLAGS, _remove_tree_at
+from skillevaluator.utils.secure_fs import SecurePathError, SecureRoot
 
 GENERATED_OUTPUT_MARKER = ".skillevaluator-generated-output"
 OUTPUT_PROVENANCE_KEY_ENV = "SKILLEVALUATOR_OUTPUT_PROVENANCE_KEY_FILE"
@@ -26,6 +28,7 @@ _KEY_TEMP_PREFIX = ".output-provenance.key.tmp-"
 _MARKER_PREFIX = b"SkillEvaluator generated output v2\n"
 _MARKER_CONTEXT = b"skillevaluator.generated-output.v2\0"
 _MARKER_SIZE = len(_MARKER_PREFIX) + len(base64.urlsafe_b64encode(bytes(_KEY_BYTES)).rstrip(b"=")) + 1
+_PATH_DESCRIPTOR_IDENTITIES_COMPARABLE = os.name == "posix"
 
 
 def _is_link_or_reparse(metadata: os.stat_result) -> bool:
@@ -35,6 +38,157 @@ def _is_link_or_reparse(metadata: os.stat_result) -> bool:
 
 def _node_fingerprint(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
     return metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_nlink, metadata.st_size
+
+
+def _artifact_fingerprint(metadata: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    """Return identity and content-change fields from one stat API family."""
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _stable_read_metadata(
+    before: os.stat_result,
+    opened: os.stat_result,
+    after: os.stat_result,
+) -> os.stat_result | None:
+    """Select comparable metadata after a descriptor-pinned read."""
+    if _PATH_DESCRIPTOR_IDENTITIES_COMPARABLE:
+        if _artifact_fingerprint(opened) != _artifact_fingerprint(before) or _artifact_fingerprint(
+            after
+        ) != _artifact_fingerprint(opened):
+            return None
+        return opened
+    if _artifact_fingerprint(after) != _artifact_fingerprint(before) or opened.st_size != after.st_size:
+        return None
+    return after
+
+
+def _fsync_directory(path: Path) -> None:
+    """Durably publish a directory entry where the platform supports it."""
+    if os.name != "posix":
+        return
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _unlink_if_same_file(path: Path, expected: os.stat_result) -> bool:
+    """Unlink only the exact regular file created by the current operation."""
+    try:
+        observed = path.lstat()
+    except OSError:
+        return False
+    if _is_link_or_reparse(observed) or not stat.S_ISREG(observed.st_mode):
+        return False
+    if not os.path.samestat(expected, observed):
+        return False
+    try:
+        path.unlink()
+    except OSError:
+        return False
+    return True
+
+
+def _inspect_atomic_destination(path: Path) -> os.stat_result | None:
+    """Return destination metadata after rejecting unsafe file types."""
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    if _is_link_or_reparse(metadata) or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise ValueError(f"Generated output artifact must be a single-link regular file: {path}")
+    return metadata
+
+
+def write_output_file_atomically(path: Path, payload: bytes) -> None:
+    """Durably replace one evaluator-owned output file with complete bytes."""
+    validate_output_directory_path(path.parent)
+    existing = _inspect_atomic_destination(path)
+    existing_mode = stat.S_IMODE(existing.st_mode) if existing is not None else None
+    temporary: Path | None = None
+    temporary_named_metadata: os.stat_result | None = None
+    descriptor = -1
+    try:
+        for _ in range(32):
+            candidate = path.parent / f".{path.name}.{os.getpid()}-{secrets.token_hex(8)}.tmp"
+            try:
+                descriptor = os.open(
+                    candidate,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    0o666,
+                )
+            except FileExistsError:
+                continue
+            temporary = candidate
+            break
+        if temporary is None or descriptor < 0:
+            raise OSError(f"Cannot allocate a temporary output artifact for: {path}")
+
+        temporary_opened = os.fstat(descriptor)
+        temporary_named_metadata = temporary.lstat()
+        if (
+            _is_link_or_reparse(temporary_opened)
+            or _is_link_or_reparse(temporary_named_metadata)
+            or not stat.S_ISREG(temporary_opened.st_mode)
+            or not stat.S_ISREG(temporary_named_metadata.st_mode)
+            or temporary_opened.st_nlink != 1
+            or temporary_named_metadata.st_nlink != 1
+            or (
+                _PATH_DESCRIPTOR_IDENTITIES_COMPARABLE
+                and not os.path.samestat(temporary_opened, temporary_named_metadata)
+            )
+        ):
+            raise ValueError(f"Generated output temporary artifact is unsafe: {temporary}")
+        if existing_mode is not None and hasattr(os, "fchmod"):
+            os.fchmod(descriptor, existing_mode)
+
+        handle = os.fdopen(descriptor, "wb", closefd=True)
+        descriptor = -1
+        with handle:
+            if handle.write(payload) != len(payload):
+                raise OSError(f"Short write while publishing generated output: {path}")
+            handle.flush()
+            os.fsync(handle.fileno())
+            written = os.fstat(handle.fileno())
+
+        observed = temporary.lstat()
+        temporary_identity_matches = os.path.samestat(temporary_named_metadata, observed) and (
+            not _PATH_DESCRIPTOR_IDENTITIES_COMPARABLE or os.path.samestat(written, observed)
+        )
+        if (
+            _is_link_or_reparse(observed)
+            or not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or written.st_size != len(payload)
+            or observed.st_size != len(payload)
+            or not temporary_identity_matches
+        ):
+            raise ValueError(f"Generated output temporary artifact changed while writing: {temporary}")
+        validate_output_directory_path(path.parent)
+        destination = _inspect_atomic_destination(path)
+        if (existing is None) != (destination is None) or (
+            existing is not None
+            and destination is not None
+            and _artifact_fingerprint(existing) != _artifact_fingerprint(destination)
+        ):
+            raise ValueError(f"Generated output destination changed while writing: {path}")
+        os.replace(temporary, path)  # noqa: PTH105 -- same-directory atomic replacement is the contract
+        temporary = None
+        _fsync_directory(path.parent)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary is not None and temporary_named_metadata is not None:
+            _unlink_if_same_file(temporary, temporary_named_metadata)
 
 
 def _protect_key_for_storage(key: bytes) -> bytes:
@@ -149,21 +303,16 @@ def _validate_key_metadata(path: Path, metadata: os.stat_result) -> None:
 def _read_key(path: Path) -> bytes:
     before = path.lstat()
     _validate_key_metadata(path, before)
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    descriptor = os.open(path, flags)
     try:
-        opened = os.fstat(descriptor)
-        _validate_key_metadata(path, opened)
-        if _node_fingerprint(opened) != _node_fingerprint(before):
-            raise ValueError(f"Output provenance key changed while it was opened: {path}")
-        payload = os.read(descriptor, before.st_size + 1)
-        after = os.fstat(descriptor)
-        _validate_key_metadata(path, after)
-        if _node_fingerprint(after) != _node_fingerprint(before):
-            raise ValueError(f"Output provenance key changed while it was read: {path}")
-    finally:
-        os.close(descriptor)
-    if len(payload) != before.st_size:
+        with SecureRoot(path.parent) as secure_root:
+            payload, opened = secure_root.read_bytes(Path(path.name), before.st_size, expected=before)
+            after = path.lstat()
+    except SecurePathError as exc:
+        raise ValueError(f"Output provenance key changed while it was read: {path}") from exc
+    _validate_key_metadata(path, opened)
+    _validate_key_metadata(path, after)
+    stable = _stable_read_metadata(before, opened, after)
+    if stable is None or len(payload) != before.st_size or len(payload) != stable.st_size:
         raise ValueError(f"Output provenance key has an invalid size: {path}")
     return _unprotect_stored_key(payload)
 
@@ -344,30 +493,26 @@ def _read_marker(path: Path, expected_size: int) -> bytes | None:
         or before.st_size != expected_size
     ):
         return None
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        descriptor = os.open(path, flags)
-    except OSError:
-        return None
-    try:
-        opened = os.fstat(descriptor)
+        with SecureRoot(path.parent) as secure_root:
+            payload, opened = secure_root.read_bytes(Path(path.name), expected_size, expected=before)
+            after = path.lstat()
         if (
             _is_link_or_reparse(opened)
             or not stat.S_ISREG(opened.st_mode)
             or opened.st_nlink != 1
             or opened.st_size != expected_size
-            or _node_fingerprint(opened) != _node_fingerprint(before)
+            or _is_link_or_reparse(after)
+            or not stat.S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+            or after.st_size != expected_size
+            or _stable_read_metadata(before, opened, after) is None
+            or len(payload) != expected_size
         ):
             return None
-        payload = os.read(descriptor, expected_size + 1)
-        after = os.fstat(descriptor)
-        if _node_fingerprint(after) != _node_fingerprint(before):
-            return None
         return payload
-    except OSError:
+    except (OSError, SecurePathError, ValueError):
         return None
-    finally:
-        os.close(descriptor)
 
 
 def is_generated_output_root(path: Path) -> bool:
@@ -420,10 +565,50 @@ def write_generated_output_marker(root: Path, *, destination: Path | None = None
         if observed is None or not hmac.compare_digest(observed, expected):
             raise ValueError(f"Generated output marker is invalid or unsafe: {marker}") from None
         return
-    with os.fdopen(descriptor, "wb", closefd=True) as handle:
-        handle.write(expected)
-        handle.flush()
-        os.fsync(handle.fileno())
+    created_named: os.stat_result | None = None
+    try:
+        created_opened = os.fstat(descriptor)
+        created_named = marker.lstat()
+        if (
+            _is_link_or_reparse(created_opened)
+            or _is_link_or_reparse(created_named)
+            or not stat.S_ISREG(created_opened.st_mode)
+            or not stat.S_ISREG(created_named.st_mode)
+            or created_opened.st_nlink != 1
+            or created_named.st_nlink != 1
+            or (_PATH_DESCRIPTOR_IDENTITIES_COMPARABLE and not os.path.samestat(created_opened, created_named))
+        ):
+            raise ValueError(f"Generated output marker is unsafe: {marker}")
+        handle = os.fdopen(descriptor, "wb", closefd=True)
+        descriptor = -1
+        with handle:
+            if handle.write(expected) != len(expected):
+                raise OSError(f"Short write while publishing generated output marker: {marker}")
+            handle.flush()
+            os.fsync(handle.fileno())
+            written = os.fstat(handle.fileno())
+        observed = marker.lstat()
+        if (
+            _is_link_or_reparse(observed)
+            or not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or written.st_size != len(expected)
+            or observed.st_size != len(expected)
+            or not os.path.samestat(created_named, observed)
+            or (_PATH_DESCRIPTOR_IDENTITIES_COMPARABLE and not os.path.samestat(written, observed))
+        ):
+            raise ValueError(f"Generated output marker changed while it was written: {marker}")
+        _fsync_directory(root)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+            descriptor = -1
+        if created_named is not None:
+            _unlink_if_same_file(marker, created_named)
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def mark_generated_output_root(path: Path) -> None:
@@ -432,3 +617,115 @@ def mark_generated_output_root(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     validate_output_directory_path(path)
     write_generated_output_marker(path)
+
+
+def _remove_output_tree_at_identity(path: Path, expected_identity: tuple[int, int]) -> bool:
+    """Remove only one no-follow tree matching a previously observed identity."""
+    if not _DESCRIPTOR_BACKEND:
+        return False
+    parent_descriptor = -1
+    try:
+        validate_output_directory_path(path.parent)
+        parent_descriptor = os.open(path.parent, _DIRECTORY_FLAGS)
+        _remove_tree_at(parent_descriptor, path.name, expected_identity=expected_identity)
+        os.fsync(parent_descriptor)
+    except (OSError, ValueError):
+        return False
+    finally:
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+    return not os.path.lexists(path)
+
+
+def _remove_empty_output_tree_fallback(
+    path: Path,
+    expected_identity: tuple[int, int],
+    *,
+    remove_authenticated_marker: bool,
+) -> bool:
+    """Conservatively remove an empty exact reservation without recursive deletion."""
+    marker = path / GENERATED_OUTPUT_MARKER
+    marker_metadata: os.stat_result | None = None
+    try:
+        validate_output_directory_path(path)
+        before = path.lstat()
+        if (
+            _is_link_or_reparse(before)
+            or not stat.S_ISDIR(before.st_mode)
+            or (before.st_dev, before.st_ino) != expected_identity
+        ):
+            return False
+        entries = list(path.iterdir())
+        if remove_authenticated_marker:
+            if len(entries) != 1 or entries[0].name != GENERATED_OUTPUT_MARKER or not is_generated_output_root(path):
+                return False
+            marker_metadata = marker.lstat()
+            if (
+                _is_link_or_reparse(marker_metadata)
+                or not stat.S_ISREG(marker_metadata.st_mode)
+                or marker_metadata.st_nlink != 1
+            ):
+                return False
+        elif entries:
+            return False
+
+        current = path.lstat()
+        if (current.st_dev, current.st_ino) != expected_identity or _is_link_or_reparse(current):
+            return False
+        if marker_metadata is not None and not _unlink_if_same_file(marker, marker_metadata):
+            return False
+        current = path.lstat()
+        if (current.st_dev, current.st_ino) != expected_identity or _is_link_or_reparse(current):
+            return False
+        if next(path.iterdir(), None) is not None:
+            return False
+        path.rmdir()
+        _fsync_directory(path.parent)
+    except (OSError, ValueError):
+        return False
+    return not os.path.lexists(path)
+
+
+def remove_output_reservation_if_identity_matches(path: Path, expected_identity: tuple[int, int]) -> bool:
+    """Clean an exact new reservation; fallback platforms require it to be empty."""
+    if not _DESCRIPTOR_BACKEND:
+        return _remove_empty_output_tree_fallback(
+            path,
+            expected_identity,
+            remove_authenticated_marker=False,
+        )
+    return _remove_output_tree_at_identity(path, expected_identity)
+
+
+def remove_generated_output_root_if_owned(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> bool:
+    """Remove an authenticated failed reservation without following replacements.
+
+    Descriptor-capable platforms use identity-bound recursive removal. Other
+    platforms remove only a marker-only directory and never recursively delete.
+    """
+    try:
+        validate_output_directory_path(path)
+        before = path.lstat()
+        if not stat.S_ISDIR(before.st_mode) or _is_link_or_reparse(before):
+            return False
+        identity = before.st_dev, before.st_ino
+        if expected_identity is not None and identity != expected_identity:
+            return False
+        if not is_generated_output_root(path):
+            return False
+        after = path.lstat()
+        if _node_fingerprint(after) != _node_fingerprint(before):
+            return False
+    except (OSError, ValueError):
+        return False
+    if not _DESCRIPTOR_BACKEND:
+        return _remove_empty_output_tree_fallback(
+            path,
+            identity,
+            remove_authenticated_marker=True,
+        )
+    return _remove_output_tree_at_identity(path, identity)

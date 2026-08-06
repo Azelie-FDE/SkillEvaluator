@@ -18,7 +18,7 @@ import time
 import tomllib
 from collections.abc import Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import wraps
@@ -32,6 +32,7 @@ from skillevaluator.evaluation.tier3_report import render_agent_eval_html_report
 from skillevaluator.provider_config import ProviderConfig, ProviderConfigurationError, resolve_llm_provider
 from skillevaluator.tier3.evals_config import EvalsConfigError, load_evals_config
 from skillevaluator.tier3.harbor.adapter import (
+    _prevalidate_baseline_skill_candidates,
     build_eval_base_image,
     find_evals_file,
     generate_harbor_tasks,
@@ -58,7 +59,12 @@ from skillevaluator.tier3.harbor.progress import (
 )
 from skillevaluator.tier3.harbor.secure_copy import copytree_secure
 from skillevaluator.tier3.harbor.secure_docker_environment import SECURE_DOCKER_ENV_IMPORT_PATH
-from skillevaluator.tier3.output_provenance import mark_generated_output_root
+from skillevaluator.tier3.output_provenance import (
+    mark_generated_output_root,
+    remove_generated_output_root_if_owned,
+    remove_output_reservation_if_identity_matches,
+    write_output_file_atomically,
+)
 from skillevaluator.tier3.results_location import publish_latest_results
 from skillevaluator.tier3_environments import DEFAULT_ENV_MODE, ENV_MODE_LOCAL, HARBOR_ENV_MODES
 
@@ -79,11 +85,13 @@ def _reserve_run_dir(results_root: Path, timestamp: str) -> Path:
             run_dir.mkdir()
         except FileExistsError:
             continue
+        reservation_metadata = run_dir.lstat()
+        reservation_identity = reservation_metadata.st_dev, reservation_metadata.st_ino
         try:
             mark_generated_output_root(run_dir)
         except Exception:
-            with suppress(OSError):
-                run_dir.rmdir()
+            if not remove_generated_output_root_if_owned(run_dir, expected_identity=reservation_identity):
+                remove_output_reservation_if_identity_matches(run_dir, reservation_identity)
             raise
         return run_dir
     raise RuntimeError("Could not reserve a unique Tier 3 run directory")
@@ -1874,19 +1882,34 @@ def _run_harbor_eval_impl(
     tasks_dir = run_dir / "_harbor-tasks"
     result_path = run_dir / "result.json"
     report_path: Path | None = None
-    jobs_dir.mkdir(parents=True, exist_ok=True)
 
-    def _emit_run_finished(state: str, detail: str) -> None:
+    def _emit_run_finished(state: str, detail: str, *, include_artifacts: bool = True) -> None:
         reporter.emit(
             ProgressEvent(
                 stage="run-finished",
                 state=state,
                 detail=detail,
-                output_dir=str(run_dir),
-                result_path=str(result_path) if result_path.is_file() else None,
-                report_path=str(report_path) if report_path is not None and report_path.is_file() else None,
+                output_dir=str(run_dir) if include_artifacts else None,
+                result_path=str(result_path) if include_artifacts and result_path.is_file() else None,
+                report_path=(
+                    str(report_path)
+                    if include_artifacts and report_path is not None and report_path.is_file()
+                    else None
+                ),
             )
         )
+
+    reservation_identity: tuple[int, int] | None = None
+    try:
+        reservation_metadata = run_dir.lstat()
+        reservation_identity = reservation_metadata.st_dev, reservation_metadata.st_ino
+        jobs_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        reporter.emit(ProgressEvent(stage="with-skill-tasks", state="failed", detail=str(exc)))
+        if reservation_identity is not None:
+            remove_generated_output_root_if_owned(run_dir, expected_identity=reservation_identity)
+        _emit_run_finished("failed", "Harbor jobs directory could not be created", include_artifacts=False)
+        return {"error": [str(exc)]}
 
     emitter = stage_native_harbor_tasks if task_source == "native_harbor" else generate_harbor_tasks
     resource_config = harbor_config.get("resources", {})
@@ -1964,6 +1987,14 @@ def _run_harbor_eval_impl(
         if not skip_baseline:
             reporter.emit(ProgressEvent(stage="baseline-tasks", state="running"))
             staging_failure_stage = "baseline-tasks"
+            baseline_alias_validation = _prevalidate_baseline_skill_candidates(
+                skill_path,
+                reference_skills_dir,
+                workspace_skills,
+                excluded_roots=(root,),
+            )
+        else:
+            baseline_alias_validation = None
         for agent in agents:
             without_dir = agent_task_dirs[agent][1]
             if without_dir is not None:
@@ -1985,6 +2016,7 @@ def _run_harbor_eval_impl(
                     task_resources=resource_config,
                     agent_workdir=harbor_config.get("agent_workdir"),
                     evaluator_skill_path=evaluator_skill_path,
+                    _baseline_alias_validation=baseline_alias_validation,
                 )
         if not skip_baseline:
             reporter.emit(ProgressEvent(stage="baseline-tasks", state="ready", detail="baseline inputs staged"))
@@ -2073,7 +2105,7 @@ def _run_harbor_eval_impl(
                 "result_path": str(result_path),
                 "agents": {},
             }
-            result_path.write_text(json.dumps(failed_result, indent=2), encoding="utf-8")
+            write_output_file_atomically(result_path, json.dumps(failed_result, indent=2).encode("utf-8"))
             _emit_run_finished("failed", "agent runtime preflight failed")
             return failed_result
         reporter.emit(
@@ -2266,7 +2298,7 @@ def _run_harbor_eval_impl(
     results["duration_seconds"] = round(time.monotonic() - started_at, 3)
 
     try:
-        result_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        write_output_file_atomically(result_path, json.dumps(results, indent=2).encode("utf-8"))
     except Exception:
         reporter.emit(ProgressEvent(stage="report", state="failed", detail="result write failed"))
         _emit_run_finished("failed", "report artifacts could not be written")
@@ -2326,7 +2358,7 @@ def _finalize_harbor_artifacts(
     result_path_value = result.get("result_path")
     result_path = Path(str(result_path_value)) if result_path_value else run_dir / "result.json"
     if result_path.is_file():
-        result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        write_output_file_atomically(result_path, json.dumps(result, indent=2).encode("utf-8"))
     run_config = result.get("run_config")
     run_config_path = run_dir / "run_config.json"
     if isinstance(run_config, dict) and run_config_path.is_file():

@@ -116,12 +116,13 @@ outside `evals/` by a pre-marker version cannot be identified safely after the
 configured location changes. Move or delete that old content before
 `--copy-repo` or another full-context evaluation, then rerun with the current
 version if replacement evidence is needed. Runtime assets that the agent needs
-should live outside skill-owned `evals/`, under `evals/files/`
-(preferred), or under another non-control subtree such as `evals/data/` and be
-declared as task inputs with `files`. A `files` declaration cannot select
-evaluator control material: dataset/configuration files, graders, developer
-eval guidance, benchmark conversion reports, native Harbor tasks, custom
-environments, evaluator tests, or generated results.
+as part of the installed skill should live outside skill-owned `evals/`. Task
+fixtures should live under `evals/files/` (preferred) or another non-control
+subtree such as `evals/data/`, and should be declared as task inputs with
+`files`. A `files` declaration cannot select evaluator control material:
+dataset/configuration files, graders, developer eval guidance, benchmark
+conversion reports, native Harbor tasks, custom environments, evaluator tests,
+or generated results.
 
 MCP declarations are read only from a bounded, stable, single-link regular
 `evals/environment/mcp_servers.toml` through a descriptor-anchored evaluator
@@ -173,7 +174,7 @@ directory:
 <FileTree>
 - evals/
   - results/
-    - 20260709_141530/
+    - 20260709_141530_12345_a1b2c3d4e5f6/
       - result.json
       - run_config.json
       - report.html

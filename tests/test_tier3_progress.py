@@ -817,6 +817,47 @@ def test_all_agent_and_baseline_arms_share_one_private_evaluator_snapshot(
     assert not snapshots[0].exists()
 
 
+def test_multi_agent_run_prevalidates_baseline_alias_candidates_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    validation_token = object()
+    validation_calls: list[tuple[Path, tuple[Path, ...]]] = []
+    baseline_tokens: list[object | None] = []
+
+    def prevalidate(
+        skill_path: Path,
+        _reference_skills_dir: Path | None,
+        _workspace_skill_paths: list[Path] | None,
+        *,
+        excluded_roots: tuple[Path, ...],
+    ) -> object:
+        validation_calls.append((skill_path, excluded_roots))
+        return validation_token
+
+    def emit_tasks(_skill: Path, output: Path, **kwargs: Any) -> list[Path]:
+        if not kwargs["with_skill"]:
+            baseline_tokens.append(kwargs.get("_baseline_alias_validation"))
+        task = output / "case-1"
+        task.mkdir(parents=True)
+        return [task]
+
+    runner, skill = _stub_runner(monkeypatch, tmp_path, task_emitter=emit_tasks)
+    monkeypatch.setattr(runner, "_prevalidate_baseline_skill_candidates", prevalidate, raising=False)
+
+    result = runner.run_harbor_eval(
+        skill,
+        ["codex", "opencode"],
+        output_dir=tmp_path / "results",
+        agent_runtime_preflight=False,
+    )
+
+    assert "error" not in result
+    assert len(validation_calls) == 1
+    assert validation_calls[0][0] == skill
+    assert baseline_tokens == [validation_token, validation_token]
+
+
 def test_runner_rejects_preexisting_run_symlink_before_child_creation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -849,6 +890,113 @@ def test_runner_reserves_unique_run_directories_concurrently(tmp_path: Path) -> 
 
     assert len(set(run_dirs)) == 8
     assert all((run_dir / ".skillevaluator-generated-output").is_file() for run_dir in run_dirs)
+
+
+def test_failed_run_reservation_cleanup_refuses_a_substituted_empty_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from skillevaluator.tier3.harbor import runner
+
+    results_root = tmp_path / "results"
+    moved_run = tmp_path / "moved-run"
+    monkeypatch.setattr(runner.os, "getpid", lambda: 12345)
+    monkeypatch.setattr(runner, "uuid4", lambda: SimpleNamespace(hex="abcdef012345"))
+    expected_run = results_root / "20260804_123456_12345_abcdef012345"
+
+    def substitute_then_fail(path: Path) -> None:
+        path.rename(moved_run)
+        path.mkdir()
+        raise OSError("injected marker failure")
+
+    monkeypatch.setattr(runner, "mark_generated_output_root", substitute_then_fail)
+
+    with pytest.raises(OSError, match="injected marker failure"):
+        runner._reserve_run_dir(results_root, "20260804_123456")
+
+    assert expected_run.is_dir()
+    assert moved_run.is_dir()
+
+
+def test_jobs_directory_creation_failure_returns_structured_error_and_removes_owned_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner, skill = _stub_runner(monkeypatch, tmp_path)
+    reporter = _RecordingReporter()
+    original_mkdir = Path.mkdir
+
+    def fail_jobs_mkdir(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path.name == "_harbor-jobs":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", fail_jobs_mkdir)
+    results_root = tmp_path / "results"
+
+    result = runner.run_harbor_eval(
+        skill,
+        ["codex"],
+        output_dir=results_root,
+        progress_reporter=reporter,
+    )
+
+    assert result == {"error": ["[Errno 28] No space left on device"]}
+    assert results_root.is_dir()
+    assert list(results_root.iterdir()) == []
+    transitions = [(event.stage, event.state) for event in reporter.events]
+    assert transitions[-1] == ("run-finished", "failed")
+    assert transitions.count(("run-finished", "failed")) == 1
+
+
+def test_jobs_directory_failure_cleans_owned_empty_run_without_descriptor_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from skillevaluator.tier3 import output_provenance
+
+    runner, skill = _stub_runner(monkeypatch, tmp_path)
+    original_mkdir = Path.mkdir
+
+    def fail_jobs_mkdir(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path.name == "_harbor-jobs":
+            raise OSError("injected jobs directory failure")
+        original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(output_provenance, "_DESCRIPTOR_BACKEND", False)
+    monkeypatch.setattr(Path, "mkdir", fail_jobs_mkdir)
+    results_root = tmp_path / "results"
+
+    result = runner.run_harbor_eval(skill, ["codex"], output_dir=results_root)
+
+    assert result == {"error": ["injected jobs directory failure"]}
+    assert list(results_root.iterdir()) == []
+
+
+def test_jobs_directory_creation_failure_preserves_run_after_provenance_is_lost(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner, skill = _stub_runner(monkeypatch, tmp_path)
+    original_mkdir = Path.mkdir
+    reserved_run: list[Path] = []
+
+    def fail_after_tampering(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path.name == "_harbor-jobs":
+            reserved_run.append(path.parent)
+            marker = path.parent / ".skillevaluator-generated-output"
+            marker.write_text("not an authentic marker\n", encoding="utf-8")
+            (path.parent / "preserve.txt").write_text("unowned\n", encoding="utf-8")
+            raise OSError("injected jobs directory failure")
+        original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", fail_after_tampering)
+
+    result = runner.run_harbor_eval(skill, ["codex"], output_dir=tmp_path / "results")
+
+    assert result == {"error": ["injected jobs directory failure"]}
+    assert len(reserved_run) == 1
+    assert (reserved_run[0] / "preserve.txt").read_text(encoding="utf-8") == "unowned\n"
 
 
 def test_runner_publishes_latest_through_shared_atomic_helper(
@@ -1495,29 +1643,59 @@ def test_runner_terminalizes_report_when_result_write_raises(
 ) -> None:
     runner, skill = _stub_runner(monkeypatch, tmp_path)
     reporter = _RecordingReporter()
-    original_write_text = Path.write_text
+    original_replace = runner.os.replace
 
-    def fail_result_write(path: Path, *args, **kwargs):
-        if path.name == "result.json":
+    def fail_result_write(source: str | Path, destination: str | Path, *args, **kwargs):
+        if Path(destination).name == "result.json":
             raise OSError("result write failed")
-        return original_write_text(path, *args, **kwargs)
+        return original_replace(source, destination, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "write_text", fail_result_write)
+    monkeypatch.setattr(runner.os, "replace", fail_result_write)
+    results_root = tmp_path / "results"
 
     with pytest.raises(OSError, match="result write failed"):
         runner.run_harbor_eval(
             skill,
             ["codex"],
-            output_dir=tmp_path / "results",
+            output_dir=results_root,
             keep_harbor_jobs=True,
             progress_reporter=reporter,
         )
 
+    run_dirs = [candidate for candidate in results_root.iterdir() if candidate.is_dir()]
+    assert len(run_dirs) == 1
+    assert not (run_dirs[0] / "result.json").exists()
+    assert not list(run_dirs[0].glob(".result.json.*.tmp"))
     transitions = [(event.stage, event.state) for event in reporter.events]
     assert ("report", "running") in transitions
     assert ("report", "failed") in transitions
     assert transitions[-1] == ("run-finished", "failed")
     assert transitions.count(("run-finished", "failed")) == 1
+
+
+def test_runner_atomically_publishes_one_complete_final_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner, skill = _stub_runner(monkeypatch, tmp_path)
+    original_replace = runner.os.replace
+    published_payloads: list[dict[str, Any]] = []
+
+    def inspect_result_publication(source: str | Path, destination: str | Path, *args, **kwargs):
+        destination_path = Path(destination)
+        if destination_path.name == "result.json":
+            assert not destination_path.exists()
+            published_payloads.append(json.loads(Path(source).read_text(encoding="utf-8")))
+        return original_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(runner.os, "replace", inspect_result_publication)
+
+    result = runner.run_harbor_eval(skill, ["codex"], output_dir=tmp_path / "results")
+
+    assert len(published_payloads) == 1
+    assert published_payloads[0]["execution_status"] == "succeeded"
+    assert published_payloads[0]["run_id"] == result["run_id"]
+    assert json.loads(Path(result["result_path"]).read_text(encoding="utf-8")) == published_payloads[0]
 
 
 def test_runner_continues_when_reporter_callbacks_raise(

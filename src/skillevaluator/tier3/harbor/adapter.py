@@ -35,7 +35,11 @@ from typing import Any
 from urllib.parse import unquote
 
 from skillevaluator.tier3.case_ids import safe_child, validate_case_ids, validate_output_directory_path
-from skillevaluator.tier3.harbor.secure_copy import copy_file_secure, copytree_secure
+from skillevaluator.tier3.harbor.secure_copy import (
+    copy_file_secure,
+    copytree_secure,
+    tree_content_fingerprint_secure,
+)
 from skillevaluator.tier3.output_provenance import (
     GENERATED_OUTPUT_MARKER,
     is_generated_output_root,
@@ -112,6 +116,7 @@ _REPO_CONTEXT_IGNORE_PARTS = {("evals", "results")}
 _REPO_CONTEXT_IGNORE_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
 _NATIVE_SOURCE_IGNORE_NAMES = ("results", "__pycache__", ".git", GENERATED_OUTPUT_MARKER)
 _NATIVE_SOURCE_IGNORE = shutil.ignore_patterns(*_NATIVE_SOURCE_IGNORE_NAMES)
+_PATH_DESCRIPTOR_IDENTITIES_COMPARABLE = os.name == "posix"
 _REPO_CONTEXT_PUBLIC_ENV_SUFFIXES = (".dist", ".example", ".sample", ".template")
 _REPO_CONTEXT_SENSITIVE_NAMES = {
     ".git-credentials",
@@ -796,6 +801,69 @@ def _check_baseline_skill_candidates_do_not_alias_target(
                 f"Baseline skill candidate '{candidate}' is an alias of target skill '{target_skill.name}'. "
                 "A baseline must not contain the evaluated skill under another directory name."
             )
+
+
+@dataclass(frozen=True, slots=True)
+class _BaselineAliasValidation:
+    """Run-scoped proof that one exact baseline source set was prevalidated."""
+
+    source_key: tuple[Any, ...]
+
+
+def _baseline_alias_source_key(
+    target_skill: Path,
+    reference_skills_dir: Path | None,
+    workspace_skill_paths: Sequence[Path] | None,
+    excluded_roots: Sequence[Path],
+) -> tuple[Any, ...]:
+    def _path_key(path: Path) -> str:
+        return os.path.normcase(os.fspath(path.expanduser().resolve(strict=False)))
+
+    return (
+        _path_key(target_skill),
+        _path_key(reference_skills_dir) if reference_skills_dir is not None else None,
+        tuple(sorted(_path_key(path) for path in workspace_skill_paths or ())),
+        tuple(sorted(_path_key(path) for path in excluded_roots)),
+    )
+
+
+def _prevalidate_baseline_skill_candidates(
+    target_skill: Path,
+    reference_skills_dir: Path | None,
+    workspace_skill_paths: list[Path] | None,
+    *,
+    excluded_roots: Sequence[Path] = (),
+) -> _BaselineAliasValidation:
+    """Validate configured baseline sources once before a multi-agent run."""
+    _check_baseline_skill_candidates_do_not_alias_target(
+        target_skill,
+        reference_skills_dir,
+        workspace_skill_paths,
+        excluded_roots=excluded_roots,
+    )
+    return _BaselineAliasValidation(
+        _baseline_alias_source_key(
+            target_skill,
+            reference_skills_dir,
+            workspace_skill_paths,
+            excluded_roots,
+        )
+    )
+
+
+def _baseline_alias_validation_matches(
+    validation: _BaselineAliasValidation,
+    target_skill: Path,
+    reference_skills_dir: Path | None,
+    workspace_skill_paths: list[Path] | None,
+    excluded_roots: Sequence[Path],
+) -> bool:
+    return validation.source_key == _baseline_alias_source_key(
+        target_skill,
+        reference_skills_dir,
+        workspace_skill_paths,
+        excluded_roots,
+    )
 
 
 def _check_staged_baseline_does_not_contain_target(env_dir: Path, target_skill: Path) -> None:
@@ -1586,8 +1654,18 @@ def _read_regular_evals_file(
         raise ValueError(f"{label} changed while it was read: {path}") from exc
     if (
         _path_is_link_or_reparse(path, named_after)
-        or _evaluator_node_fingerprint(named_after) != _evaluator_node_fingerprint(opened)
         or len(payload) != opened.st_size
+        or (
+            _PATH_DESCRIPTOR_IDENTITIES_COMPARABLE
+            and _evaluator_node_fingerprint(named_after) != _evaluator_node_fingerprint(opened)
+        )
+        or (
+            not _PATH_DESCRIPTOR_IDENTITIES_COMPARABLE
+            and (
+                _evaluator_node_fingerprint(named_after) != _evaluator_node_fingerprint(before)
+                or len(payload) != named_after.st_size
+            )
+        )
     ):
         raise ValueError(f"{label} changed while it was read: {path}")
     if parent_snapshot:
@@ -3596,6 +3674,7 @@ def _write_dockerfile(
     compose_env_names: set[str] | None = None,
     repo_context_exclude_paths: Sequence[Path] = (),
     agent_workdir: str | None = None,
+    baseline_aliases_prevalidated: bool = False,
 ) -> None:
     """Generate a Dockerfile that installs skills into the container.
 
@@ -3608,7 +3687,7 @@ def _write_dockerfile(
     env_dir = task_dir / "environment"
     env_dir.mkdir(parents=True, exist_ok=True)
 
-    if not has_skill and skill_path is not None:
+    if not has_skill and skill_path is not None and not baseline_aliases_prevalidated:
         _check_baseline_skill_candidates_do_not_alias_target(
             skill_path,
             reference_skills_dir,
@@ -3982,11 +4061,12 @@ def _prepare_native_environment(
     compose_env_names: set[str] | None = None,
     repo_context_exclude_paths: Sequence[Path] = (),
     agent_workdir: str | None = None,
+    baseline_aliases_prevalidated: bool = False,
 ) -> None:
     """Stage SkillEvaluator runtime additions into a copied native Harbor task."""
     env_dir = task_dir / "environment"
     env_dir.mkdir(parents=True, exist_ok=True)
-    if not has_skill:
+    if not has_skill and not baseline_aliases_prevalidated:
         _check_baseline_skill_candidates_do_not_alias_target(
             skill_path,
             reference_skills_dir,
@@ -4443,6 +4523,7 @@ def _stage_native_harbor_tasks_into(
     pre_agent_setup: list[str] | None = None,
     task_resources: dict[str, int] | None = None,
     agent_workdir: str | None = None,
+    baseline_aliases_prevalidated: bool = False,
 ) -> list[Path]:
     """Build native Harbor tasks inside a private, caller-owned directory.
 
@@ -4489,6 +4570,15 @@ def _stage_native_harbor_tasks_into(
         )
 
     workspace_skill_names = sorted({p.name for p in workspace_skill_paths or []})
+    effective_excluded_roots = (*repo_context_exclude_paths, *private_repo_context_exclude_paths)
+    if not with_skill and not baseline_aliases_prevalidated:
+        _check_baseline_skill_candidates_do_not_alias_target(
+            skill_path,
+            reference_skills_dir,
+            workspace_skill_paths,
+            excluded_roots=effective_excluded_roots,
+        )
+        baseline_aliases_prevalidated = True
     for task_dir in task_dirs:
         entry_id = _native_entry_id(task_dir)
         native_agent_workdir = _native_task_workdir(task_dir)
@@ -4564,8 +4654,9 @@ def _stage_native_harbor_tasks_into(
             grading_mode=grading_mode,
             repo_context_mode="full" if copy_repo else "linked",
             compose_env_names=set(runtime_env or {}),
-            repo_context_exclude_paths=(*repo_context_exclude_paths, *private_repo_context_exclude_paths),
+            repo_context_exclude_paths=effective_excluded_roots,
             agent_workdir=native_agent_workdir,
+            baseline_aliases_prevalidated=baseline_aliases_prevalidated,
         )
 
     if not (output_dir / "dataset.toml").exists():
@@ -4619,6 +4710,7 @@ def stage_native_harbor_tasks(
     task_resources: dict[str, int] | None = None,
     agent_workdir: str | None = None,
     evaluator_skill_path: Path | None = None,
+    _baseline_alias_validation: _BaselineAliasValidation | None = None,
 ) -> list[Path]:
     """Stage native tasks privately, then publish one exact output snapshot."""
 
@@ -4642,7 +4734,20 @@ def stage_native_harbor_tasks(
                 task_resources=task_resources,
                 agent_workdir=agent_workdir,
                 evaluator_skill_path=private_skill_path,
+                _baseline_alias_validation=_baseline_alias_validation,
             )
+
+    baseline_aliases_prevalidated = False
+    if not with_skill and _baseline_alias_validation is not None:
+        if not _baseline_alias_validation_matches(
+            _baseline_alias_validation,
+            skill_path,
+            reference_skills_dir,
+            workspace_skill_paths,
+            repo_context_exclude_paths,
+        ):
+            raise ValueError("Run-scoped baseline alias validation does not match the requested source set")
+        baseline_aliases_prevalidated = True
 
     validate_output_provenance_key_location(
         skill_path,
@@ -4695,6 +4800,7 @@ def stage_native_harbor_tasks(
             pre_agent_setup=pre_agent_setup,
             task_resources=task_resources,
             agent_workdir=agent_workdir,
+            baseline_aliases_prevalidated=baseline_aliases_prevalidated,
         )
         relative_tasks = [task.relative_to(private_output) for task in private_tasks]
         if output_requires_provenance:
@@ -4752,6 +4858,7 @@ def _generate_harbor_tasks_into(
     pre_agent_setup: list[str] | None = None,
     task_resources: dict[str, int] | None = None,
     agent_workdir: str | None = None,
+    baseline_aliases_prevalidated: bool = False,
 ) -> list[Path]:
     """Generate Harbor task directories inside a private output directory.
 
@@ -4815,6 +4922,15 @@ def _generate_harbor_tasks_into(
     output_dir.mkdir(parents=True, exist_ok=True)
     task_dirs: list[str] = []
     task_paths: list[Path] = []
+    effective_excluded_roots = (*repo_context_exclude_paths, *private_repo_context_exclude_paths)
+    if not with_skill and not baseline_aliases_prevalidated:
+        _check_baseline_skill_candidates_do_not_alias_target(
+            skill_path,
+            reference_skills_dir,
+            workspace_skill_paths,
+            excluded_roots=effective_excluded_roots,
+        )
+        baseline_aliases_prevalidated = True
 
     for normalized_entry, case_id in prepared_entries:
         task_dir = safe_child(output_dir, case_id)
@@ -4868,8 +4984,9 @@ def _generate_harbor_tasks_into(
             repo_context_skill_path=skill_path,
             repo_context_mode="full" if copy_repo else "linked",
             compose_env_names=set(runtime_env or {}),
-            repo_context_exclude_paths=(*repo_context_exclude_paths, *private_repo_context_exclude_paths),
+            repo_context_exclude_paths=effective_excluded_roots,
             agent_workdir=agent_workdir,
+            baseline_aliases_prevalidated=baseline_aliases_prevalidated,
         )
 
         task_dirs.append(case_id)
@@ -5227,6 +5344,12 @@ def private_evaluator_skill_snapshot(
                 ignored.update(_NATIVE_SOURCE_IGNORE(current, names))
             return ignored
 
+        source_content_fingerprint = tree_content_fingerprint_secure(
+            source_evals_dir,
+            ignore=_ignore_unselected_evaluator_paths,
+            allowed_root=source_evals_dir,
+        )
+
         copytree_secure(
             source_evals_dir,
             evaluator_skill_path / "evals",
@@ -5239,6 +5362,9 @@ def private_evaluator_skill_snapshot(
             bind_full_evidence_sources=bind_full_evidence_sources,
         )
         if copied_selection.signature != selection.signature:
+            raise ValueError("Evaluator source selection changed while its private snapshot was created")
+        copied_content_fingerprint = tree_content_fingerprint_secure(evaluator_skill_path / "evals")
+        if copied_content_fingerprint != source_content_fingerprint:
             raise ValueError("Evaluator source selection changed while its private snapshot was created")
         yield evaluator_skill_path
 
@@ -5262,6 +5388,7 @@ def generate_harbor_tasks(
     task_resources: dict[str, int] | None = None,
     agent_workdir: str | None = None,
     evaluator_skill_path: Path | None = None,
+    _baseline_alias_validation: _BaselineAliasValidation | None = None,
 ) -> list[Path]:
     """Generate tasks from one private evals snapshot, then publish exactly."""
 
@@ -5287,9 +5414,22 @@ def generate_harbor_tasks(
                 task_resources=task_resources,
                 agent_workdir=agent_workdir,
                 evaluator_skill_path=private_skill_path,
+                _baseline_alias_validation=_baseline_alias_validation,
             )
     if find_evals_file(evaluator_skill_path) is None:
         raise FileNotFoundError(f"No evals dataset found in {evaluator_skill_path / 'evals'}")
+
+    baseline_aliases_prevalidated = False
+    if not with_skill and _baseline_alias_validation is not None:
+        if not _baseline_alias_validation_matches(
+            _baseline_alias_validation,
+            skill_path,
+            reference_skills_dir,
+            workspace_skill_paths,
+            repo_context_exclude_paths,
+        ):
+            raise ValueError("Run-scoped baseline alias validation does not match the requested source set")
+        baseline_aliases_prevalidated = True
 
     validate_output_provenance_key_location(
         skill_path,
@@ -5342,6 +5482,7 @@ def generate_harbor_tasks(
             pre_agent_setup=pre_agent_setup,
             task_resources=task_resources,
             agent_workdir=agent_workdir,
+            baseline_aliases_prevalidated=baseline_aliases_prevalidated,
         )
         relative_tasks = [task.relative_to(private_output) for task in private_tasks]
         if output_requires_provenance:

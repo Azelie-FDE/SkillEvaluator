@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import stat
 import subprocess
 from contextlib import suppress
@@ -15,12 +16,16 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from skillevaluator.tier3.output_provenance import GENERATED_OUTPUT_MARKER
+from skillevaluator.tier3.output_provenance import GENERATED_OUTPUT_MARKER, is_generated_output_root
 from skillevaluator.utils.secure_fs import SecurePathError, SecureRoot
 
 ENV_RESULTS_DIR = "SKILLEVALUATOR_RESULTS_DIR"
 
 _RUN_TIMESTAMP_FORMATS = (("%Y%m%d_%H%M%S", 15), ("%Y-%m-%d_%H%M%S", 17))
+# Pre-provenance releases emitted exact timestamp names. The collision-safe
+# PID/UUID suffix and run-level marker were introduced together, so a suffix is
+# a reliable format boundary and must never fall back to the historical parser.
+_CURRENT_RUN_SUFFIX = re.compile(r"_[1-9][0-9]{0,19}_[0-9a-f]{12}\Z")
 
 # A current completed run carries ``run_config.json`` plus an atomically
 # written ``result.json`` whose run identity matches its directory. Historical
@@ -32,6 +37,10 @@ _FINAL_RESULT_ARTIFACT = "result.json"
 # The writer emits a small enumeration; this generous cap rejects pathological
 # metadata without relying on Python's bounded decimal-to-int conversion.
 _MAX_LEGACY_OCCURRENCE_DIGITS = 32
+_CURRENT_BASE_IMAGE_MODES = frozenset({"reuse", "rebuild", "disabled"})
+_CURRENT_GRADING_MODES = frozenset({"default", "default_plus_custom", "custom_only"})
+_CURRENT_EXECUTION_STATUSES = frozenset({"succeeded", "failed", "skipped"})
+_PATH_DESCRIPTOR_IDENTITIES_COMPARABLE = os.name == "posix"
 # These runtime-owned directories predate canonical run-level ``result.json``;
 # ``staged/`` arrived with that artifact and is intentionally not legacy-safe.
 _LEGACY_RUNTIME_SIDECAR_DIRS = frozenset({"harbor-run-logs", "astra-cleanup"})
@@ -112,18 +121,25 @@ def iter_candidate_results_roots(
     return roots
 
 
-def _run_timestamp(name: str) -> datetime | None:
-    """Parse the timestamp prefix shared by current and legacy run names."""
+def _run_timestamp_parts(name: str) -> tuple[datetime, str] | None:
+    """Parse a supported run timestamp and return its remaining suffix."""
     for timestamp_format, prefix_length in _RUN_TIMESTAMP_FORMATS:
         prefix = name[:prefix_length]
         suffix = name[prefix_length:]
         if suffix and not suffix.startswith("_"):
             continue
         try:
-            return datetime.strptime(prefix, timestamp_format)  # noqa: DTZ007 -- run names have no timezone
+            timestamp = datetime.strptime(prefix, timestamp_format)  # noqa: DTZ007 -- run names have no timezone
         except ValueError:
             continue
+        return timestamp, suffix
     return None
+
+
+def _run_timestamp(name: str) -> datetime | None:
+    """Parse the timestamp prefix shared by current and legacy run names."""
+    parsed = _run_timestamp_parts(name)
+    return parsed[0] if parsed is not None else None
 
 
 def _path_is_link_or_reparse(path: Path, metadata: os.stat_result) -> bool:
@@ -157,27 +173,52 @@ def _is_single_link_regular(path: Path, metadata: os.stat_result) -> bool:
     return not _path_is_link_or_reparse(path, metadata) and stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
 
 
-def _read_stable_json(
+def _read_stable_bytes(
     secure_root: SecureRoot,
     path: Path,
     before: os.stat_result,
-) -> tuple[object, os.stat_result, bytes] | None:
-    """Read one JSON artifact through the pinned run root."""
+) -> tuple[os.stat_result, bytes] | None:
+    """Read one regular artifact through the pinned run root."""
     if not _is_single_link_regular(path, before):
         return None
     try:
         relative_path = path.absolute().relative_to(secure_root.root)
         raw, opened = secure_root.read_bytes(relative_path, before.st_size, expected=before)
         after = path.lstat()
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, OSError, SecurePathError, ValueError):
+    except (OSError, SecurePathError, ValueError):
         return None
-    if (
-        not _is_single_link_regular(path, after)
-        or _node_fingerprint(opened) != _node_fingerprint(before)
-        or _node_fingerprint(after) != _node_fingerprint(opened)
-        or len(raw) != opened.st_size
-    ):
+    if not _is_single_link_regular(path, after) or len(raw) != opened.st_size:
+        return None
+    if _PATH_DESCRIPTOR_IDENTITIES_COMPARABLE:
+        if _node_fingerprint(opened) != _node_fingerprint(before) or _node_fingerprint(after) != _node_fingerprint(
+            opened
+        ):
+            return None
+        stable_metadata = opened
+    else:
+        # Windows path ``lstat`` and CRT descriptor ``fstat`` expose
+        # incompatible identity fields. ``SecureRoot._open_windows`` pins the
+        # native handle and validates the declared name before the read, so the
+        # caller completes that proof with same-family path snapshots here.
+        if _node_fingerprint(after) != _node_fingerprint(before) or len(raw) != after.st_size:
+            return None
+        stable_metadata = after
+    return stable_metadata, raw
+
+
+def _read_stable_json(
+    secure_root: SecureRoot,
+    path: Path,
+    before: os.stat_result,
+) -> tuple[object, os.stat_result, bytes] | None:
+    """Read one JSON artifact through the pinned run root."""
+    observed = _read_stable_bytes(secure_root, path, before)
+    if observed is None:
+        return None
+    opened, raw = observed
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return None
     return payload, opened, raw
 
@@ -192,11 +233,156 @@ def _artifact_snapshot_is_unchanged(
         current_metadata = path.lstat()
     except OSError:
         return False
-    observed = _read_stable_json(secure_root, path, current_metadata)
+    observed = _read_stable_bytes(secure_root, path, current_metadata)
     return bool(
         observed is not None
-        and observed[2] == expected_raw
-        and _node_fingerprint(observed[1]) == _node_fingerprint(expected_metadata)
+        and observed[1] == expected_raw
+        and _node_fingerprint(observed[0]) == _node_fingerprint(expected_metadata)
+    )
+
+
+def _recorded_path_matches(recorded: object, expected: Path) -> bool:
+    """Match absolute paths canonically and relative paths by safe suffix."""
+    if not isinstance(recorded, str) or not recorded:
+        return False
+    try:
+        recorded_path = Path(recorded).expanduser()
+        expected_path = expected.expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):
+        return False
+    if recorded_path.is_absolute():
+        try:
+            return recorded_path.resolve(strict=False) == expected_path
+        except (OSError, RuntimeError):
+            return False
+    if not recorded_path.parts or any(part == ".." for part in recorded_path.parts):
+        return False
+    recorded_parts = tuple(os.path.normcase(part) for part in recorded_path.parts if part != ".")
+    expected_parts = tuple(os.path.normcase(part) for part in expected_path.parts)
+    return (
+        bool(recorded_parts)
+        and len(recorded_parts) <= len(expected_parts)
+        and expected_parts[-len(recorded_parts) :] == recorded_parts
+    )
+
+
+def _is_non_bool_int(value: object, *, minimum: int = 0) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+
+
+def _is_finite_number(value: object, *, minimum: float | None = None, maximum: float | None = None) -> bool:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    try:
+        numeric = float(value)
+    except (OverflowError, ValueError):
+        return False
+    if not math.isfinite(numeric):
+        return False
+    return (minimum is None or numeric >= minimum) and (maximum is None or numeric <= maximum)
+
+
+def _is_string_list(value: object) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _score_mapping_is_valid(value: object) -> bool:
+    return isinstance(value, dict) and all(
+        isinstance(metric, str) and bool(metric) and _is_finite_number(score) for metric, score in value.items()
+    )
+
+
+def _current_agent_result_is_valid(
+    candidate: Path,
+    agent: str,
+    configured: dict[object, object],
+    payload: object,
+) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    model = configured.get("model")
+    source = configured.get("source")
+    model_resolution = payload.get("model_resolution")
+    if (
+        payload.get("model") != model
+        or payload.get("model_source") != source
+        or not isinstance(model_resolution, dict)
+        or model_resolution.get("model") != model
+        or model_resolution.get("source") != source
+    ):
+        return False
+    for field in ("with_skill", "without_skill", "custom_with_skill", "custom_without_skill"):
+        if not _score_mapping_is_valid(payload.get(field)):
+            return False
+    for field in (
+        "dimensions_with_skill",
+        "dimensions_without_skill",
+        "lift",
+        "custom_lift",
+        "security_attribution",
+        "conditions",
+    ):
+        if not isinstance(payload.get(field), dict):
+            return False
+    pass_at_k = payload.get("pass_at_k")
+    if not isinstance(pass_at_k, dict) or any(
+        not isinstance(pass_at_k.get(condition), dict) for condition in ("with_skill", "without_skill", "lift")
+    ):
+        return False
+    for field in ("agent_runtime_failures", "trial_failures"):
+        failures = payload.get(field)
+        if not isinstance(failures, dict) or any(
+            not isinstance(failures.get(condition), list) for condition in ("with_skill", "without_skill")
+        ):
+            return False
+    job_failures = payload.get("job_failures")
+    if not isinstance(job_failures, dict) or any(
+        not isinstance(job_failures.get(condition), str) for condition in ("with_skill", "without_skill")
+    ):
+        return False
+    if payload.get("execution_status") not in _CURRENT_EXECUTION_STATUSES or not _is_string_list(
+        payload.get("execution_errors")
+    ):
+        return False
+    if any(
+        not _is_non_bool_int(payload.get(field))
+        for field in ("expected_attempts", "scored_attempts", "num_trials_with", "num_trials_without")
+    ):
+        return False
+    return _recorded_path_matches(payload.get("output_dir"), candidate / agent)
+
+
+def _current_result_identity_is_valid(candidate: Path, run_config: dict[object, object], result: object) -> bool:
+    """Validate identities emitted together for an authenticated current run."""
+    if not isinstance(result, dict) or result.get("run_id") != candidate.name or result.get("run_config") != run_config:
+        return False
+    configured_agents = _current_run_config_agents(run_config)
+    result_agents = result.get("agents")
+    if configured_agents is None or not isinstance(result_agents, dict) or set(result_agents) != set(configured_agents):
+        return False
+    if not all(
+        _current_agent_result_is_valid(candidate, agent, configured_agents[agent], result_agents[agent])
+        for agent in configured_agents
+    ):
+        return False
+    attempt_policy = result.get("attempt_policy")
+    if (
+        not isinstance(result.get("skill_name"), str)
+        or not result["skill_name"]
+        or result.get("execution_status") not in _CURRENT_EXECUTION_STATUSES
+        or not _is_string_list(result.get("execution_errors"))
+        or result.get("report_status") not in {"complete", "degraded"}
+        or not _is_finite_number(result.get("duration_seconds"), minimum=0)
+        or not isinstance(attempt_policy, dict)
+        or not _is_non_bool_int(attempt_policy.get("max_attempts"), minimum=1)
+        or not _is_finite_number(attempt_policy.get("pass_threshold"), minimum=0, maximum=1)
+        or not isinstance(attempt_policy.get("stop_on_pass"), bool)
+        or not isinstance(attempt_policy.get("score_definition"), str)
+        or not attempt_policy["score_definition"]
+    ):
+        return False
+    return _recorded_path_matches(result.get("run_dir"), candidate) and _recorded_path_matches(
+        result.get("result_path"), candidate / _FINAL_RESULT_ARTIFACT
     )
 
 
@@ -240,13 +426,53 @@ def _legacy_run_agents(payload: object) -> tuple[str, ...] | None:
     return tuple(sorted(normalized))
 
 
-def _is_finite_number(value: object) -> bool:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return False
-    try:
-        return math.isfinite(value)
-    except OverflowError:
-        return False
+def _current_run_config_agents(payload: object) -> dict[str, dict[object, object]] | None:
+    """Return agent metadata only for the complete current runner config schema."""
+    expected_agents = _legacy_run_agents(payload)
+    if expected_agents is None or not isinstance(payload, dict):
+        return None
+    config_file = payload.get("config_file")
+    harbor = payload.get("harbor")
+    provider = payload.get("provider")
+    grading = payload.get("grading")
+    agents = payload.get("agents")
+    if (
+        not isinstance(config_file, str)
+        or not config_file
+        or not isinstance(harbor, dict)
+        or not isinstance(provider, dict)
+        or not isinstance(grading, dict)
+        or not isinstance(agents, dict)
+    ):
+        return None
+    environment = harbor.get("environment")
+    if (
+        not isinstance(environment, dict)
+        or not isinstance(environment.get("value"), str)
+        or not environment["value"]
+        or not isinstance(environment.get("source"), str)
+        or not environment["source"]
+        or not _is_non_bool_int(harbor.get("n_attempts"), minimum=1)
+        or not isinstance(harbor.get("stop_on_pass"), bool)
+        or not _is_non_bool_int(harbor.get("n_concurrent"), minimum=1)
+        or not _is_finite_number(harbor.get("timeout_multiplier"), minimum=0)
+        or harbor.get("timeout_multiplier") == 0
+        or harbor.get("base_image_mode") not in _CURRENT_BASE_IMAGE_MODES
+        or not isinstance(harbor.get("jobs_retained"), bool)
+        or not isinstance(provider.get("name"), str)
+        or not provider["name"]
+        or not isinstance(provider.get("model"), str)
+        or not provider["model"]
+        or grading.get("mode") not in _CURRENT_GRADING_MODES
+    ):
+        return None
+    normalized: dict[str, dict[object, object]] = {}
+    for agent in expected_agents:
+        metadata = agents.get(agent)
+        if not isinstance(metadata, dict) or metadata.get("agent") != agent:
+            return None
+        normalized[agent] = metadata
+    return normalized
 
 
 def _is_nonnegative_int(value: object) -> bool:
@@ -591,11 +817,11 @@ def run_directory_sort_key(
 ) -> tuple[datetime, int, str] | None:
     """Return shared ordering metadata for one result directory.
 
-    Timestamped runs are accepted when they carry either a valid final result
-    matching the directory's run ID or the stricter pre-result legacy contract,
-    and are ordered by parsed timestamp, completion mtime, then name. Compare
-    also keeps accepting summary-only non-timestamp directories, placing them
-    behind timestamped runs.
+    Exact-timestamp historical runs retain the prior result or pre-result
+    summary contracts. Collision-safe suffixed runs require their path-bound
+    generated-output marker plus matching result/config identities. Accepted
+    runs are ordered by parsed timestamp, completion mtime, then name. Compare
+    also keeps summary-only non-timestamp directories behind timestamped runs.
     """
     if candidate.name.startswith((".", "_")) or candidate.name == "latest":
         return None
@@ -606,15 +832,27 @@ def run_directory_sort_key(
     except OSError:
         return None
 
-    timestamp = _run_timestamp(candidate.name)
-    if timestamp is None:
+    parsed_run_name = _run_timestamp_parts(candidate.name)
+    if parsed_run_name is None:
         if require_completed_result:
             return None
         return datetime.min, -1, candidate.name  # noqa: DTZ901 -- legacy names have no timezone
+    timestamp, suffix = parsed_run_name
+    is_current_run = bool(suffix)
+    if is_current_run and _CURRENT_RUN_SUFFIX.fullmatch(suffix) is None:
+        return None
 
     try:
         snapshots: list[tuple[Path, bytes, os.stat_result]] = []
         with SecureRoot(candidate, expected=candidate_metadata) as secure_root:
+            if is_current_run:
+                marker_path = candidate / GENERATED_OUTPUT_MARKER
+                marker_metadata = marker_path.lstat()
+                observed_marker = _read_stable_bytes(secure_root, marker_path, marker_metadata)
+                if observed_marker is None or not is_generated_output_root(candidate):
+                    return None
+                snapshots.append((marker_path, observed_marker[1], observed_marker[0]))
+
             run_config_path = candidate / _RUN_COMPLETION_ARTIFACTS[0]
             run_config_metadata = run_config_path.lstat()
             observed_run_config = _read_stable_json(secure_root, run_config_path, run_config_metadata)
@@ -643,7 +881,10 @@ def run_directory_sort_key(
                 if observed_result is None:
                     return None
                 result = observed_result[0]
-                if not isinstance(result, dict) or result.get("run_id") != candidate.name:
+                if is_current_run:
+                    if not _current_result_identity_is_valid(candidate, observed_run_config[0], result):
+                        return None
+                elif not isinstance(result, dict) or result.get("run_id") != candidate.name:
                     return None
                 snapshots.append((result_path, observed_result[2], observed_result[1]))
                 completion_mtime = observed_result[1].st_mtime_ns
@@ -656,7 +897,7 @@ def run_directory_sort_key(
             candidate_after
         ) != _node_fingerprint(candidate_metadata):
             return None
-    except (OSError, SecurePathError):
+    except (OSError, SecurePathError, ValueError):
         return None
     return timestamp, completion_mtime, candidate.name
 

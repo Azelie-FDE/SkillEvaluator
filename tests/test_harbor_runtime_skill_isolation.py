@@ -8,10 +8,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -722,15 +724,21 @@ def test_prebuild_uses_each_tasks_exact_environment(
     assert task_tags["case-a"] != task_tags["case-b"]
 
     first_build_tags = {path.parent.name: tag for tag, path in build_calls}
-    (dataset / "case-a" / "environment" / "input" / "fixture.txt").chmod(0o755)
-    for task in dataset.iterdir():
-        (task / "task.toml").write_text("[environment]\n", encoding="utf-8")
-    build_calls.clear()
+    fixture_path = dataset / "case-a" / "environment" / "input" / "fixture.txt"
+    original_mode = stat.S_IMODE(fixture_path.stat().st_mode)
+    changed_mode = original_mode & ~stat.S_IWRITE if os.name == "nt" else original_mode | stat.S_IXUSR
+    try:
+        fixture_path.chmod(changed_mode)
+        for task in dataset.iterdir():
+            (task / "task.toml").write_text("[environment]\n", encoding="utf-8")
+        build_calls.clear()
 
-    assert prebuild_task_environments([dataset]) == 2
-    second_build_tags = {path.parent.name: tag for tag, path in build_calls}
-    assert second_build_tags["case-a"] != first_build_tags["case-a"]
-    assert second_build_tags["case-b"] == first_build_tags["case-b"]
+        assert prebuild_task_environments([dataset]) == 2
+        second_build_tags = {path.parent.name: tag for tag, path in build_calls}
+        assert second_build_tags["case-a"] != first_build_tags["case-a"]
+        assert second_build_tags["case-b"] == first_build_tags["case-b"]
+    finally:
+        fixture_path.chmod(original_mode)
 
 
 def test_prebuild_skips_task_with_compose_build_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -3039,6 +3047,193 @@ def test_selective_evaluator_snapshot_rejects_fixture_selection_change_during_co
         pass
 
     assert mutated
+
+
+@pytest.mark.parametrize(
+    ("task_source", "selected_relative"),
+    [
+        ("evals_json", Path("files/selected.txt")),
+        ("evals_json", Path("grader.py")),
+        ("evals_json", Path("environment/sidecar/seed.txt")),
+        ("native_harbor", Path("harbor/case-001/instruction.md")),
+    ],
+)
+def test_selective_evaluator_snapshot_rejects_selected_content_change_during_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    task_source: str,
+    selected_relative: Path,
+) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    if task_source == "native_harbor":
+        _write_minimal_native_task(target)
+    selected_path = target / "evals" / selected_relative
+    original_copytree = adapter_module.copytree_secure
+    mutated = False
+
+    def mutate_content_then_copy(source: Path, destination: Path, *args: object, **kwargs: object) -> None:
+        nonlocal mutated
+        if Path(source) == target / "evals" and not mutated:
+            selected_path.write_text(selected_path.read_text(encoding="utf-8") + "MUTATED\n", encoding="utf-8")
+            mutated = True
+        original_copytree(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(adapter_module, "copytree_secure", mutate_content_then_copy)
+
+    with (
+        pytest.raises(ValueError, match="selection changed"),
+        private_evaluator_skill_snapshot(target, task_source=task_source),
+    ):
+        pass
+
+    assert mutated
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX executable mode semantics")
+def test_selective_evaluator_snapshot_rejects_selected_mode_change_during_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    script = target / "evals" / "environment" / "run.sh"
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    script.chmod(0o644)
+    original_copytree = adapter_module.copytree_secure
+    mutated = False
+
+    def mutate_mode_then_copy(source: Path, destination: Path, *args: object, **kwargs: object) -> None:
+        nonlocal mutated
+        if Path(source) == target / "evals" and not mutated:
+            script.chmod(0o755)
+            mutated = True
+        original_copytree(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(adapter_module, "copytree_secure", mutate_mode_then_copy)
+
+    with (
+        pytest.raises(ValueError, match="selection changed"),
+        private_evaluator_skill_snapshot(target, task_source="evals_json"),
+    ):
+        pass
+
+    assert mutated
+
+
+def test_evaluator_read_accepts_windows_crt_descriptor_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evals = tmp_path / "evals"
+    evals.mkdir()
+    dataset = evals / "evals.json"
+    dataset.write_text("[]\n", encoding="utf-8")
+    original_read_bytes = adapter_module.SecureRoot.read_bytes
+
+    def read_with_windows_crt_identity(
+        secure_root: adapter_module.SecureRoot,
+        relative_path: Path,
+        max_bytes: int,
+        *,
+        expected: os.stat_result | None = None,
+    ) -> tuple[bytes, object]:
+        raw, opened = original_read_bytes(secure_root, relative_path, max_bytes, expected=expected)
+        return raw, SimpleNamespace(
+            st_dev=opened.st_dev + 10_000,
+            st_ino=opened.st_ino + 10_000,
+            st_mode=opened.st_mode,
+            st_nlink=opened.st_nlink,
+            st_size=opened.st_size,
+            st_mtime_ns=opened.st_mtime_ns,
+            st_ctime_ns=opened.st_ctime_ns,
+        )
+
+    monkeypatch.setattr(adapter_module, "_PATH_DESCRIPTOR_IDENTITIES_COMPARABLE", False, raising=False)
+    monkeypatch.setattr(adapter_module.SecureRoot, "read_bytes", read_with_windows_crt_identity)
+
+    assert adapter_module._read_regular_evals_file(dataset, allowed_root=evals) == b"[]\n"
+
+
+@pytest.mark.parametrize("task_source", ["evals_json", "native_harbor"])
+def test_baseline_alias_candidates_are_scanned_once_per_multi_case_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    task_source: str,
+) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    entries = [
+        {
+            "id": f"case-{index:03d}",
+            "question": f"Run case {index}.",
+            "files": ["evals/files/selected.txt"],
+        }
+        for index in range(1, 4)
+    ]
+    (target / "evals" / "evals.json").write_text(json.dumps(entries), encoding="utf-8")
+    if task_source == "native_harbor":
+        for entry in entries:
+            native_task = target / "evals" / "harbor" / entry["id"]
+            native_task.mkdir(parents=True)
+            (native_task / "instruction.md").write_text("Run the native case.\n", encoding="utf-8")
+            (native_task / "task.toml").write_text(
+                'schema_version = "1.3"\n\n[task]\n'
+                f'name = "nvidia/{entry["id"]}"\n\n'
+                f'[metadata]\nentry_id = "{entry["id"]}"\n\n[environment]\n',
+                encoding="utf-8",
+            )
+
+    scans = 0
+
+    def count_scan(*args: object, **kwargs: object) -> None:
+        nonlocal scans
+        scans += 1
+
+    monkeypatch.setattr(adapter_module, "_check_baseline_skill_candidates_do_not_alias_target", count_scan)
+    stager = generate_harbor_tasks if task_source == "evals_json" else stage_native_harbor_tasks
+
+    tasks = stager(target, tmp_path / f"{task_source}-scan-count", with_skill=False)
+
+    assert len(tasks) == 3
+    assert scans == 1
+
+
+def test_run_scoped_baseline_alias_validation_skips_rescan_and_is_path_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, target, references_dir, workspace = _write_projection_fixture(tmp_path)
+    excluded_root = target / "evals" / "results"
+    validation = adapter_module._prevalidate_baseline_skill_candidates(
+        target,
+        references_dir,
+        [workspace],
+        excluded_roots=(excluded_root,),
+    )
+
+    def reject_rescan(*args: object, **kwargs: object) -> None:
+        raise AssertionError("run-scoped validation should suppress repeated source scans")
+
+    monkeypatch.setattr(adapter_module, "_check_baseline_skill_candidates_do_not_alias_target", reject_rescan)
+    tasks = generate_harbor_tasks(
+        target,
+        tmp_path / "validated-baseline",
+        with_skill=False,
+        reference_skills_dir=references_dir,
+        workspace_skill_paths=[workspace],
+        repo_context_exclude_paths=(excluded_root,),
+        _baseline_alias_validation=validation,
+    )
+
+    assert len(tasks) == 1
+    with pytest.raises(ValueError, match="does not match"):
+        generate_harbor_tasks(
+            target,
+            tmp_path / "mismatched-validation",
+            with_skill=False,
+            reference_skills_dir=references_dir,
+            workspace_skill_paths=[],
+            repo_context_exclude_paths=(excluded_root,),
+            _baseline_alias_validation=validation,
+        )
 
 
 def test_in_repo_temp_evaluator_snapshot_is_excluded_from_copy_repo(
