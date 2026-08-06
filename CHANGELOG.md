@@ -41,6 +41,10 @@ All notable changes to SkillEvaluator are documented in this file.
 
 ### Changed
 
+- Reduced pull-request runner use for changes confined to `docs/**` and
+  `fern/**`: DCO, Gitleaks, and pinned Fern validation still run, while mixed
+  and non-docs changes retain the complete Linux, macOS, Windows, packaging,
+  and security matrix.
 - Simplified the repository README into a concise documentation landing page,
   retained a compact keyless `validate` quickstart, LLM-provider setup, and a
   one-command `validate --full` path through all three tiers, broadened the
