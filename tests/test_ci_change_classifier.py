@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -41,8 +42,14 @@ def git_repo(tmp_path: Path) -> tuple[Path, str]:
     ("paths", "expected"),
     [
         ([b"docs/index.mdx"], True),
+        ([b"fern/fern.config.json"], True),
         ([b"fern/docs.yml", b"docs/assets/logo.svg"], True),
+        ([b"docs"], False),
+        ([b"fern"], False),
+        ([b"docs-old/index.mdx"], False),
+        ([b"fernicious/docs.yml"], False),
         ([b"README.md"], False),
+        ([b"CHANGELOG.md"], False),
         ([b"src/skillevaluator/tier3/reference_skills/demo/SKILL.md"], False),
         ([b"tests/golden/benchmark_tier1.md"], False),
         ([b"docs/index.mdx", b"src/skillevaluator/cli.py"], False),
@@ -66,6 +73,11 @@ def test_is_docs_only(paths: list[bytes], expected: bool) -> None:
             b"C075\0docs/source.mdx\0fern/copied.yml\0",
             [b"docs/source.mdx", b"fern/copied.yml"],
         ),
+        (
+            b"M\0docs/file with spaces.mdx\0M\0docs/line\nbreak.mdx\0",
+            [b"docs/file with spaces.mdx", b"docs/line\nbreak.mdx"],
+        ),
+        (b"M\0docs/non-utf8-\xff.mdx\0", [b"docs/non-utf8-\xff.mdx"]),
         (b"", []),
     ],
 )
@@ -161,6 +173,50 @@ def test_main_checks_both_sides_of_a_rename(
     assert (tmp_path / "github-output").read_text(encoding="utf-8") == "docs_only=false\n"
 
 
+def test_main_treats_a_rename_within_docs_as_docs_only(
+    git_repo: tuple[Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, base = git_repo
+    _git(repo, "mv", "docs/index.mdx", "docs/renamed.mdx")
+    head = _commit(repo, "rename within docs")
+
+    assert _classify(repo, base, head, tmp_path / "github-output", monkeypatch) == 0
+    assert (tmp_path / "github-output").read_text(encoding="utf-8") == "docs_only=true\n"
+
+
+def test_main_checks_the_source_of_a_rename_into_docs(
+    git_repo: tuple[Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, base = git_repo
+    _git(repo, "mv", "README.md", "docs/readme.mdx")
+    head = _commit(repo, "rename into docs")
+
+    assert _classify(repo, base, head, tmp_path / "github-output", monkeypatch) == 0
+    assert (tmp_path / "github-output").read_text(encoding="utf-8") == "docs_only=false\n"
+
+
+def test_main_uses_the_merge_base_when_the_base_branch_advances(
+    git_repo: tuple[Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, original_base = git_repo
+    _git(repo, "checkout", "--quiet", "-b", "feature")
+    (repo / "docs" / "index.mdx").write_text("feature docs\n", encoding="utf-8")
+    feature_head = _commit(repo, "feature docs")
+
+    _git(repo, "checkout", "--quiet", "--detach", original_base)
+    (repo / "source.py").write_text("base advanced\n", encoding="utf-8")
+    advanced_base = _commit(repo, "advance base")
+
+    assert _classify(repo, advanced_base, feature_head, tmp_path / "github-output", monkeypatch) == 0
+    assert (tmp_path / "github-output").read_text(encoding="utf-8") == "docs_only=true\n"
+
+
 @pytest.mark.parametrize("revision", ["0" * 40, "not-a-sha"])
 def test_main_fails_closed_for_invalid_revisions(
     git_repo: tuple[Path, str],
@@ -196,3 +252,63 @@ def test_main_fails_closed_for_an_empty_diff(
     assert captured.out == "docs_only=false\n"
     assert "no changed paths" in captured.err
     assert output.read_text(encoding="utf-8") == "existing=value\ndocs_only=false\n"
+
+
+def test_main_fails_closed_outside_a_git_repository(
+    git_repo: tuple[Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _, head = git_repo
+    output = tmp_path / "github-output"
+
+    assert _classify(tmp_path / "missing-repo", head, head, output, monkeypatch) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out == "docs_only=false\n"
+    assert "falling back to full CI" in captured.err
+    assert output.read_text(encoding="utf-8") == "docs_only=false\n"
+
+
+def test_cli_classifies_a_real_fern_only_diff(git_repo: tuple[Path, str], tmp_path: Path) -> None:
+    repo, base = git_repo
+    (repo / "fern").mkdir()
+    (repo / "fern" / "docs.yml").write_text("navigation: []\n", encoding="utf-8")
+    head = _commit(repo, "fern docs")
+    output = tmp_path / "github-output"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve().parents[1] / "scripts" / "classify_ci_changes.py"),
+            "--repo",
+            str(repo),
+            "--base",
+            base,
+            "--head",
+            head,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={"GITHUB_OUTPUT": str(output)},
+    )
+
+    assert result.stdout == "docs_only=true\n"
+    assert result.stderr == ""
+    assert output.read_text(encoding="utf-8") == "docs_only=true\n"
+
+
+def test_output_write_failure_is_not_silently_downgraded(
+    git_repo: tuple[Path, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, base = git_repo
+    (repo / "docs" / "index.mdx").write_text("updated\n", encoding="utf-8")
+    head = _commit(repo, "docs")
+    monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path))
+
+    with pytest.raises(OSError):
+        main(["--repo", str(repo), "--base", base, "--head", head])

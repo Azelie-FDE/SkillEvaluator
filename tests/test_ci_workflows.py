@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -22,9 +23,14 @@ REQUIRED_CI_JOBS = {
     "native-windows-local-mode": "Native Windows local mode fails closed",
 }
 HEAVY_CI_JOBS = set(REQUIRED_CI_JOBS) - {"test-python-312"}
-FULL_LANE_IF = "${{ always() && needs.classify-changes.outputs.docs_only != 'true' }}"
+RUN_UNLESS_CANCELLED_IF = "${{ !cancelled() }}"
+FULL_LANE_IF = "${{ !cancelled() && needs.classify-changes.outputs.docs_only != 'true' }}"
 DOCS_ONLY_IF = "${{ needs.classify-changes.outputs.docs_only == 'true' }}"
 NOT_DOCS_ONLY_IF = "${{ needs.classify-changes.outputs.docs_only != 'true' }}"
+PR_CONCURRENCY = {
+    "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}",
+    "cancel-in-progress": "true",
+}
 
 
 def _load(name: str) -> dict[str, Any]:
@@ -42,6 +48,14 @@ def _runs(job: dict[str, Any]) -> str:
     return "\n".join(step.get("run", "") for step in job["steps"])
 
 
+def _all_uses(workflow: dict[str, Any]) -> list[str]:
+    return [step["uses"] for job in workflow["jobs"].values() for step in job.get("steps", []) if "uses" in step]
+
+
+def _all_steps(workflow: dict[str, Any]) -> list[dict[str, Any]]:
+    return [step for job in workflow["jobs"].values() for step in job.get("steps", [])]
+
+
 def test_ci_preserves_required_contexts_as_explicit_jobs() -> None:
     ci = _load("ci.yml")
 
@@ -51,12 +65,15 @@ def test_ci_preserves_required_contexts_as_explicit_jobs() -> None:
 
 
 def test_ci_classifier_is_pull_request_only_and_exports_docs_only() -> None:
-    classifier = _load("ci.yml")["jobs"]["classify-changes"]
+    ci = _load("ci.yml")
+    classifier = ci["jobs"]["classify-changes"]
 
+    assert ci["concurrency"] == PR_CONCURRENCY
     assert classifier["name"] == "Classify changes"
     assert classifier["if"] == "${{ github.event_name == 'pull_request' }}"
     assert classifier["outputs"]["docs_only"] == "${{ steps.changes.outputs.docs_only }}"
     assert classifier["steps"][0]["with"]["fetch-depth"] == "0"
+    assert classifier["steps"][0]["with"]["persist-credentials"] == "false"
     assert classifier["steps"][1]["id"] == "changes"
     assert "scripts/classify_ci_changes.py" in classifier["steps"][1]["run"]
     assert classifier["steps"][1]["run"].startswith("python3 ")
@@ -70,21 +87,21 @@ def test_ci_docs_lane_uses_the_required_python_312_context() -> None:
     job = _load("ci.yml")["jobs"]["test-python-312"]
 
     assert job["needs"] == "classify-changes"
-    assert job["if"] == "${{ always() }}"
+    assert job["if"] == RUN_UNLESS_CANCELLED_IF
     assert job["runs-on"] == "ubuntu-latest"
-    assert all(
-        step.get("if") == NOT_DOCS_ONLY_IF
-        for step in job["steps"]
-        if step.get("name")
-        in {
-            "Set up Python",
-            "Set up uv",
-            "Install dependencies",
-            "Scan OSS source boundary",
-            "Lint",
-            "Run tests with coverage",
-        }
-    )
+    assert job["steps"][0]["with"]["persist-credentials"] == "false"
+
+    full_lane_step_names = {
+        "Set up Python",
+        "Set up uv",
+        "Install dependencies",
+        "Scan OSS source boundary",
+        "Lint",
+        "Run tests with coverage",
+    }
+    full_lane_steps = {step.get("name"): step for step in job["steps"] if step.get("name") in full_lane_step_names}
+    assert set(full_lane_steps) == full_lane_step_names
+    assert all(step["if"] == NOT_DOCS_ONLY_IF for step in full_lane_steps.values())
 
     node_step = next(step for step in job["steps"] if step.get("name") == "Set up Node.js for docs")
     docs_step = next(step for step in job["steps"] if step.get("name") == "Validate Fern documentation")
@@ -128,17 +145,20 @@ def test_security_keeps_gitleaks_always_on_and_skips_only_nonessential_jobs() ->
     jobs = security["jobs"]
 
     _assert_no_path_filter(security)
+    assert security["concurrency"] == PR_CONCURRENCY
     assert "if" not in jobs["gitleaks"]
     assert "needs" not in jobs["gitleaks"]
     assert jobs["classify-changes"]["if"] == "${{ github.event_name == 'pull_request' }}"
     assert jobs["classify-changes"]["outputs"]["docs_only"] == "${{ steps.changes.outputs.docs_only }}"
+    assert jobs["classify-changes"]["steps"][0]["with"]["persist-credentials"] == "false"
     assert jobs["classify-changes"]["steps"][1]["run"].startswith("python3 ")
 
     dependency_if = " ".join(jobs["dependency-review"]["if"].split())
     codeql_if = " ".join(jobs["codeql"]["if"].split())
     for job_id in ("dependency-review", "codeql"):
         assert jobs[job_id]["needs"] == "classify-changes"
-        assert "always()" in jobs[job_id]["if"]
+        assert "!cancelled()" in jobs[job_id]["if"]
+        assert "always()" not in jobs[job_id]["if"]
         assert "needs.classify-changes.outputs.docs_only != 'true'" in jobs[job_id]["if"]
     assert "github.event_name == 'pull_request'" in dependency_if
     assert "github.event.repository.private == false" in dependency_if
@@ -153,3 +173,16 @@ def test_dco_stays_unconditional_and_has_no_path_filter() -> None:
     _assert_no_path_filter(dco)
     assert "if" not in dco["jobs"]["dco"]
     assert "needs" not in dco["jobs"]["dco"]
+
+
+def test_changed_workflows_pin_every_action_to_a_commit() -> None:
+    for workflow_name in ("ci.yml", "security.yml"):
+        for uses in _all_uses(_load(workflow_name)):
+            assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", uses), uses
+
+
+def test_changed_workflows_do_not_persist_checkout_credentials() -> None:
+    for workflow_name in ("ci.yml", "security.yml"):
+        checkout_steps = [step for step in _all_steps(_load(workflow_name)) if step.get("uses", "").startswith("actions/checkout@")]
+        assert checkout_steps
+        assert all(step.get("with", {}).get("persist-credentials") == "false" for step in checkout_steps)
