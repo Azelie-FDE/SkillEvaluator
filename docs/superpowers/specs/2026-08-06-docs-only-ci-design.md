@@ -6,7 +6,7 @@ title: "Docs-only CI routing design"
 description: "Design for validating documentation pull requests without consuming the full SkillEvaluator CI matrix."
 ---
 
-**Status:** High-level design approved; awaiting written-spec review  
+**Status:** Approved
 **Date:** 2026-08-06
 
 ## Context
