@@ -424,32 +424,83 @@ def test_invalid_marker_blocks_in_skill_atomic_replacement(tmp_path: Path, nativ
     assert sentinel.read_text(encoding="utf-8") == "preserve\n"
 
 
+@pytest.mark.parametrize(
+    "force_fallback",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(os.name == "nt", reason="native Windows already exercises the fallback publisher"),
+        ),
+    ],
+)
 def test_partial_atomic_publication_preserves_signed_output_and_reruns(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    force_fallback: bool,
 ) -> None:
+    if force_fallback:
+        monkeypatch.setattr(secure_copy, "_DESCRIPTOR_BACKEND", False)
+        monkeypatch.setattr(secure_copy, "_ATOMIC_RENAME", None)
     skill = _write_skill(tmp_path)
     declared_root, output = _in_skill_output(skill, "partial-results")
     generate_harbor_tasks(skill, output, repo_context_exclude_paths=(declared_root,))
     old_dataset = (output / "dataset.toml").read_bytes()
-    original_rename = secure_copy._rename_no_replace
+    output_parent_metadata = output.parent.stat()
     rename_calls = 0
 
-    def _fail_second_rename(*args: object, **kwargs: object) -> None:
-        nonlocal rename_calls
-        rename_calls += 1
-        if rename_calls == 2:
-            raise OSError("injected generated-output publish failure after old destination moved")
-        original_rename(*args, **kwargs)
+    using_fallback = not secure_copy._DESCRIPTOR_BACKEND or secure_copy._ATOMIC_RENAME is None
+    if using_fallback:
+        original_path_rename = Path.rename
 
-    monkeypatch.setattr(secure_copy, "_rename_no_replace", _fail_second_rename)
+        def _fail_second_path_rename(source: Path, target: Path) -> Path:
+            nonlocal rename_calls
+            target_path = Path(target)
+            if output in (source, target_path):
+                rename_calls += 1
+                if rename_calls == 2:
+                    raise OSError("injected generated-output publish failure after old destination moved")
+            return original_path_rename(source, target_path)
+
+        monkeypatch.setattr(Path, "rename", _fail_second_path_rename)
+    else:
+        original_atomic_rename = secure_copy._rename_no_replace
+
+        def _fail_second_atomic_rename(
+            source_name: str,
+            destination_name: str,
+            *,
+            source_parent: int,
+            destination_parent: int,
+        ) -> None:
+            nonlocal rename_calls
+            in_output_parent = os.path.samestat(
+                os.fstat(source_parent),
+                output_parent_metadata,
+            ) and os.path.samestat(os.fstat(destination_parent), output_parent_metadata)
+            if in_output_parent and output.name in (source_name, destination_name):
+                rename_calls += 1
+                if rename_calls == 2:
+                    raise OSError("injected generated-output publish failure after old destination moved")
+            original_atomic_rename(
+                source_name,
+                destination_name,
+                source_parent=source_parent,
+                destination_parent=destination_parent,
+            )
+
+        monkeypatch.setattr(secure_copy, "_rename_no_replace", _fail_second_atomic_rename)
     with pytest.raises(OSError, match="generated-output publish"):
         generate_harbor_tasks(skill, output, repo_context_exclude_paths=(declared_root,))
 
+    assert rename_calls == 3
     assert (output / "dataset.toml").read_bytes() == old_dataset
     assert is_generated_output_root(output)
 
-    monkeypatch.setattr(secure_copy, "_rename_no_replace", original_rename)
+    if using_fallback:
+        monkeypatch.setattr(Path, "rename", original_path_rename)
+    else:
+        monkeypatch.setattr(secure_copy, "_rename_no_replace", original_atomic_rename)
     tasks = generate_harbor_tasks(skill, output, repo_context_exclude_paths=(declared_root,))
     assert tasks
     assert is_generated_output_root(output)
