@@ -358,6 +358,17 @@ class TestQualityScoreValidator:
 
         assert any("Description contains XML tags" in finding.message for finding in result.findings)
 
+    def test_self_closing_xml_tag_in_description_remains_quality_error(self, tmp_path: Path):
+        """Self-closing tags use the same XML definition as schema validation."""
+        skill_dir = _write_issue_skill(
+            tmp_path,
+            description="Use when validating an injected <script/> tag.",
+        )
+
+        result = QualityScoreValidator(min_score=0).validate(skill_dir)
+
+        assert any("Description contains XML tags" in finding.message for finding in result.findings)
+
     def test_readme_supporting_file_is_allowed(self, quality_skill):
         # An unreferenced README.md is a permitted human-facing supporting file
         # (SkillEvaluator HOW_TO_CONTRIBUTE_SKILLS.md). The quality_skill SKILL.md does
@@ -389,6 +400,19 @@ class TestQualityScoreValidator:
             if "README.md" in finding.message and "references" in finding.message.lower()
         ]
         assert readme_findings, "Expected a finding when SKILL.md references README.md"
+
+    def test_reference_style_readme_link_is_flagged(self, quality_skill: Path):
+        (quality_skill / "README.md").write_text("# Human-facing skill notes\n")
+        skill_md = quality_skill / "SKILL.md"
+        skill_md.write_text(
+            skill_md.read_text() + "\n## More\n\nSee [the overview][readme] for background.\n\n[readme]: README.md\n"
+        )
+
+        result = QualityScoreValidator(min_score=0).validate(quality_skill)
+
+        assert any(
+            "README.md" in finding.message and "references" in finding.message.lower() for finding in result.findings
+        )
 
     def test_large_skill_is_high_severity(self, tmp_path):
         """Large skills (>5000 tokens) should produce HIGH severity findings."""
@@ -658,11 +682,39 @@ class TestQualityScoreKeywordBoundaries:
 
         assert "MCP skill lacks connection/error guidance" in messages
 
+    def test_unrelated_guidance_in_same_paragraph_does_not_satisfy_mcp_guidance(self, tmp_path: Path):
+        messages = _finding_messages(
+            _write_issue_skill(
+                tmp_path,
+                extra_body=(
+                    "\n## Usage\n\n"
+                    "- Use the MCP server to enumerate tools.\n"
+                    "- Connect to the compilation cache before measuring.\n"
+                ),
+            )
+        )
+
+        assert "MCP skill lacks connection/error guidance" in messages
+
     def test_mcp_reconnect_guidance_is_still_accepted(self, tmp_path: Path):
         messages = _finding_messages(
             _write_issue_skill(
                 tmp_path,
                 extra_body="\nUse the MCP server. Reconnect the server if the session expires.\n",
+            )
+        )
+
+        assert "MCP skill lacks connection/error guidance" not in messages
+
+    def test_later_explicit_mcp_sentence_can_supply_guidance(self, tmp_path: Path):
+        messages = _finding_messages(
+            _write_issue_skill(
+                tmp_path,
+                extra_body=(
+                    "\n## Usage\n\n"
+                    "Use the MCP server to enumerate tools. "
+                    "If the MCP server disconnects, reconnect it.\n"
+                ),
             )
         )
 
@@ -922,6 +974,11 @@ class TestQualityScoreKeywordBoundaries:
 
         assert quality_score_module._markdown_link_targets(content) == ["advanced.md"]
 
+    def test_shortcut_reference_style_link_resolves_definition(self):
+        content = "See [readme] for details.\n\n[readme]: README.md\n"
+
+        assert quality_score_module._markdown_link_targets(content) == ["README.md"]
+
     @pytest.mark.parametrize(
         "target",
         [
@@ -986,6 +1043,26 @@ class TestQualityScoreKeywordBoundaries:
         messages = _finding_messages(skill_dir)
 
         assert all("Deeply nested references" not in message for message in messages)
+
+    def test_commented_markdown_link_is_not_nested(self, tmp_path: Path):
+        skill_dir = _write_issue_skill(tmp_path)
+        references = skill_dir / "references"
+        references.mkdir()
+        (references / "mechanisms.md").write_text("<!-- [example](advanced.md) -->\n")
+
+        messages = _finding_messages(skill_dir)
+
+        assert all("Deeply nested references" not in message for message in messages)
+
+    def test_reference_style_local_markdown_link_is_nested(self, tmp_path: Path):
+        skill_dir = _write_issue_skill(tmp_path)
+        references = skill_dir / "references"
+        references.mkdir()
+        (references / "mechanisms.md").write_text("See [more details][advanced].\n\n[advanced]: advanced.md\n")
+
+        messages = _finding_messages(skill_dir)
+
+        assert "Deeply nested references in mechanisms.md" in messages
 
     def test_instruction_action_verbs_do_not_match_inside_words(self, tmp_path: Path):
         messages = _finding_messages(
