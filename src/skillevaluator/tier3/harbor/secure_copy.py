@@ -36,8 +36,15 @@ IgnoreCallback = Callable[[str, list[str]], Iterable[str]]
 
 _CHUNK_SIZE = 1024 * 1024
 _REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_BINARY_FLAG = getattr(os, "O_BINARY", 0)
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-_FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0)
+_FILE_FLAGS = (
+    os.O_RDONLY
+    | _BINARY_FLAG
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_NOCTTY", 0)
+)
 _WINDOWS_CHMOD_SEMANTICS = os.name == "nt"
 _PATH_DESCRIPTOR_IDENTITIES_COMPARABLE = os.name == "posix"
 _DESCRIPTOR_BACKEND = (
@@ -728,7 +735,7 @@ def _create_staged_node(parent_descriptor: int, *, prefix: str, kind: str) -> _S
             else:
                 descriptor = os.open(
                     name,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _BINARY_FLAG | getattr(os, "O_NOFOLLOW", 0),
                     0o600,
                     dir_fd=parent_descriptor,
                 )
@@ -924,7 +931,7 @@ def _copy_manifest_file(
             os.unlink(entry.parts[-1], dir_fd=destination_parent)
         destination_descriptor = os.open(
             entry.parts[-1],
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | _BINARY_FLAG | getattr(os, "O_NOFOLLOW", 0),
             0o600,
             dir_fd=destination_parent,
         )
@@ -1664,7 +1671,11 @@ def _copy_manifest_file_fallback(manifest: _TreeManifest, entry: _ManifestEntry,
     destination_descriptor = -1
     try:
         source_opened = os.fstat(source_descriptor)
-        destination_descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        destination_descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | _BINARY_FLAG,
+            0o600,
+        )
         _apply_fallback_open_file_mode(destination, destination_descriptor, 0o600)
         digest = hashlib.sha256()
         while data := os.read(source_descriptor, _CHUNK_SIZE):
@@ -2201,7 +2212,11 @@ def _stage_fallback_file(manifest: _FileManifest, stage: Path) -> None:
     destination_descriptor = -1
     try:
         source_opened = os.fstat(source_descriptor)
-        destination_descriptor = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        destination_descriptor = os.open(
+            stage,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | _BINARY_FLAG,
+            0o600,
+        )
         _apply_fallback_open_file_mode(stage, destination_descriptor, 0o600)
         digest = hashlib.sha256()
         while data := os.read(source_descriptor, _CHUNK_SIZE):

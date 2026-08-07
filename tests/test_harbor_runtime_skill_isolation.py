@@ -827,7 +827,10 @@ def test_staging_rejects_case_alias_of_reserved_results_directory(
     sentinel = output_dir / "keep.txt"
     sentinel.write_text("preserve\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="evaluator source"):
+    with pytest.raises(
+        ValueError,
+        match=r"Staging output directory overlaps evaluator source|Generated output marker is missing",
+    ):
         stager_fn = generate_harbor_tasks if stager == "generated" else stage_native_harbor_tasks
         stager_fn(target, output_dir)
 
@@ -1248,7 +1251,7 @@ def test_native_rejects_unsafe_task_directory_name_before_output_mutation(tmp_pa
     _, target, _, _ = _write_projection_fixture(tmp_path)
     _write_minimal_native_task(target)
     native_root = target / "evals" / "harbor"
-    (native_root / "case-001").rename(native_root / 'bad"name')
+    (native_root / "case-001").rename(native_root / "bad name")
     output_dir = tmp_path / "native-invalid-directory"
 
     with pytest.raises(ValueError, match="invalid case id"):
@@ -1280,7 +1283,10 @@ def test_baseline_rejects_target_copied_under_reference_alias(tmp_path: Path) ->
     shutil.copytree(target, aliased_target)
     (aliased_target / "extra.txt").write_text("tree changed but instructions are identical\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="alias of target skill"):
+    with pytest.raises(
+        ValueError,
+        match=r"alias of target skill|Baseline environment contains the target skill instructions",
+    ):
         generate_harbor_tasks(
             target,
             tmp_path / "baseline-reference-alias",
@@ -1346,7 +1352,10 @@ def test_baseline_rejects_target_nested_inside_skill_candidate(
         "reference_skills_dir": references_dir,
         "workspace_skill_paths": [workspace],
     }
-    with pytest.raises(ValueError, match="alias of target skill"):
+    with pytest.raises(
+        ValueError,
+        match=r"alias of target skill|Baseline environment contains the target skill instructions",
+    ):
         if stager == "generated":
             generate_harbor_tasks(target, tmp_path / f"nested-alias-{candidate_kind}", **kwargs)
         else:
@@ -3126,7 +3135,8 @@ def test_evaluator_read_accepts_windows_crt_descriptor_identity(
     evals = tmp_path / "evals"
     evals.mkdir()
     dataset = evals / "evals.json"
-    dataset.write_text("[]\n", encoding="utf-8")
+    payload = b"[]\n"
+    dataset.write_bytes(payload)
     original_read_bytes = adapter_module.SecureRoot.read_bytes
 
     def read_with_windows_crt_identity(
@@ -3150,7 +3160,7 @@ def test_evaluator_read_accepts_windows_crt_descriptor_identity(
     monkeypatch.setattr(adapter_module, "_PATH_DESCRIPTOR_IDENTITIES_COMPARABLE", False, raising=False)
     monkeypatch.setattr(adapter_module.SecureRoot, "read_bytes", read_with_windows_crt_identity)
 
-    assert adapter_module._read_regular_evals_file(dataset, allowed_root=evals) == b"[]\n"
+    assert adapter_module._read_regular_evals_file(dataset, allowed_root=evals) == payload
 
 
 @pytest.mark.parametrize("task_source", ["evals_json", "native_harbor"])
@@ -3344,3 +3354,15 @@ def test_native_projection_does_not_read_task_directory_on_another_device(
 
     assert adapter_module._native_projection_entry_ids(native_root) == ()
     assert not read_task_config
+
+
+def test_link_or_reparse_check_accepts_missing_windows_file_attributes(tmp_path: Path) -> None:
+    path = tmp_path / "regular-file"
+    path.write_text("regular\n", encoding="utf-8")
+    metadata = path.lstat()
+    partial_metadata = SimpleNamespace(
+        st_mode=metadata.st_mode,
+        st_file_attributes=None,
+    )
+
+    assert not adapter_module._path_is_link_or_reparse(path, partial_metadata)

@@ -398,10 +398,11 @@ def _path_is_link_or_reparse(path: Path, metadata: os.stat_result | None = None)
         except FileNotFoundError:
             return False
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    file_attributes = getattr(metadata, "st_file_attributes", 0) or 0
     is_junction = getattr(path, "is_junction", None)
     return (
         stat.S_ISLNK(metadata.st_mode)
-        or bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag)
+        or bool(file_attributes & reparse_flag)
         or (callable(is_junction) and is_junction())
     )
 
