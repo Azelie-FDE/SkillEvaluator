@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from scripts.ci import check_public_benchmarks as benchmark_gate
 
+from skillevaluator.evaluation.tier3_report import advisory_skip_result
 from skillevaluator.models import Finding, Severity, ValidationResult
 from skillevaluator.reporting import BenchmarkReporter
 
@@ -254,6 +255,44 @@ def test_real_incomplete_and_legacy_cards_pass_publication_gate(tmp_path: Path) 
         benchmark.write_text(rendered, encoding="utf-8")
         _files, offenders = benchmark_gate.find_offenders([benchmark])
         assert offenders == [], f"{name}: {offenders}"
+
+
+def test_legacy_pass_is_incomplete_without_publication_provenance(tmp_path: Path) -> None:
+    rendered = BenchmarkReporter(include_timestamp=True).render_all(
+        [_tier1_result(), _tier3_result("PASS", legacy=True)]
+    )
+    benchmark = tmp_path / "BENCHMARK.md"
+    benchmark.write_text(rendered, encoding="utf-8")
+
+    _files, offenders = benchmark_gate.find_offenders([benchmark])
+
+    assert "Overall verdict: INCOMPLETE" in rendered
+    assert "## Publication Recommendation" not in rendered
+    assert offenders == []
+
+
+@pytest.mark.parametrize(
+    ("tier3_required", "expected_verdict"),
+    [(True, "INCOMPLETE"), (False, "PASS")],
+)
+def test_advisory_tier3_skip_respects_publication_policy(
+    tmp_path: Path,
+    tier3_required: bool,
+    expected_verdict: str,
+) -> None:
+    tier1 = _tier1_result()
+    tier1.metadata["benchmark_policy"] = {"tier3_required": tier3_required}
+    rendered = BenchmarkReporter(include_timestamp=True).render_all(
+        [tier1, advisory_skip_result("Live evaluation runtime unavailable", skill_name="demo-skill")]
+    )
+    benchmark = tmp_path / "BENCHMARK.md"
+    benchmark.write_text(rendered, encoding="utf-8")
+
+    _files, offenders = benchmark_gate.find_offenders([benchmark])
+
+    assert f"Overall verdict: {expected_verdict}" in rendered
+    assert "| Tier 3 | Live agent evaluation | **SKIPPED (ADVISORY)** |" in rendered
+    assert offenders == []
 
 
 def test_reporter_without_generation_timestamp_passes_publication_gate(tmp_path: Path) -> None:

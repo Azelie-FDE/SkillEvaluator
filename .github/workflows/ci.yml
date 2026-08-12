@@ -29,6 +29,9 @@ jobs:
       - name: Scan OSS source boundary
         if: matrix.python-version == '3.12'
         run: python scripts/check_oss_boundary.py --root . --allowlist config/oss_boundary_allowlist.json
+      - name: Check public benchmark publication cards
+        if: matrix.python-version == '3.12'
+        run: python scripts/ci/check_public_benchmarks.py --require-files tests/golden
       - if: matrix.python-version == '3.12'
         run: uv run ruff check .
       - name: Run tests with coverage

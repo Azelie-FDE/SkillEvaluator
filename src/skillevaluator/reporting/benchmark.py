@@ -587,17 +587,35 @@ def _benchmark_policy(
 
 
 def _tier3_evidence_complete(ae: dict[str, Any] | None) -> bool:
-    """Require an actual supported-agent verdict, with legacy compatibility."""
-    if not isinstance(ae, dict) or not _agents(ae):
+    """Require a succeeded run with the minimum publication provenance."""
+    if not isinstance(ae, dict):
+        return False
+    agents = _agents(ae)
+    if not agents or any(
+        not str(agent.get("model") or agent.get("model_name") or agent.get("llm_model") or "").strip()
+        for agent in agents.values()
+    ):
         return False
     summary = _mapping(ae.get("summary"))
     verdict = str(ae.get("verdict") or summary.get("verdict") or "").lower()
     if verdict not in {"pass", "neutral", "fail"}:
         return False
     execution_status = str(ae.get("execution_status") or summary.get("execution_status") or "").lower()
-    # Historical payloads predate execution_status. Their recorded agents and
-    # verdict are the strongest available evidence and remain renderable.
-    return execution_status in {"", "succeeded"}
+    evaluated_at = ae.get("evaluated_at") or summary.get("evaluated_at")
+    evaluator_version = ae.get("evaluator_version") or summary.get("evaluator_version")
+    dataset_digest = ae.get("dataset_digest") or summary.get("dataset_digest")
+    attempt_policy = _mapping(ae.get("attempt_policy"))
+    attempts = _nonnegative_int(attempt_policy.get("max_attempts"))
+    environment = summary.get("environment") or ae.get("environment")
+    return bool(
+        execution_status == "succeeded"
+        and str(evaluated_at or "").strip()
+        and str(evaluator_version or "").strip()
+        and str(dataset_digest or "").strip()
+        and _dataset_summary(ae)["total_tasks"] > 0
+        and attempts > 0
+        and str(environment or "").strip()
+    )
 
 
 def _advisory_agent_eval_skip_message(results: list[ValidationResult]) -> str | None:
@@ -638,16 +656,11 @@ def _overall_status(
     if has_failures or verdict == "fail":
         return "FAIL"
 
-    if (
-        benchmark_policy["tier3_required"]
-        and not _tier3_evidence_complete(ae)
-        and not _advisory_agent_eval_skip_message(results)
-    ):
-        return "INCOMPLETE"
-
     execution_status = str((ae or {}).get("execution_status") or summary.get("execution_status") or "").lower()
     if verdict == "neutral" and execution_status in {"succeeded", ""}:
         return "NEUTRAL"
+    if benchmark_policy["tier3_required"] and not _tier3_evidence_complete(ae):
+        return "INCOMPLETE"
     return "PASS"
 
 

@@ -83,3 +83,5 @@ navigation:
       - page: Contributing
         path: ../docs/developer-guide.mdx
         slug: developer-guide
+      - link: NVIDIA Verified Skills
+        href: https://docs.nvidia.com/skills/
