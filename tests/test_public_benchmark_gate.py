@@ -122,6 +122,21 @@ def test_gate_requires_explicit_agent_model_state(tmp_path: Path) -> None:
     assert {offender.reason for offender in offenders} == {"agent model identity not recorded"}
 
 
+def test_gate_accepts_multiple_explicit_agent_model_states(tmp_path: Path) -> None:
+    benchmark = tmp_path / "BENCHMARK.md"
+    benchmark.write_text(
+        _valid_benchmark().replace(
+            "Agents: Codex (`gpt-codex`)",
+            "Agents: Codex (`gpt-codex`), Claude Code (model not recorded)",
+        ),
+        encoding="utf-8",
+    )
+
+    _files, offenders = benchmark_gate.find_offenders([benchmark])
+
+    assert offenders == []
+
+
 @pytest.mark.parametrize(
     "field",
     [

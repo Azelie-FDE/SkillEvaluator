@@ -70,9 +70,8 @@ LINE_RULES = (
     ),
 )
 
-_AGENT_MODEL_STATES = re.compile(
-    r"^[^,]+ \((?:`[^`]+`|model not recorded)\)"
-    r"(?:,\s*[^,]+ \((?:`[^`]+`|model not recorded)\))*$",
+_AGENT_MODEL_STATE = re.compile(
+    r"^[^,]+ \((?:`[^`,]+`|model not recorded)\)$",
     flags=re.IGNORECASE,
 )
 _OVERALL_PASS = re.compile(
@@ -185,8 +184,14 @@ def _check_metadata_semantics(path: Path, text: str, offenders: list[Offender]) 
     elif lowered.startswith("requested but not run"):
         if "model not recorded" not in lowered:
             offenders.append(Offender(path, line_number, "agent model identity not recorded"))
-    elif not _AGENT_MODEL_STATES.fullmatch(value):
+    elif not _valid_agent_model_states(value):
         offenders.append(Offender(path, line_number, "agent model identity not recorded"))
+
+
+def _valid_agent_model_states(value: str) -> bool:
+    """Validate a comma-delimited agent list without a backtracking list regex."""
+    agents = [agent.strip() for agent in value.split(",")]
+    return bool(agents) and all(_AGENT_MODEL_STATE.fullmatch(agent) for agent in agents)
 
 
 def _metadata_section_lines(text: str) -> list[tuple[int, str]]:
