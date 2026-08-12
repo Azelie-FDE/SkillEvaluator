@@ -69,19 +69,27 @@ and never clobbers the previous run.
 
 When the target is a skill, `validate` always writes `BENCHMARK.md` to the
 output directory — regardless of which `-r` formats you picked, and even when
-validation fails. It is a publication card: evaluation date, the active
-validation profile, per-tier summaries, and (when Tier 3 ran) agents, dataset
-composition, and the dimension-by-dimension results table.
+validation fails. It is a decision-first publication card: the overall verdict
+and recommendation come first, followed by per-tier evidence, evaluator and
+dataset provenance, agent/model details, and a dimension-by-dimension
+`Baseline → Skill Uplift` table when Tier 3 ran. Public cards omit validation
+profile names and absolute host paths.
 
 The card carries one overall verdict — `PASS`, `FAIL`, or `INCOMPLETE`. It
 fails closed: if a required scanner produced no trustworthy evidence, the
 verdict is `INCOMPLETE` and the card explicitly says not to use it to recommend
 publication. A Publication Recommendation section appears only on a clean
-`PASS`. An advisory Tier 3 run that was skipped doesn't fail the combined
-verdict: the card adds an explicit `Tier 3 live evaluation: SKIPPED — <reason>`
-line and adjusts the publication recommendation to say the live evaluation
-didn't run. Keep the file with the skill and refresh it whenever the skill or
-its eval dataset materially changes.
+`PASS`. Tier 3 evidence is publication-required by default, so a missing,
+skipped, or incomplete live evaluation produces `INCOMPLETE` rather than a
+publication recommendation. A catalog may explicitly persist
+`benchmark_policy.tier3_required = false`; the card discloses that exception
+instead of implying that Tier 3 ran.
+
+Keep the file with the skill and refresh it whenever the skill, eval dataset,
+agent/model, evaluator version, scoring policy, attempt policy, or execution
+environment materially changes. Follow the
+[rollout and backfill runbook](benchmark-rollout.mdx) when regenerating existing
+published cards.
 
 ## Safety guarantees
 

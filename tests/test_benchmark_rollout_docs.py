@@ -15,6 +15,8 @@ def test_rollout_runbook_covers_safe_backfill_and_freshness() -> None:
 
     assert "--output-dir ./benchmark-backfill/example-skill" in runbook
     assert "check_public_benchmarks.py" in runbook
+    assert "assets/benchmark-card-before.png" in runbook
+    assert "assets/benchmark-card-after.png" in runbook
     assert "--require-files" in runbook
     assert "Do not reuse a prior live score" in runbook
     assert "The generated evaluation date must come from the live run artifact" in runbook
