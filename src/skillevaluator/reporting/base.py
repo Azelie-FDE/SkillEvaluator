@@ -345,6 +345,9 @@ def is_advisory_agent_eval_skip(result: ValidationResult) -> bool:
     """Return whether a Tier 3 result records a non-blocking skipped run."""
     if result.validator_name != "AGENT_EVAL":
         return False
+    gating = result.metadata.get("gating") if isinstance(result.metadata, dict) else None
+    if isinstance(gating, dict) and gating.get("blocking", False):
+        return False
     payload = result.metadata.get("agent_eval", {}) if result.metadata else {}
     provenance = payload.get("provenance", {}) if isinstance(payload, dict) else {}
     return bool(

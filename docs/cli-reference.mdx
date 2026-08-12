@@ -136,7 +136,7 @@ Static checks; LLM-free by default. Tier 1 gates the exit code and always runs.
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--checks, --tier1-checks TEXT` | all applicable | Comma-separated subset of Tier 1 checks. Choices: `schema`, `security`, `pii`, `license`, `code-integrity`, `unicode`, `quality`, `lint`; opt-in (not run by default): `version`, `dependency`. `quality`/`lint`/`version` are skill-only and skipped for rules and workflows. |
+| `--checks, --tier1-checks TEXT` | all applicable | Comma-separated subset of Tier 1 checks. Default choices: `schema`, `version`, `security`, `pii`, `license`, `code-integrity`, `unicode`, `quality`, `lint`; opt-in (not run by default): `dependency`. `quality`/`lint`/`version` are skill-only and skipped for rules and workflows. |
 | `--fail-fast` | off | Stop on the first failing check instead of collecting all issues. |
 | `-c, --continue-on-failure` | off | Run the full pipeline without stopping early; record all issues in the reports. Overrides `--fail-fast`, and for folder validation keeps scanning every skill past a CRITICAL finding. |
 | `--llm, --tier1-llm / --no-llm, --no-tier1-llm` | `no-llm` | Enable LLM-backed security analysis (requires a configured public provider — see [Providers & Credentials](configuration.mdx)). |

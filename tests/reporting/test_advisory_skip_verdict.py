@@ -162,8 +162,14 @@ def test_explicit_blocking_gating_overrides_legacy_advisory_skip_shape() -> None
 
     assert payload["overall_status"] == "failed"
     assert payload["overall_passed"] is False
+    assert payload["total_advisory_skipped"] == 0
+    assert payload["results"][0]["status"] == "failed"
     assert payload["gating"]["tiers"]["3"]["blocking"] is True
     assert html_data["summary"]["status"] == "failed"
+    assert html_data["summary"]["advisory_skipped_count"] == 0
+    assert html_data["results"][0]["status"] == "failed"
     assert html_data["gating"]["would_block"] is True
     assert "**Status:** ❌ FAILED" in markdown
+    assert "### ❌ AGENT_EVAL" in markdown
+    assert "SKIPPED AGENT_EVAL" not in markdown
     assert "Overall verdict: FAIL" in benchmark
