@@ -61,15 +61,21 @@ _NEGATED_MCP_RES = (
         r"(?:\w+\s+){0,3}mcp\b",
         re.IGNORECASE,
     ),
+    re.compile(
+        r"\b(?:(?:is|are|was|were)\s+not|(?:isn't|aren't|wasn't|weren't))\s+"
+        r"(?:(?:currently|actively)\s+){0,2}"
+        r"(?:using|requiring|depending\s+on|relying\s+on)\s+(?:an?\s+|the\s+)?mcp\b",
+        re.IGNORECASE,
+    ),
     re.compile(r"\bwithout\s+(?:an?\s+)?mcp\b", re.IGNORECASE),
     re.compile(r"\b(?:no|not\s+(?:an?\s+)?)mcp\b", re.IGNORECASE),
     re.compile(
-        r"\bmcp\b\s+(?:"
+        r"\bmcp\b(?:\s+(?:use|usage|support|integration|access|capability|server))?\s+(?:"
         r"(?:(?:is|are|was|were)\s+not|(?:isn't|aren't|wasn't|weren't))|"
         r"(?:(?:should|must|shall|can|could|would)\s+not|"
         r"(?:shouldn't|mustn't|shan't|can't|couldn't|wouldn't))\s+be"
         r")\s+"
-        r"(?:used|required|needed|enabled|supported|involved)\b",
+        r"(?:used|required|needed|enabled|supported|involved|necessary|available)\b",
         re.IGNORECASE,
     ),
     re.compile(
@@ -98,12 +104,11 @@ _MARKDOWN_H2_RE = re.compile(r"^##[ \t]+(.+?)[ \t]*\r?$", re.MULTILINE)
 _MCP_SUPPORT_HEADINGS = frozenset({"troubleshooting", "common issues", "faq"})
 _MCP_SUPPORT_SUBJECT_RE = re.compile(r"\b(?:connections?|sessions?|api\s+keys?)\b", re.IGNORECASE)
 _TIME_REFERENCE_RE = re.compile(
-    r"\b(?:before|after|as of|until)\s+(?:the\s+year\s+)?(?:19\d{2}|2\d{3})\b",
+    r"\b(?:before|after|as of|until)\s+(?P<explicit_year>the\s+year\s+)?(?:19\d{2}|2\d{3})\b",
     re.IGNORECASE,
 )
 _NON_TEMPORAL_COUNT_RE = re.compile(
-    r"^\s+(?:iterations?|tokens?|bytes?|kilobytes?|megabytes?|gigabytes?|"
-    r"milliseconds?|seconds?|minutes?|hours?|rows?|items?|attempts?|samples?|steps?|calls?)\b",
+    r"^\s+(?:[A-Za-z][A-Za-z0-9_-]*s|bytes?|people|children|data\s+points?)\b",
     re.IGNORECASE,
 )
 _EXCLUSIVITY_RE = re.compile(
@@ -377,7 +382,7 @@ def _has_exclusive_replacement(content: str) -> bool:
 
 def _has_time_reference(content: str) -> bool:
     for match in _TIME_REFERENCE_RE.finditer(content):
-        if not _NON_TEMPORAL_COUNT_RE.match(content[match.end() : match.end() + 32]):
+        if match.group("explicit_year") or not _NON_TEMPORAL_COUNT_RE.match(content[match.end() : match.end() + 32]):
             return True
     return False
 

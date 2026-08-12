@@ -574,6 +574,20 @@ class TestQualityScoreKeywordBoundaries:
     @pytest.mark.parametrize(
         "statement",
         [
+            "This skill is not using MCP.",
+            "This workflow isn't currently relying on MCP.",
+            "MCP usage is not supported.",
+            "MCP access isn't available.",
+        ],
+    )
+    def test_copular_negated_mcp_mention_does_not_classify_mcp_skill(self, tmp_path: Path, statement: str):
+        messages = _finding_messages(_write_issue_skill(tmp_path, extra_body=f"\n{statement}\n"))
+
+        assert "MCP skill lacks connection/error guidance" not in messages
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
             "This skill should not use MCP.",
             "MCP should not be used by this skill.",
         ],
@@ -772,16 +786,30 @@ class TestQualityScoreKeywordBoundaries:
 
         assert "MCP skill lacks connection/error guidance" in messages
 
-    def test_iteration_count_is_not_time_sensitive_information(self, tmp_path: Path):
-        messages = _finding_messages(
-            _write_issue_skill(tmp_path, extra_body="\nUnrolling stops after 2048 iterations.\n")
-        )
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "Unrolling stops after 2048 iterations.",
+            "Stop after 2048 files.",
+            "Retry after 2025 requests.",
+            "Fail after 2000 data points.",
+        ],
+    )
+    def test_four_digit_count_is_not_time_sensitive_information(self, tmp_path: Path, statement: str):
+        messages = _finding_messages(_write_issue_skill(tmp_path, extra_body=f"\n{statement}\n"))
 
         assert "Time-sensitive information detected" not in messages
 
     def test_actual_year_reference_remains_time_sensitive(self, tmp_path: Path):
         messages = _finding_messages(
             _write_issue_skill(tmp_path, extra_body="\nUse this compatibility path after 2025.\n")
+        )
+
+        assert "Time-sensitive information detected" in messages
+
+    def test_explicit_year_reference_with_following_plural_remains_time_sensitive(self, tmp_path: Path):
+        messages = _finding_messages(
+            _write_issue_skill(tmp_path, extra_body="\nAfter the year 2025, releases use this compatibility path.\n")
         )
 
         assert "Time-sensitive information detected" in messages
