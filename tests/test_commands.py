@@ -603,6 +603,7 @@ def test_validate_tier2_default_is_blocking_and_can_be_advisory(monkeypatch) -> 
         )
 
     assert blocking.exit_code != 0
+    assert "failed in Tier 2" in _plain_text(blocking.output)
     assert advisory.exit_code == 0, advisory.output
 
 

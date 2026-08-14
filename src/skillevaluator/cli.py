@@ -791,11 +791,9 @@ def _finish_pipeline_view(
     if failed:
         first = failed[0].validator_name or "validation"
         extra = f" (+{len(failed) - 1} more)" if len(failed) > 1 else ""
-        tier_no = int(
-            (failed[0].metadata.get("gating") or {}).get("tier")
-            or 1
-        )
-        headline = f"{first}{extra} failed in Tier {tier_no}"
+        tier_no = (failed[0].metadata.get("gating") or {}).get("tier")
+        tier_label = f" in Tier {tier_no}" if tier_no is not None else ""
+        headline = f"{first}{extra} failed{tier_label}"
     else:
         headline = "validation failed"
     rerun = _rerun_hint(target_path, agent_eval)
@@ -1194,6 +1192,9 @@ def validate(
     block_on_agent_eval_effective = False if block_on_agent_eval is None else block_on_agent_eval
 
     resolved_type = content_type if content_type != "auto" else detect_content_type(target_path)
+    # Only skills own an evals/ task source. Plugins, rules, and workflows can
+    # still run Tier 3, but must bypass the skill-directory source preflight.
+    preflight_tier3_source = resolved_type == CONTENT_TYPE_SKILL
 
     # --full is the one-shot (everything incl. autopilot); --autopilot implies
     # Tier 3; --tiers is the explicit selector. Explicit --no-tier2 still wins.
@@ -1389,7 +1390,7 @@ def validate(
             timeout_multiplier=timeout_multiplier,
             harbor_keep_jobs=harbor_keep_jobs,
             block_on_agent_eval=block_on_agent_eval_effective,
-            validate_source=resolved_type == CONTENT_TYPE_SKILL,
+            validate_source=preflight_tier3_source,
             progress_reporter=reporter,
         )
         results.append(tier3_result)
@@ -1413,7 +1414,7 @@ def validate(
         }
     if tier3_result is not None:
         source_kind = "plugin"
-        if resolved_type == CONTENT_TYPE_SKILL:
+        if preflight_tier3_source:
             from skillevaluator.tier3.evals_spec import validate_tier3_source
 
             source_kind, _source_checks = validate_tier3_source(target_path)
