@@ -2,7 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Validate generated BENCHMARK.md files before publishing them."""
+"""Lint committed BENCHMARK.md fixtures for structure and known leak patterns.
+
+A clean scan means no configured pattern matched; it does not prove that a card
+is safe to publish. Publication still requires the repository's broader review
+and security controls.
+"""
 
 from __future__ import annotations
 
@@ -42,9 +47,9 @@ LINE_RULES = (
         ),
     ),
     (
-        "internal validation profile",
+        "validation profile metadata",
         re.compile(
-            r"^\s*-\s*(?:Skill\s+Evaluator\s+)?Profile:\s*`?(?:internal|external)`?\s*$",
+            r"^\s*-\s*(?:Skill\s+Evaluator\s+)?Profile\s*:",
             flags=re.IGNORECASE,
         ),
     ),

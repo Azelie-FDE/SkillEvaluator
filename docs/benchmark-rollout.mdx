@@ -110,11 +110,14 @@ python scripts/ci/check_public_benchmarks.py \
   ./benchmark-backfill
 ```
 
-The gate rejects retired/internal product identities anywhere in the card,
-historical internal or external validation-profile lines, common absolute home
-paths, ambiguous legacy uplift cells, the old
-`Num` column, missing metadata/decision sections, and a publication `PASS`
-without completed required Tier 3 evidence.
+The linter rejects configured known leak patterns such as retired product
+identities, any validation-profile metadata line, common absolute home paths,
+ambiguous legacy uplift cells, the old `Num` column, missing metadata/decision
+sections, and a publication `PASS` without completed required Tier 3 evidence.
+A clean result means none of those configured patterns matched; it is a fixture
+regression guard, not proof that a card is safe to publish. Keep human review
+and the repository's broader boundary and security checks in the promotion
+workflow.
 
 ## 6. Promote and verify
 

@@ -87,7 +87,7 @@ def test_gate_rejects_legacy_and_private_output(tmp_path: Path) -> None:
 
     assert reasons == {
         "internal environment identity",
-        "internal validation profile",
+        "validation profile metadata",
         "retired product identity",
         "absolute macOS user path",
         "legacy Num score column",
@@ -175,17 +175,19 @@ def test_gate_requires_metadata_fields_inside_metadata_section(tmp_path: Path) -
     [
         "- Profile: internal",
         "- Profile: `external`",
+        "- Profile: team-strict",
         "- Skill Evaluator profile: external",
         "- skill evaluator Profile: `internal`",
+        "- Skill Evaluator Profile: `custom-publication-policy` (generated)",
     ],
 )
-def test_gate_rejects_historical_profile_shapes(tmp_path: Path, profile_line: str) -> None:
+def test_gate_rejects_all_profile_metadata_shapes(tmp_path: Path, profile_line: str) -> None:
     benchmark = tmp_path / "BENCHMARK.md"
     benchmark.write_text(_valid_benchmark() + f"\n{profile_line}\n", encoding="utf-8")
 
     _files, offenders = benchmark_gate.find_offenders([benchmark])
 
-    assert "internal validation profile" in {offender.reason for offender in offenders}
+    assert "validation profile metadata" in {offender.reason for offender in offenders}
 
 
 def test_gate_rejects_internal_sandbox_phrase_anywhere_but_preserves_astra_db(tmp_path: Path) -> None:
