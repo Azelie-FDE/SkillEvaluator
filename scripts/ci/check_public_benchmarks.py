@@ -79,6 +79,7 @@ _AGENT_MODEL_STATE = re.compile(
     r"^[^,]+ \((?:`[^`,]+`|model not recorded)\)$",
     flags=re.IGNORECASE,
 )
+_RECORDED_AGENT_MODEL_STATE = re.compile(r"^[^,]+ \(`[^`,]+`\)$")
 _OVERALL_PASS = re.compile(
     r"^\s*>\s*.*Overall verdict:\s*PASS\b",
     flags=re.IGNORECASE | re.MULTILINE,
@@ -112,6 +113,20 @@ _METADATA_FIELD_RULES = (
         "Tier 3 evidence",
         re.compile(r"(?:required for publication|optional by policy)", flags=re.IGNORECASE),
     ),
+)
+_PASS_METADATA_FIELD_RULES = (
+    ("Evaluation date", re.compile(r"\d{4}-\d{2}-\d{2}")),
+    ("Evaluator version", re.compile(r"`[^`\s][^`]*`")),
+    ("Tasks", re.compile(r"[1-9]\d*\s+evaluation tasks?(?:\s+\(.*\))?", flags=re.IGNORECASE)),
+    (
+        "Dataset digest",
+        re.compile(
+            r"`sha256:[0-9a-f]{64}`\s+\(skill-evaluator-dataset-snapshot/1\)",
+            flags=re.IGNORECASE,
+        ),
+    ),
+    ("Attempts per task", re.compile(r"[1-9]\d*")),
+    ("Environment", re.compile(r"`[^`\s][^`]*`")),
 )
 
 
@@ -262,8 +277,38 @@ def _check_verdict_tier_consistency(path: Path, text: str, offenders: list[Offen
     line_number, tier3_status = tier3_row
     tier3_complete = tier3_status == "PASS"
     tier3_optional = (_metadata_field_value(text, "Tier 3 evidence") or "").lower() == "optional by policy"
+    if not tier3_optional:
+        _check_pass_provenance(path, text, offenders)
     if not tier3_complete and not tier3_optional:
         offenders.append(Offender(path, line_number, "publication PASS without completed Tier 3 evidence"))
+
+
+def _check_pass_provenance(path: Path, text: str, offenders: list[Offender]) -> None:
+    """Reject PASS cards that replace required provenance with legacy placeholders."""
+    metadata_lines = _metadata_section_lines(text)
+    fallback_line = metadata_lines[0][0] if metadata_lines else 1
+    for field, pattern in _PASS_METADATA_FIELD_RULES:
+        matches = _metadata_field_matches(metadata_lines, field)
+        line_number = matches[0][0] if matches else fallback_line
+        if len(matches) != 1 or not pattern.fullmatch(matches[0][1]):
+            offenders.append(
+                Offender(path, line_number, f"publication PASS without recorded {field.lower()}")
+            )
+
+    agent_matches = _metadata_field_matches(metadata_lines, "Agents")
+    line_number = agent_matches[0][0] if agent_matches else fallback_line
+    if len(agent_matches) != 1:
+        return
+    value = agent_matches[0][1]
+    if (value.lower().startswith("not recorded") or _valid_agent_model_states(value)) and not (
+        _valid_recorded_agent_models(value)
+    ):
+        offenders.append(Offender(path, line_number, "publication PASS without recorded agent model identity"))
+
+
+def _valid_recorded_agent_models(value: str) -> bool:
+    agents = [agent.strip() for agent in value.split(",")]
+    return bool(agents) and all(_RECORDED_AGENT_MODEL_STATE.fullmatch(agent) for agent in agents)
 
 
 def find_offenders(roots: list[Path]) -> tuple[list[Path], list[Offender]]:

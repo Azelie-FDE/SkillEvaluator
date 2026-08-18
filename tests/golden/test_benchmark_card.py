@@ -107,12 +107,13 @@ def _live_tier3_result() -> ValidationResult:
             "unclassified_tasks": 0,
             "source": "dataset",
         },
-        "dataset_digest": "sha256:0123456789abcdef",
+        "dataset_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "dataset_digest_algorithm": "skill-evaluator-dataset-snapshot/1",
         "attempt_policy": {"max_attempts": 3, "pass_threshold": 0.5},
         "agents": {
             "claude-code": {
                 "model": "claude-sonnet",
+                "execution_status": "succeeded",
                 "baseline": 0.47,
                 "with_skill": 0.92,
                 "dimensions": dimensions(0.47, 0.92),
@@ -120,6 +121,7 @@ def _live_tier3_result() -> ValidationResult:
             },
             "codex": {
                 "model": "gpt-codex",
+                "execution_status": "succeeded",
                 "baseline": 0.55,
                 "with_skill": 0.88,
                 "dimensions": dimensions(0.55, 0.88),
@@ -177,7 +179,10 @@ def test_benchmark_live_results_are_decision_first_and_unambiguous() -> None:
     assert "- Evaluation date: 2026-07-24" in rendered
     assert "- Evaluator version: `0.8.2`" in rendered
     assert "- Tasks: 8 evaluation tasks (6 positive, 2 negative)" in rendered
-    assert "- Dataset digest: `sha256:0123456789abcdef` (skill-evaluator-dataset-snapshot/1)" in rendered
+    assert (
+        "- Dataset digest: `sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef` "
+        "(skill-evaluator-dataset-snapshot/1)"
+    ) in rendered
     assert "- Tier 3 evidence: required for publication" in rendered
     assert "Each task attempt ran in its own isolated sandbox." in rendered
     assert "| Measure | Claude Code (Baseline → Skill Uplift) | Codex (Baseline → Skill Uplift) |" in rendered
@@ -222,7 +227,7 @@ def test_benchmark_allows_explicit_persisted_optional_tier3_policy() -> None:
     assert "- Tier 3 evidence: optional by policy" in rendered
 
 
-def test_legacy_neutral_verdict_stays_neutral_without_execution_status() -> None:
+def test_legacy_neutral_verdict_is_incomplete_without_required_evidence() -> None:
     tier3 = _tier3_result(environment="docker")
     payload = tier3.metadata["agent_eval"]
     payload["verdict"] = "neutral"
@@ -230,9 +235,9 @@ def test_legacy_neutral_verdict_stays_neutral_without_execution_status() -> None
 
     rendered = BenchmarkReporter(include_timestamp=False).render_all([*_deterministic_results(), tier3])
 
-    assert "Overall verdict: NEUTRAL" in rendered
+    assert "Overall verdict: INCOMPLETE" in rendered
     assert "## Publication Recommendation" not in rendered
-    assert "| Tier 3 | Live agent evaluation | **NEUTRAL** |" in rendered
+    assert "| Tier 3 | Live agent evaluation | **INCOMPLETE** |" in rendered
 
 
 def test_verdict_callout_falls_back_for_future_statuses() -> None:

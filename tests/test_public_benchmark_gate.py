@@ -5,12 +5,13 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 from scripts.ci import check_public_benchmarks as benchmark_gate
 
-from skillevaluator.evaluation.tier3_report import advisory_skip_result
+from skillevaluator.evaluation.tier3_report import _validation_result_from_payload, advisory_skip_result
 from skillevaluator.models import Finding, Severity, ValidationResult
 from skillevaluator.reporting import BenchmarkReporter
 
@@ -33,7 +34,7 @@ def _valid_benchmark() -> str:
 - Evaluator version: `0.8.3`
 - Agents: Codex (`gpt-codex`)
 - Tasks: 4 evaluation tasks
-- Dataset digest: `sha256:0123456789abcdef` (skill-evaluator-dataset-snapshot/1)
+- Dataset digest: `sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef` (skill-evaluator-dataset-snapshot/1)
 - Attempts per task: 1
 - Environment: `Isolated sandbox`
 - Tier 3 evidence: required for publication
@@ -122,7 +123,7 @@ def test_gate_requires_explicit_agent_model_state(tmp_path: Path) -> None:
     assert {offender.reason for offender in offenders} == {"agent model identity not recorded"}
 
 
-def test_gate_accepts_multiple_explicit_agent_model_states(tmp_path: Path) -> None:
+def test_gate_rejects_pass_when_any_agent_model_is_not_recorded(tmp_path: Path) -> None:
     benchmark = tmp_path / "BENCHMARK.md"
     benchmark.write_text(
         _valid_benchmark().replace(
@@ -134,7 +135,9 @@ def test_gate_accepts_multiple_explicit_agent_model_states(tmp_path: Path) -> No
 
     _files, offenders = benchmark_gate.find_offenders([benchmark])
 
-    assert offenders == []
+    assert {offender.reason for offender in offenders} == {
+        "publication PASS without recorded agent model identity"
+    }
 
 
 @pytest.mark.parametrize(
@@ -223,6 +226,16 @@ def _tier3_result(verdict: str, *, legacy: bool = False) -> ValidationResult:
         "agents": {"codex": {} if legacy else {"model": "gpt-codex"}},
     }
     if not legacy:
+        dimension_score = {"pass": 0.9, "neutral": 0.7, "fail": 0.3}[verdict.lower()]
+        payload["agents"]["codex"].update(
+            {
+                "execution_status": "succeeded",
+                "dimensions": [
+                    {"id": dimension, "with_skill": dimension_score}
+                    for dimension in ("security", "correctness", "discoverability", "effectiveness", "efficiency")
+                ],
+            }
+        )
         payload.update(
             {
                 "execution_status": "succeeded",
@@ -235,7 +248,7 @@ def _tier3_result(verdict: str, *, legacy: bool = False) -> ValidationResult:
                     "unclassified_tasks": 0,
                     "source": "dataset",
                 },
-                "dataset_digest": "sha256:0123456789abcdef",
+                "dataset_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 "dataset_digest_algorithm": "skill-evaluator-dataset-snapshot/1",
                 "attempt_policy": {"max_attempts": 1, "pass_threshold": 0.5},
             }
@@ -285,6 +298,38 @@ def test_legacy_pass_is_incomplete_without_publication_provenance(tmp_path: Path
 
     assert "Overall verdict: INCOMPLETE" in rendered
     assert "## Publication Recommendation" not in rendered
+    assert offenders == []
+
+
+def test_legacy_neutral_is_incomplete_without_required_publication_provenance(tmp_path: Path) -> None:
+    rendered = BenchmarkReporter(include_timestamp=True).render_all(
+        [_tier1_result(), _tier3_result("NEUTRAL", legacy=True)]
+    )
+    benchmark = tmp_path / "BENCHMARK.md"
+    benchmark.write_text(rendered, encoding="utf-8")
+
+    _files, offenders = benchmark_gate.find_offenders([benchmark])
+
+    assert "Overall verdict: INCOMPLETE" in rendered
+    assert "| Tier 3 | Live agent evaluation | **INCOMPLETE** |" in rendered
+    assert offenders == []
+
+
+def test_malformed_canonical_pass_payload_is_incomplete_and_lints_cleanly(tmp_path: Path) -> None:
+    payload = deepcopy(_tier3_result("PASS").metadata["agent_eval"])
+    payload["overall_score"] = 0.9
+    payload["agents"]["codex"]["dimensions"] = []
+    result = _validation_result_from_payload(payload)
+    assert result is not None
+
+    rendered = BenchmarkReporter(include_timestamp=True).render_all([_tier1_result(), result])
+    benchmark = tmp_path / "BENCHMARK.md"
+    benchmark.write_text(rendered, encoding="utf-8")
+
+    _files, offenders = benchmark_gate.find_offenders([benchmark])
+
+    assert "Overall verdict: INCOMPLETE" in rendered
+    assert "| Tier 3 | Live agent evaluation | **INCOMPLETE** |" in rendered
     assert offenders == []
 
 
@@ -342,6 +387,24 @@ def test_reporter_sanitizes_finding_before_publication_gate(tmp_path: Path) -> N
 
     assert _private_sandbox_name() not in rendered
     assert "Observed in isolated sandbox during evaluation" in rendered
+    assert offenders == []
+
+
+def test_reporter_sanitizes_requested_environment_from_advisory_payload(tmp_path: Path) -> None:
+    private_environment = "secret-cluster"
+    result = advisory_skip_result(
+        f"Runtime unavailable in {private_environment}",
+        skill_name="demo-skill",
+    )
+    result.metadata["agent_eval"]["requested_environment"] = private_environment
+    rendered = BenchmarkReporter(include_timestamp=True).render_all([_tier1_result(), result])
+    benchmark = tmp_path / "BENCHMARK.md"
+    benchmark.write_text(rendered, encoding="utf-8")
+
+    _files, offenders = benchmark_gate.find_offenders([benchmark])
+
+    assert private_environment not in rendered
+    assert "Runtime unavailable in Isolated sandbox" in rendered
     assert offenders == []
 
 
@@ -419,6 +482,54 @@ def test_gate_does_not_treat_pass_in_tier3_evidence_as_completion(tmp_path: Path
     _files, offenders = benchmark_gate.find_offenders([benchmark])
 
     assert {offender.reason for offender in offenders} == {"publication PASS without completed Tier 3 evidence"}
+
+
+def test_gate_rejects_pass_with_placeholder_provenance(tmp_path: Path) -> None:
+    benchmark = tmp_path / "BENCHMARK.md"
+    content = _valid_benchmark()
+    replacements = {
+        "- Evaluation date: 2026-07-25": "- Evaluation date: not recorded (legacy or non-live result)",
+        "- Evaluator version: `0.8.3`": "- Evaluator version: not recorded (legacy or non-live result)",
+        "- Agents: Codex (`gpt-codex`)": "- Agents: Codex (model not recorded)",
+        "- Tasks: 4 evaluation tasks": "- Tasks: not recorded (legacy or non-live result)",
+        "- Dataset digest: `sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef` "
+        "(skill-evaluator-dataset-snapshot/1)": (
+            "- Dataset digest: not recorded (legacy or non-live result)"
+        ),
+        "- Attempts per task: 1": "- Attempts per task: not recorded (legacy or non-live result)",
+        "- Environment: `Isolated sandbox`": "- Environment: not recorded (legacy or non-live result)",
+    }
+    for original, replacement in replacements.items():
+        content = content.replace(original, replacement)
+    benchmark.write_text(content, encoding="utf-8")
+
+    _files, offenders = benchmark_gate.find_offenders([benchmark])
+
+    assert {offender.reason for offender in offenders} == {
+        "publication PASS without recorded evaluation date",
+        "publication PASS without recorded evaluator version",
+        "publication PASS without recorded agent model identity",
+        "publication PASS without recorded tasks",
+        "publication PASS without recorded dataset digest",
+        "publication PASS without recorded attempts per task",
+        "publication PASS without recorded environment",
+    }
+
+
+def test_gate_rejects_pass_with_malformed_dataset_digest(tmp_path: Path) -> None:
+    benchmark = tmp_path / "BENCHMARK.md"
+    benchmark.write_text(
+        _valid_benchmark().replace(
+            "`sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef` "
+            "(skill-evaluator-dataset-snapshot/1)",
+            "`md5:0123456789abcdef` (legacy)",
+        ),
+        encoding="utf-8",
+    )
+
+    _files, offenders = benchmark_gate.find_offenders([benchmark])
+
+    assert "publication PASS without recorded dataset digest" in {offender.reason for offender in offenders}
 
 
 def test_require_files_fails_empty_tree(tmp_path: Path, capsys) -> None:

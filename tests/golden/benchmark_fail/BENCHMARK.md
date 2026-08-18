@@ -11,7 +11,7 @@ The skill should be reviewed before publication. Address the blocking findings b
 - Evaluator version: `0.8.2`
 - Agents: Claude Code (`claude-sonnet`), Codex (`gpt-codex`)
 - Tasks: 8 evaluation tasks (6 positive, 2 negative)
-- Dataset digest: `sha256:0123456789abcdef` (skill-evaluator-dataset-snapshot/1)
+- Dataset digest: `sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef` (skill-evaluator-dataset-snapshot/1)
 - Attempts per task: 3
 - Environment: `Isolated sandbox`
 - Tier 3 evidence: required for publication

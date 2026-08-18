@@ -606,9 +606,15 @@ def _tier3_evidence_complete(ae: dict[str, Any] | None) -> bool:
     dataset_digest = ae.get("dataset_digest") or summary.get("dataset_digest")
     attempt_policy = _mapping(ae.get("attempt_policy"))
     attempts = _nonnegative_int(attempt_policy.get("max_attempts"))
-    environment = summary.get("environment") or ae.get("environment")
+    environment = (
+        summary.get("environment")
+        or summary.get("requested_environment")
+        or ae.get("environment")
+        or ae.get("requested_environment")
+    )
     return bool(
         execution_status == "succeeded"
+        and _tier3_dimension_verdict(ae) is not None
         and str(evaluated_at or "").strip()
         and str(evaluator_version or "").strip()
         and str(dataset_digest or "").strip()
@@ -616,6 +622,58 @@ def _tier3_evidence_complete(ae: dict[str, Any] | None) -> bool:
         and attempts > 0
         and str(environment or "").strip()
     )
+
+
+def _tier3_dimension_verdict(ae: dict[str, Any] | None) -> str | None:
+    """Recompute the canonical verdict from every supported agent's dimensions."""
+    supported_agents = [agent for agent in _agents(ae).values() if agent.get("execution_status") == "succeeded"]
+    if not supported_agents:
+        return None
+
+    agent_verdicts: list[str] = []
+    for agent in supported_agents:
+        scores = _agent_dimension_scores(agent)
+        if scores is None:
+            return None
+        if any(score < DIMENSION_VERDICT_NEUTRAL_THRESHOLD for score in scores):
+            agent_verdicts.append("fail")
+        elif any(score < DIMENSION_VERDICT_PASS_THRESHOLD for score in scores):
+            agent_verdicts.append("neutral")
+        else:
+            agent_verdicts.append("pass")
+
+    if "pass" in agent_verdicts:
+        return "pass"
+    if "neutral" in agent_verdicts:
+        return "neutral"
+    return "fail"
+
+
+def _agent_dimension_scores(agent: dict[str, Any]) -> list[float] | None:
+    """Return all configured in-range dimension scores, rejecting partial evidence."""
+    raw_dimensions = agent.get("dimensions")
+    if not isinstance(raw_dimensions, list):
+        return None
+    dimensions: dict[str, dict[str, Any]] = {}
+    for dimension in raw_dimensions:
+        if not isinstance(dimension, dict):
+            continue
+        dimension_id = str(dimension.get("id") or "")
+        if dimension_id in dimensions:
+            return None
+        dimensions[dimension_id] = dimension
+
+    scores: list[float] = []
+    for dimension_id in DIMENSION_MAPPING:
+        dimension = dimensions.get(dimension_id)
+        if dimension is None:
+            return None
+        value = dimension.get("with_skill") if "with_skill" in dimension else dimension.get("score")
+        score = _number(value)
+        if score is None or not 0.0 <= score <= 1.0:
+            return None
+        scores.append(score)
+    return scores
 
 
 def _advisory_agent_eval_skip_message(results: list[ValidationResult]) -> str | None:
@@ -653,14 +711,17 @@ def _overall_status(
     has_failures = not all(passes_required_gate(result) for result in results)
     summary = _mapping((ae or {}).get("summary"))
     verdict = str((ae or {}).get("verdict") or summary.get("verdict") or "").lower()
-    if has_failures or verdict == "fail":
+    dimension_verdict = _tier3_dimension_verdict(ae)
+    if has_failures or verdict == "fail" or dimension_verdict == "fail":
         return "FAIL"
 
+    if benchmark_policy["tier3_required"] and not _tier3_evidence_complete(ae):
+        return "INCOMPLETE"
     execution_status = str((ae or {}).get("execution_status") or summary.get("execution_status") or "").lower()
     if verdict == "neutral" and execution_status in {"succeeded", ""}:
         return "NEUTRAL"
-    if benchmark_policy["tier3_required"] and not _tier3_evidence_complete(ae):
-        return "INCOMPLETE"
+    if verdict == "pass" and dimension_verdict == "neutral":
+        return "NEUTRAL"
     return "PASS"
 
 
@@ -903,12 +964,23 @@ def _tier_status(
 
     if tier == "Tier 3" and ae:
         summary = _mapping(ae.get("summary"))
-        execution = str(ae.get("execution_status") or summary.get("execution_status") or "")
-        verdict = str(ae.get("verdict") or summary.get("verdict") or "").upper()
+        execution = str(ae.get("execution_status") or summary.get("execution_status") or "").lower()
+        verdict = str(ae.get("verdict") or summary.get("verdict") or "").lower()
+        dimension_verdict = _tier3_dimension_verdict(ae)
+        if verdict == "fail" or dimension_verdict == "fail":
+            return "FAIL", f"{len(_agents(ae))} agent(s); {_dataset_summary(ae)['total_tasks']} task(s)"
         if execution and execution != "succeeded":
             return "INCOMPLETE", f"Execution status: {execution}"
-        if verdict in {"PASS", "NEUTRAL", "FAIL"}:
-            return verdict, f"{len(_agents(ae))} agent(s); {_dataset_summary(ae)['total_tasks']} task(s)"
+        policy = _benchmark_policy(results, ae)
+        if policy["tier3_required"] and not _tier3_evidence_complete(ae):
+            return "INCOMPLETE", "Required Tier 3 evidence is missing"
+        effective_verdict = verdict
+        if verdict == "pass" and dimension_verdict == "neutral":
+            effective_verdict = "neutral"
+        if effective_verdict in {"pass", "neutral"}:
+            return effective_verdict.upper(), (
+                f"{len(_agents(ae))} agent(s); {_dataset_summary(ae)['total_tasks']} task(s)"
+            )
 
     status = "PASSED WITH OBSERVATIONS" if findings else "PASSED"
     return status, f"{len(results)} validator(s); {len(findings)} finding(s)"
@@ -1016,7 +1088,12 @@ def _private_environment_labels(ae: dict[str, Any] | None) -> tuple[str, ...]:
     if not ae:
         return ()
     summary = _mapping(ae.get("summary"))
-    candidates = [summary.get("environment"), ae.get("environment")]
+    candidates = [
+        summary.get("environment"),
+        summary.get("requested_environment"),
+        ae.get("environment"),
+        ae.get("requested_environment"),
+    ]
     labels: list[str] = []
     for value in candidates:
         label = " ".join(str(value or "").split())
