@@ -201,40 +201,44 @@ _COMPOSE_ALLOWED_BUILD_KEYS = frozenset(
 )
 _COMPOSE_ALLOWED_NETWORK_KEYS = frozenset({"attachable", "enable_ipv4", "enable_ipv6", "internal", "labels"})
 _COMPOSE_ALLOWED_VOLUME_KEYS = frozenset({"labels"})
-_VERIFIER_PROVIDER_ENV_VARS = frozenset(
-    {
-        "SKILL_EVAL_LLM_PROVIDER",
-        "SKILL_EVAL_LLM_MODEL",
-        "SKILL_EVAL_LLM_API_KEY",
-        "SKILL_EVAL_LLM_BASE_URL",
-        "OPENAI_API_KEY",
-        "OPENAI_BASE_URL",
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_BASE_URL",
-        "NVIDIA_API_KEY",
-        "AWS_REGION",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_BEARER_TOKEN_BEDROCK",
-        "AWS_CONFIG_FILE",
-        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
-        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
-        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-        "AWS_DEFAULT_REGION",
-        "AWS_PROFILE",
-        "AWS_ROLE_ARN",
-        "AWS_ROLE_SESSION_NAME",
-        "AWS_SDK_LOAD_CONFIG",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SESSION_TOKEN",
-        "AWS_SHARED_CREDENTIALS_FILE",
-        "AWS_WEB_IDENTITY_TOKEN_FILE",
-    }
+_VERIFIER_JUDGE_MODEL_ENV_VARS = frozenset({"LLM_JUDGE_MODEL", "SKILL_EVAL_JUDGE_MODEL"})
+_VERIFIER_PROVIDER_ENV_VARS = (
+    frozenset(
+        {
+            "SKILL_EVAL_LLM_PROVIDER",
+            "SKILL_EVAL_LLM_MODEL",
+            "SKILL_EVAL_LLM_API_KEY",
+            "SKILL_EVAL_LLM_BASE_URL",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "NVIDIA_API_KEY",
+            "AWS_REGION",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_CONFIG_FILE",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+            "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_DEFAULT_REGION",
+            "AWS_PROFILE",
+            "AWS_ROLE_ARN",
+            "AWS_ROLE_SESSION_NAME",
+            "AWS_SDK_LOAD_CONFIG",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+        }
+    )
+    | _VERIFIER_JUDGE_MODEL_ENV_VARS
 )
 
 
 def _verifier_env_vars(runtime_env: dict[str, str] | None = None) -> tuple[str, ...]:
-    """Return public provider variables explicitly staged for the verifier."""
+    """Return evaluator-controlled variables explicitly staged for the verifier."""
     return tuple(sorted(set(runtime_env or {}).intersection(_VERIFIER_PROVIDER_ENV_VARS)))
 
 
@@ -4215,6 +4219,108 @@ def _native_entry_id(task_dir: Path) -> str:
     return task_dir.name
 
 
+def _environment_reference_names(value: object) -> set[str]:
+    """Return portable shell-style environment references from a TOML value."""
+    if not isinstance(value, str):
+        return set()
+    dollar_references = {
+        braced or plain
+        for braced, plain in re.findall(
+            r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}|\$([A-Za-z_][A-Za-z0-9_]*)\b",
+            value,
+        )
+    }
+    percent_references = set(re.findall(r"%([A-Za-z_][A-Za-z0-9_]*)%", value))
+    return dollar_references | percent_references
+
+
+def _judge_model_env_controls(environment: dict[str, Any]) -> set[str]:
+    """Return reserved judge-model names used as keys or value references."""
+    authored_keys = {name for name in environment if name.upper() in _VERIFIER_JUDGE_MODEL_ENV_VARS}
+    authored_references = {
+        reference
+        for value in environment.values()
+        for reference in _environment_reference_names(value)
+        if reference.upper() in _VERIFIER_JUDGE_MODEL_ENV_VARS
+    }
+    return authored_keys | authored_references
+
+
+def _native_env_table(container: dict[str, Any], *, path: str, task_toml: Path) -> dict[str, Any]:
+    environment = container.get("env", {})
+    if not isinstance(environment, dict):
+        raise ValueError(f"Native Harbor task [{path}] must be a table: {task_toml}")
+    return environment
+
+
+def _native_verifier_env_tables(
+    verifier: dict[str, Any],
+    *,
+    path: str,
+    task_toml: Path,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Return every process or persistent environment owned by a verifier."""
+    environments = [(f"{path}.env", _native_env_table(verifier, path=f"{path}.env", task_toml=task_toml))]
+    persistent = verifier.get("environment")
+    if persistent is None:
+        return environments
+    if not isinstance(persistent, dict):
+        raise ValueError(f"Native Harbor task [{path}.environment] must be a table: {task_toml}")
+    environments.append(
+        (
+            f"{path}.environment.env",
+            _native_env_table(persistent, path=f"{path}.environment.env", task_toml=task_toml),
+        )
+    )
+    return environments
+
+
+def _validate_native_judge_model_controls(
+    task_toml: Path,
+    *,
+    data: dict[str, Any],
+    environment_env: dict[str, Any],
+) -> None:
+    agent_controls = sorted(_judge_model_env_controls(environment_env))
+    if agent_controls:
+        raise ValueError(
+            f"Native Harbor task [environment.env] cannot name or reference evaluator-controlled judge model "
+            f"variable(s): {', '.join(agent_controls)}: {task_toml}"
+        )
+
+    verifier = data.get("verifier", {})
+    if not isinstance(verifier, dict):
+        raise ValueError(f"Native Harbor task [verifier] must be a table: {task_toml}")
+    verifier_tables = _native_verifier_env_tables(verifier, path="verifier", task_toml=task_toml)
+
+    steps = data.get("steps", [])
+    if steps is None:
+        steps = []
+    if not isinstance(steps, list):
+        raise ValueError(f"Native Harbor task [[steps]] must be an array of tables: {task_toml}")
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            raise ValueError(f"Native Harbor task [[steps]] entry {index} must be a table: {task_toml}")
+        step_verifier = step.get("verifier", {})
+        if not isinstance(step_verifier, dict):
+            raise ValueError(f"Native Harbor task [steps.verifier] entry {index} must be a table: {task_toml}")
+        verifier_tables.extend(
+            _native_verifier_env_tables(
+                step_verifier,
+                path=f"steps[{index}].verifier",
+                task_toml=task_toml,
+            )
+        )
+
+    for path, environment in verifier_tables:
+        controls = sorted(_judge_model_env_controls(environment))
+        if controls:
+            raise ValueError(
+                f"Native Harbor task [{path}] cannot name or reference evaluator-controlled judge model "
+                f"variable(s): {', '.join(controls)}: {task_toml}"
+            )
+
+
 def _native_task_workdir(task_dir: Path, *, allow_docker_image: bool = False) -> str | None:
     """Read and validate the workdir Harbor will use for a native task."""
     try:
@@ -4229,6 +4335,14 @@ def _native_task_workdir(task_dir: Path, *, allow_docker_image: bool = False) ->
     environment_env = environment.get("env", {})
     if not isinstance(environment_env, dict):
         raise ValueError(f"Native Harbor task [environment.env] must be a table: {task_dir / 'task.toml'}")
+    verifier = data.get("verifier", {}) if isinstance(data, dict) else {}
+    if not isinstance(verifier, dict):
+        raise ValueError(f"Native Harbor task [verifier] must be a table: {task_dir / 'task.toml'}")
+    _validate_native_judge_model_controls(
+        task_dir / "task.toml",
+        data=data,
+        environment_env=environment_env,
+    )
     _validate_runtime_discovery_env(environment_env)
     _validate_runtime_loader_env(environment_env)
     skills_dir = environment.get("skills_dir")
@@ -4269,40 +4383,71 @@ def _ensure_native_skills_dir(task_dir: Path) -> None:
     task_toml.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _toml_table_header_indices(lines: list[str], *segments: str) -> tuple[int, ...]:
+    """Locate raw candidates for a standard bare or quoted TOML table header."""
+    segment_patterns = [
+        rf"(?:{re.escape(segment)}|\"{re.escape(segment)}\"|'{re.escape(segment)}')" for segment in segments
+    ]
+    pattern = re.compile(r"^\s*\[\s*" + r"\s*\.\s*".join(segment_patterns) + r"\s*\]\s*(?:#.*)?$")
+    return tuple(index for index, line in enumerate(lines) if pattern.fullmatch(line))
+
+
+def _has_expected_verifier_env(content: str, expected: dict[str, str]) -> bool:
+    """Return whether parsed TOML contains the exact managed verifier values."""
+    try:
+        parsed = tomllib.loads(content)
+    except tomllib.TOMLDecodeError:
+        return False
+    verifier = parsed.get("verifier", {}) if isinstance(parsed, dict) else {}
+    environment = verifier.get("env", {}) if isinstance(verifier, dict) else {}
+    return isinstance(environment, dict) and all(environment.get(name) == value for name, value in expected.items())
+
+
 def _ensure_skill_evaluator_verifier_env(task_dir: Path, *, verifier_env: dict[str, str] | None) -> None:
-    """Ensure staged native tasks forward configured public provider variables."""
+    """Ensure staged native tasks forward configured evaluator variables."""
     task_toml = task_dir / "task.toml"
     content = task_toml.read_text(encoding="utf-8")
-    env_lines = [f'{name} = "${{{name}}}"' for name in _verifier_env_vars(verifier_env)]
-    if all(line in content for line in env_lines):
+    managed_names = _verifier_env_vars(verifier_env)
+    if not managed_names:
         return
 
+    parsed = tomllib.loads(content)
+    parsed_verifier = parsed.get("verifier", {}) if isinstance(parsed, dict) else {}
+    if not isinstance(parsed_verifier, dict):
+        raise ValueError(f"Native Harbor task [verifier] must be a table: {task_toml}")
+    expected = {name: f"${{{name}}}" for name in managed_names}
     lines = content.splitlines()
-    if "[verifier.env]" in lines:
-        idx = lines.index("[verifier.env]") + 1
-        existing = set(lines)
-        for line in reversed(env_lines):
-            if line not in existing:
-                lines.insert(idx, line)
-        task_toml.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return
-
-    env_block = ["[verifier.env]", *env_lines]
-    if "[verifier]" in lines:
-        start = lines.index("[verifier]") + 1
-        insert_at = len(lines)
-        for idx in range(start, len(lines)):
-            line = lines[idx].strip()
-            if line.startswith("[") and line.endswith("]"):
-                insert_at = idx
+    if "env" in parsed_verifier:
+        parsed_verifier_env = parsed_verifier["env"]
+        if not isinstance(parsed_verifier_env, dict):
+            raise ValueError(f"Native Harbor task [verifier.env] must be a table: {task_toml}")
+        env_lines = [
+            f'{name} = "{value}"' for name, value in expected.items() if parsed_verifier_env.get(name) != value
+        ]
+        if not env_lines:
+            return
+        updated_content = ""
+        for verifier_env_index in _toml_table_header_indices(lines, "verifier", "env"):
+            candidate_lines = lines.copy()
+            candidate_lines[verifier_env_index + 1 : verifier_env_index + 1] = env_lines
+            candidate = "\n".join(candidate_lines) + "\n"
+            if _has_expected_verifier_env(candidate, expected):
+                updated_content = candidate
                 break
-        lines[insert_at:insert_at] = ["", *env_block]
-        task_toml.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return
+        if not updated_content:
+            raise ValueError(f"Native Harbor task [verifier.env] must use a standard table header: {task_toml}")
+    else:
+        env_lines = [f'{name} = "{value}"' for name, value in expected.items()]
+        env_block = ["[verifier.env]", *env_lines]
+        if "verifier" in parsed:
+            candidate_lines = [*lines, "", *env_block]
+        else:
+            candidate_lines = [*lines, "", "[verifier]", "timeout_sec = 180.0", "", *env_block]
+        updated_content = "\n".join(candidate_lines) + "\n"
 
-    insert_at = lines.index("[environment]") if "[environment]" in lines else len(lines)
-    lines[insert_at:insert_at] = ["[verifier]", "timeout_sec = 180.0", "", *env_block, ""]
-    task_toml.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if not _has_expected_verifier_env(updated_content, expected):
+        raise ValueError(f"Cannot inject evaluator-controlled [verifier.env] into native task: {task_toml}")
+    task_toml.write_text(updated_content, encoding="utf-8")
 
 
 def _insert_table_block(lines: list[str], anchor: str, block: list[str]) -> None:

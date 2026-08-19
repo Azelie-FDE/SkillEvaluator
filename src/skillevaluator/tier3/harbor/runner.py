@@ -32,6 +32,7 @@ from skillevaluator.evaluation.tier3_report import render_agent_eval_html_report
 from skillevaluator.provider_config import ProviderConfig, ProviderConfigurationError, resolve_llm_provider
 from skillevaluator.tier3.evals_config import EvalsConfigError, load_evals_config
 from skillevaluator.tier3.harbor.adapter import (
+    _VERIFIER_JUDGE_MODEL_ENV_VARS,
     _prevalidate_baseline_skill_candidates,
     build_eval_base_image,
     find_evals_file,
@@ -232,6 +233,7 @@ _RUNTIME_ENV_HOST_CONTROL_NAMES = (
         }
     )
     | _BEDROCK_HOST_ENV_VARS
+    | _VERIFIER_JUDGE_MODEL_ENV_VARS
     | frozenset().union(*_HARBOR_ENV_MODE_VARS.values())
 )
 _RUNTIME_ENV_HOST_CONTROL_PREFIXES = (
@@ -422,11 +424,14 @@ def build_harbor_run_command(
 
 
 def _provider_environment(config: ProviderConfig) -> dict[str, str]:
-    """Map a public provider config to evaluator-owned verifier variables."""
+    """Build evaluator-owned verifier variables from provider config and host overrides."""
     environment = {
         "SKILL_EVAL_LLM_PROVIDER": config.provider,
         "SKILL_EVAL_LLM_MODEL": config.model,
     }
+    environment.update(
+        {name: value for name in _VERIFIER_JUDGE_MODEL_ENV_VARS if (value := os.environ.get(name, "").strip())}
+    )
     if config.provider == "anthropic":
         environment["ANTHROPIC_API_KEY"] = config.api_key or ""
         if config.base_url:
@@ -719,17 +724,26 @@ def _resolve_runtime_env(templates: dict[str, str] | None) -> tuple[dict[str, st
             errors.append(f"harbor.runtime_env.{name} controls the host process and is not allowed")
             continue
         template_value = str(template)
-        references = {
+        dollar_references = {
             braced or plain
             for braced, plain in re.findall(
-                r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))",
+                r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}|\$([A-Za-z_][A-Za-z0-9_]*)\b",
                 template_value,
             )
         }
+        percent_references = set(re.findall(r"%([A-Za-z_][A-Za-z0-9_]*)%", template_value))
+        references = dollar_references | percent_references
         owned_references = sorted(reference for reference in references if _is_operator_owned_runtime_name(reference))
         if owned_references:
             errors.append(
                 f"harbor.runtime_env.{name} references operator-owned credential(s): " + ", ".join(owned_references)
+            )
+            continue
+        if percent_references:
+            errors.append(
+                f"harbor.runtime_env.{name} uses unsupported %VAR% reference syntax for: "
+                + ", ".join(sorted(percent_references))
+                + "; use ${VAR}"
             )
             continue
         value = os.path.expandvars(template_value)

@@ -161,6 +161,8 @@ def test_skill_config_cannot_override_operator_owned_agent_credentials(owned_nam
         "OPENAI_BASE_URL",
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_BASE_URL",
+        "LLM_JUDGE_MODEL",
+        "SKILL_EVAL_JUDGE_MODEL",
         "AWS_SECRET_ACCESS_KEY",
         "E2B_API_KEY",
         "DOCKER_HOST",
@@ -179,15 +181,81 @@ def test_skill_config_cannot_alias_operator_owned_credentials(
     assert source_name in errors[0]
 
 
+@pytest.mark.parametrize("source_name", ["LLM_JUDGE_MODEL", "SKILL_EVAL_JUDGE_MODEL"])
+def test_skill_config_cannot_alias_judge_model_with_default_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+    source_name: str,
+) -> None:
+    monkeypatch.setenv(source_name, "operator-model")
+
+    resolved, errors = runner._resolve_runtime_env({"INNOCENT_NAME": f"${{{source_name}:-skill-fallback}}"})
+
+    assert resolved == {}
+    assert errors and "operator-owned" in errors[0]
+    assert source_name in errors[0]
+
+
 @pytest.mark.parametrize(
     "name",
-    ["SKILL_EVAL_LLM_BASE_URL", "SKILL_EVAL_LLM_PROVIDER", "SKILL_EVAL_LLM_API_KEY"],
+    [
+        "LLM_JUDGE_MODEL",
+        "SKILL_EVAL_JUDGE_MODEL",
+        "SKILL_EVAL_LLM_BASE_URL",
+        "SKILL_EVAL_LLM_PROVIDER",
+        "SKILL_EVAL_LLM_API_KEY",
+    ],
 )
-def test_skill_config_cannot_control_evaluator_provider_routing(name: str) -> None:
+def test_skill_config_cannot_control_evaluator_or_judge_routing(name: str) -> None:
     resolved, errors = runner._resolve_runtime_env({name: "https://attacker.example/v1"})
 
     assert resolved == {}
     assert errors and "host process" in errors[0]
+
+
+@pytest.mark.parametrize("name", ["LLM_JUDGE_MODEL", "SKILL_EVAL_JUDGE_MODEL"])
+@pytest.mark.parametrize("provider_name", ["openai", "anthropic", "bedrock", "nv_build"])
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        ("judge-model", "judge-model"),
+        ("  judge-model  ", "judge-model"),
+        ("", None),
+        ("   ", None),
+    ],
+)
+def test_provider_environment_forwards_each_host_judge_model_override(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    provider_name: str,
+    configured: str,
+    expected: str | None,
+) -> None:
+    monkeypatch.setattr(runner.os, "environ", {name: configured})
+
+    environment = runner._provider_environment(_provider(provider_name))
+
+    assert environment.get(name) == expected
+
+
+@pytest.mark.parametrize(
+    ("source_name", "expected_error"),
+    [
+        ("LLM_JUDGE_MODEL", "operator-owned"),
+        ("HOST_AGENT_TOKEN", "unsupported"),
+    ],
+)
+def test_runtime_env_rejects_windows_style_variable_references(
+    monkeypatch: pytest.MonkeyPatch,
+    source_name: str,
+    expected_error: str,
+) -> None:
+    monkeypatch.setenv(source_name, "host-value")
+
+    resolved, errors = runner._resolve_runtime_env({"SAFE_ALIAS": f"%{source_name}%"})
+
+    assert resolved == {}
+    assert errors and source_name in errors[0]
+    assert expected_error in errors[0]
 
 
 def test_mixed_agents_receive_disjoint_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -391,8 +459,11 @@ def test_run_harbor_eval_stages_per_agent_credential_trees(
     (skill / "evals").mkdir(parents=True)
     (skill / "evals" / "evals.json").write_text("[]\n", encoding="utf-8")
     provider = _provider("nv_build")
-    emitted: list[tuple[str, bool, dict[str, str]]] = []
+    emitted: list[tuple[str, bool, dict[str, str], dict[str, str]]] = []
     launched: dict[str, tuple[str, str, dict[str, str]]] = {}
+
+    monkeypatch.setenv("LLM_JUDGE_MODEL", "legacy-judge-model")
+    monkeypatch.setenv("SKILL_EVAL_JUDGE_MODEL", "judge-model")
 
     monkeypatch.setattr(runner, "resolve_llm_provider", lambda: provider)
     monkeypatch.setattr(
@@ -406,7 +477,14 @@ def test_run_harbor_eval_stages_per_agent_credential_trees(
     def emit(_skill, target, *, with_skill, runtime_env, **_kwargs):
         task = target / "case-001"
         task.mkdir(parents=True)
-        emitted.append((str(target.relative_to(tmp_path / "results")), with_skill, dict(runtime_env)))
+        emitted.append(
+            (
+                str(target.relative_to(tmp_path / "results")),
+                with_skill,
+                dict(runtime_env),
+                dict(_kwargs["verifier_env"]),
+            )
+        )
         return [task]
 
     def launch(**kwargs):
@@ -439,17 +517,30 @@ def test_run_harbor_eval_stages_per_agent_credential_trees(
     )
 
     assert "error" not in result
-    assert {(path.split("/")[-2], path.split("/")[-1], with_skill) for path, with_skill, _env in emitted} == {
+    assert {
+        (path.split("/")[-2], path.split("/")[-1], with_skill)
+        for path, with_skill, _runtime_env, _verifier_env in emitted
+    } == {
         ("opencode", "with", True),
         ("opencode", "without", False),
         ("claude-code", "with", True),
         ("claude-code", "without", False),
     }
-    staged = {(path.split("/")[-2], path.split("/")[-1]): env for path, _with_skill, env in emitted}
+    staged = {
+        (path.split("/")[-2], path.split("/")[-1]): runtime_env
+        for path, _with_skill, runtime_env, _verifier_env in emitted
+    }
     assert staged[("opencode", "with")] == {"NVIDIA_API_KEY": "${NVIDIA_API_KEY}"}
     assert staged[("claude-code", "with")] == {}
+    for _path, _with_skill, runtime_env, verifier_env in emitted:
+        assert "LLM_JUDGE_MODEL" not in runtime_env
+        assert "SKILL_EVAL_JUDGE_MODEL" not in runtime_env
+        assert verifier_env["LLM_JUDGE_MODEL"] == "${LLM_JUDGE_MODEL}"
+        assert verifier_env["SKILL_EVAL_JUDGE_MODEL"] == "${SKILL_EVAL_JUDGE_MODEL}"
     assert launched["opencode"][0].endswith("_harbor-tasks/opencode/with")
     assert launched["claude-code"][1].endswith("_harbor-tasks/claude-code/without")
+    assert launched["opencode"][2]["LLM_JUDGE_MODEL"] == "legacy-judge-model"
+    assert launched["opencode"][2]["SKILL_EVAL_JUDGE_MODEL"] == "judge-model"
     assert "ANTHROPIC_API_KEY" not in launched["opencode"][2]
     assert "OPENAI_API_KEY" not in launched["opencode"][2]
     assert launched["claude-code"][2]["NVIDIA_API_KEY"] == "provider-key"

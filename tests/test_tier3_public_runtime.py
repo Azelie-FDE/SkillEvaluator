@@ -356,14 +356,18 @@ def test_generated_task_keeps_evaluator_provider_variables_out_of_agent_environm
         has_skill=True,
         runtime_env={"SERVICE_API_TOKEN": "${SERVICE_API_TOKEN}"},
         verifier_env={
+            "LLM_JUDGE_MODEL": "${LLM_JUDGE_MODEL}",
             "SKILL_EVAL_LLM_PROVIDER": "${SKILL_EVAL_LLM_PROVIDER}",
+            "SKILL_EVAL_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}",
             "NVIDIA_API_KEY": "${NVIDIA_API_KEY}",
         },
     )
 
     task = tomllib.loads((tmp_path / "task.toml").read_text(encoding="utf-8"))
     assert task["verifier"]["env"] == {
+        "LLM_JUDGE_MODEL": "${LLM_JUDGE_MODEL}",
         "NVIDIA_API_KEY": "${NVIDIA_API_KEY}",
+        "SKILL_EVAL_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}",
         "SKILL_EVAL_LLM_PROVIDER": "${SKILL_EVAL_LLM_PROVIDER}",
     }
     assert task["environment"]["env"] == {

@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -198,6 +199,10 @@ def test_native_tasks_project_runtime_skills_without_root_evals(tmp_path: Path) 
         reference_skills_dir=references_dir,
         workspace_skill_paths=[workspace],
         copy_repo=True,
+        verifier_env={
+            "LLM_JUDGE_MODEL": "${LLM_JUDGE_MODEL}",
+            "SKILL_EVAL_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}",
+        },
     )[0]
 
     _assert_runtime_projection(task, target, workspace)
@@ -215,6 +220,194 @@ def test_native_tasks_project_runtime_skills_without_root_evals(tmp_path: Path) 
     assert (staged_nested_prebundled / "references" / "evals" / "keep.md").is_file()
     assert (task / "tests" / "entry.json").is_file()
     assert (task / "tests" / "grader.py").is_file()
+    task_config = tomllib.loads((task / "task.toml").read_text(encoding="utf-8"))
+    assert task_config["verifier"]["env"] == {
+        "LLM_JUDGE_MODEL": "${LLM_JUDGE_MODEL}",
+        "SKILL_EVAL_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}",
+    }
+    assert "LLM_JUDGE_MODEL" not in task_config["environment"].get("env", {})
+    assert "SKILL_EVAL_JUDGE_MODEL" not in task_config["environment"].get("env", {})
+
+
+@pytest.mark.parametrize("name", ["LLM_JUDGE_MODEL", "SKILL_EVAL_JUDGE_MODEL"])
+def test_native_tasks_reject_authored_judge_model_in_verifier_env(tmp_path: Path, name: str) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    _write_minimal_native_task(target)
+    task_toml = target / "evals" / "harbor" / "case-001" / "task.toml"
+    content = task_toml.read_text(encoding="utf-8").replace(
+        "[environment]",
+        f'[verifier]\ntimeout_sec = 180.0\n\n[verifier.env]\n{name} = "skill-model"\n\n[environment]',
+    )
+    task_toml.write_text(content, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=rf"verifier\.env.*{name}|{name}.*verifier\.env"):
+        stage_native_harbor_tasks(
+            target,
+            tmp_path / f"native-verifier-{name.lower()}",
+            verifier_env={name: f"${{{name}}}"},
+        )
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        'LLM_JUDGE_MODEL = "skill-model"',
+        'SKILL_EVAL_JUDGE_MODEL = "skill-model"',
+        'JUDGE_HINT = "$LLM_JUDGE_MODEL"',
+        'JUDGE_HINT = "${SKILL_EVAL_JUDGE_MODEL}"',
+        'JUDGE_HINT = "${LLM_JUDGE_MODEL:-skill-fallback}"',
+        'JUDGE_HINT = "${SKILL_EVAL_JUDGE_MODEL:-skill-fallback}"',
+        'JUDGE_HINT = "%LLM_JUDGE_MODEL%"',
+    ],
+)
+def test_native_tasks_reject_judge_model_controls_in_agent_environment(tmp_path: Path, assignment: str) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    _write_minimal_native_task(target)
+    task_toml = target / "evals" / "harbor" / "case-001" / "task.toml"
+    task_toml.write_text(
+        task_toml.read_text(encoding="utf-8") + f"\n[environment.env]\n{assignment}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"environment.env.*judge|judge.*environment.env"):
+        stage_native_harbor_tasks(target, tmp_path / "native-agent-judge-control")
+
+
+def test_native_task_comments_cannot_suppress_judge_model_injection(tmp_path: Path) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    _write_minimal_native_task(target)
+    task_toml = target / "evals" / "harbor" / "case-001" / "task.toml"
+    content = task_toml.read_text(encoding="utf-8").replace(
+        "[environment]",
+        '# LLM_JUDGE_MODEL = "${LLM_JUDGE_MODEL}"\n'
+        '# SKILL_EVAL_JUDGE_MODEL = "${SKILL_EVAL_JUDGE_MODEL}"\n\n'
+        "[environment]",
+    )
+    task_toml.write_text(content, encoding="utf-8")
+
+    task = stage_native_harbor_tasks(
+        target,
+        tmp_path / "native-comment-placeholder",
+        verifier_env={
+            "LLM_JUDGE_MODEL": "${LLM_JUDGE_MODEL}",
+            "SKILL_EVAL_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}",
+        },
+    )[0]
+
+    task_config = tomllib.loads((task / "task.toml").read_text(encoding="utf-8"))
+    assert task_config["verifier"]["env"] == {
+        "LLM_JUDGE_MODEL": "${LLM_JUDGE_MODEL}",
+        "SKILL_EVAL_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}",
+    }
+
+
+def test_native_task_preserves_noncanonical_verifier_env_table_when_injecting(tmp_path: Path) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    _write_minimal_native_task(target)
+    task_toml = target / "evals" / "harbor" / "case-001" / "task.toml"
+    content = task_toml.read_text(encoding="utf-8").replace(
+        "[environment]",
+        '[verifier]\ntimeout_sec = 180.0\n\n[ verifier . env ]\nCUSTOM = "preserved"\n\n[environment]',
+    )
+    task_toml.write_text(content, encoding="utf-8")
+
+    task = stage_native_harbor_tasks(
+        target,
+        tmp_path / "native-noncanonical-verifier-table",
+        verifier_env={"SKILL_EVAL_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}"},
+    )[0]
+
+    task_config = tomllib.loads((task / "task.toml").read_text(encoding="utf-8"))
+    assert task_config["verifier"]["env"] == {
+        "CUSTOM": "preserved",
+        "SKILL_EVAL_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}",
+    }
+
+
+def test_native_task_reuses_existing_exact_provider_placeholder_when_injecting(tmp_path: Path) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    _write_minimal_native_task(target)
+    task_toml = target / "evals" / "harbor" / "case-001" / "task.toml"
+    content = task_toml.read_text(encoding="utf-8").replace(
+        "[environment]",
+        "[verifier]\ntimeout_sec = 180.0\n\n[verifier.env]\n"
+        'SKILL_EVAL_LLM_PROVIDER = "${SKILL_EVAL_LLM_PROVIDER}"\n\n[environment]',
+    )
+    task_toml.write_text(content, encoding="utf-8")
+
+    task = stage_native_harbor_tasks(
+        target,
+        tmp_path / "native-existing-provider-placeholder",
+        verifier_env={
+            "SKILL_EVAL_LLM_MODEL": "${SKILL_EVAL_LLM_MODEL}",
+            "SKILL_EVAL_LLM_PROVIDER": "${SKILL_EVAL_LLM_PROVIDER}",
+        },
+    )[0]
+
+    task_config = tomllib.loads((task / "task.toml").read_text(encoding="utf-8"))
+    assert task_config["verifier"]["env"] == {
+        "SKILL_EVAL_LLM_MODEL": "${SKILL_EVAL_LLM_MODEL}",
+        "SKILL_EVAL_LLM_PROVIDER": "${SKILL_EVAL_LLM_PROVIDER}",
+    }
+
+
+@pytest.mark.parametrize("decoy_header", ["[verifier]", "[verifier.env]"])
+def test_native_task_ignores_verifier_header_inside_multiline_string(
+    tmp_path: Path,
+    decoy_header: str,
+) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    _write_minimal_native_task(target)
+    task_toml = target / "evals" / "harbor" / "case-001" / "task.toml"
+    content = task_toml.read_text(encoding="utf-8").replace(
+        '[metadata]\nentry_id = "case-001"',
+        f'[metadata]\nentry_id = "case-001"\ndescription = """\n{decoy_header}\ndecoy\n"""',
+    )
+    task_toml.write_text(content, encoding="utf-8")
+
+    task = stage_native_harbor_tasks(
+        target,
+        tmp_path / "native-multiline-decoy",
+        verifier_env={"SKILL_EVAL_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}"},
+    )[0]
+
+    task_config = tomllib.loads((task / "task.toml").read_text(encoding="utf-8"))
+    assert task_config["metadata"]["description"] == f"{decoy_header}\ndecoy\n"
+    assert task_config["verifier"]["env"] == {
+        "SKILL_EVAL_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}",
+    }
+
+
+@pytest.mark.parametrize("name", ["LLM_JUDGE_MODEL", "SKILL_EVAL_JUDGE_MODEL"])
+@pytest.mark.parametrize(
+    "authored_config",
+    [
+        '[verifier]\ntimeout_sec = 180.0\n\n[verifier.environment]\nworkdir = "/workspace"\n\n'
+        '[verifier.environment.env]\n{name} = "skill-model"\n',
+        '[[steps]]\nname = "step-one"\n\n[steps.verifier.env]\n{name} = "skill-model"\n',
+        '[[steps]]\nname = "step-one"\n\n[steps.verifier.environment]\nworkdir = "/workspace"\n\n'
+        '[steps.verifier.environment.env]\n{name} = "skill-model"\n',
+    ],
+)
+def test_native_tasks_reject_judge_model_controls_in_nested_verifier_envs(
+    tmp_path: Path,
+    name: str,
+    authored_config: str,
+) -> None:
+    _, target, _, _ = _write_projection_fixture(tmp_path)
+    _write_minimal_native_task(target)
+    task_toml = target / "evals" / "harbor" / "case-001" / "task.toml"
+    task_toml.write_text(
+        task_toml.read_text(encoding="utf-8") + "\n" + authored_config.format(name=name),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=rf"verifier.*{name}|{name}.*verifier"):
+        stage_native_harbor_tasks(
+            target,
+            tmp_path / "native-nested-verifier-control",
+            verifier_env={"SKILL_EVAL_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}"},
+        )
 
 
 def test_native_task_staging_uses_one_private_evals_snapshot(
