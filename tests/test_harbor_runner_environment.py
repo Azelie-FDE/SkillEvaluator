@@ -213,7 +213,7 @@ def test_skill_config_cannot_control_evaluator_or_judge_routing(name: str) -> No
 
 
 @pytest.mark.parametrize("name", ["LLM_JUDGE_MODEL", "SKILL_EVAL_JUDGE_MODEL"])
-@pytest.mark.parametrize("provider_name", ["openai", "anthropic", "bedrock", "nv_build"])
+@pytest.mark.parametrize("provider_name", ["openai", "openai-compatible", "anthropic", "bedrock", "nv_build"])
 @pytest.mark.parametrize(
     ("configured", "expected"),
     [
@@ -237,17 +237,10 @@ def test_provider_environment_forwards_each_host_judge_model_override(
     assert environment.get(name) == expected
 
 
-@pytest.mark.parametrize(
-    ("source_name", "expected_error"),
-    [
-        ("LLM_JUDGE_MODEL", "operator-owned"),
-        ("HOST_AGENT_TOKEN", "unsupported"),
-    ],
-)
-def test_runtime_env_rejects_windows_style_variable_references(
+@pytest.mark.parametrize("source_name", ["LLM_JUDGE_MODEL", "SKILL_EVAL_JUDGE_MODEL"])
+def test_runtime_env_rejects_operator_owned_windows_style_variable_references(
     monkeypatch: pytest.MonkeyPatch,
     source_name: str,
-    expected_error: str,
 ) -> None:
     monkeypatch.setenv(source_name, "host-value")
 
@@ -255,7 +248,83 @@ def test_runtime_env_rejects_windows_style_variable_references(
 
     assert resolved == {}
     assert errors and source_name in errors[0]
-    assert expected_error in errors[0]
+    assert "operator-owned" in errors[0]
+
+
+def test_runtime_env_preserves_platform_expansion_for_non_owned_percent_references(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expanded: list[str] = []
+
+    def expandvars(value: str) -> str:
+        expanded.append(value)
+        return value.replace("%HOST_AGENT_TOKEN%", "host-value")
+
+    monkeypatch.setattr(runner.os.path, "expandvars", expandvars)
+
+    resolved, errors = runner._resolve_runtime_env({"SAFE_ALIAS": "%HOST_AGENT_TOKEN%"})
+
+    assert errors == []
+    assert resolved == {"SAFE_ALIAS": "host-value"}
+    assert expanded == ["%HOST_AGENT_TOKEN%"]
+
+
+def test_custom_only_does_not_force_the_standard_judge_model_into_custom_verifiers() -> None:
+    provider_env = {
+        "LLM_JUDGE_MODEL": "legacy-judge-model",
+        "SKILL_EVAL_JUDGE_MODEL": "judge-model",
+    }
+
+    assert runner._job_judge_verifier_env(provider_env, "custom_only") == {}
+    assert runner._judge_model_config(_provider("nv_build"), provider_env, "custom_only") == {
+        "enabled": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("provider_env", "expected"),
+    [
+        (
+            {"SKILL_EVAL_JUDGE_MODEL": "operator-model"},
+            {"LLM_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}"},
+        ),
+        (
+            {"LLM_JUDGE_MODEL": "legacy-model", "SKILL_EVAL_JUDGE_MODEL": "operator-model"},
+            {"LLM_JUDGE_MODEL": "${LLM_JUDGE_MODEL}"},
+        ),
+    ],
+)
+def test_standard_judge_override_occupies_the_highest_precedence_verifier_key(
+    provider_env: dict[str, str],
+    expected: dict[str, str],
+) -> None:
+    assert runner._job_judge_verifier_env(provider_env, "default") == expected
+
+
+@pytest.mark.parametrize(
+    ("configured_model", "expected_source"),
+    [(None, "provider default"), ("operator-model", "SKILL_EVAL_LLM_MODEL")],
+)
+def test_judge_model_config_distinguishes_provider_default_from_explicit_model(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_model: str | None,
+    expected_source: str,
+) -> None:
+    if configured_model is None:
+        monkeypatch.delenv("SKILL_EVAL_LLM_MODEL", raising=False)
+    else:
+        monkeypatch.setenv("SKILL_EVAL_LLM_MODEL", configured_model)
+    provider = _provider("openai")
+
+    config = runner._judge_model_config(provider, runner._provider_environment(provider), "default")
+
+    assert config == {
+        "enabled": True,
+        "provider": "openai",
+        "model": "test-model",
+        "source": expected_source,
+        "override_applied": False,
+    }
 
 
 def test_mixed_agents_receive_disjoint_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -460,7 +529,7 @@ def test_run_harbor_eval_stages_per_agent_credential_trees(
     (skill / "evals" / "evals.json").write_text("[]\n", encoding="utf-8")
     provider = _provider("nv_build")
     emitted: list[tuple[str, bool, dict[str, str], dict[str, str]]] = []
-    launched: dict[str, tuple[str, str, dict[str, str]]] = {}
+    launched: dict[str, tuple[str, str, dict[str, str], dict[str, str]]] = {}
 
     monkeypatch.setenv("LLM_JUDGE_MODEL", "legacy-judge-model")
     monkeypatch.setenv("SKILL_EVAL_JUDGE_MODEL", "judge-model")
@@ -492,6 +561,7 @@ def test_run_harbor_eval_stages_per_agent_credential_trees(
             str(kwargs["with_skill"].relative_to(tmp_path / "results")),
             str(kwargs["baseline"].relative_to(tmp_path / "results")),
             dict(kwargs["run_env"]),
+            dict(kwargs["verifier_env"]),
         )
         return []
 
@@ -535,8 +605,8 @@ def test_run_harbor_eval_stages_per_agent_credential_trees(
     for _path, _with_skill, runtime_env, verifier_env in emitted:
         assert "LLM_JUDGE_MODEL" not in runtime_env
         assert "SKILL_EVAL_JUDGE_MODEL" not in runtime_env
-        assert verifier_env["LLM_JUDGE_MODEL"] == "${LLM_JUDGE_MODEL}"
-        assert verifier_env["SKILL_EVAL_JUDGE_MODEL"] == "${SKILL_EVAL_JUDGE_MODEL}"
+        assert "LLM_JUDGE_MODEL" not in verifier_env
+        assert "SKILL_EVAL_JUDGE_MODEL" not in verifier_env
     assert launched["opencode"][0].endswith("_harbor-tasks/opencode/with")
     assert launched["claude-code"][1].endswith("_harbor-tasks/claude-code/without")
     assert launched["opencode"][2]["LLM_JUDGE_MODEL"] == "legacy-judge-model"
@@ -544,6 +614,15 @@ def test_run_harbor_eval_stages_per_agent_credential_trees(
     assert "ANTHROPIC_API_KEY" not in launched["opencode"][2]
     assert "OPENAI_API_KEY" not in launched["opencode"][2]
     assert launched["claude-code"][2]["NVIDIA_API_KEY"] == "provider-key"
+    assert launched["opencode"][3] == {"LLM_JUDGE_MODEL": "${LLM_JUDGE_MODEL}"}
+    assert launched["claude-code"][3] == launched["opencode"][3]
+    assert result["run_config"]["judge"] == {
+        "enabled": True,
+        "provider": "nv_build",
+        "model": "legacy-judge-model",
+        "source": "LLM_JUDGE_MODEL",
+        "override_applied": True,
+    }
 
 
 def test_run_harbor_eval_rejects_provenance_key_inside_skill_before_creation(

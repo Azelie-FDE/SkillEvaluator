@@ -91,10 +91,15 @@ All notable changes to SkillEvaluator are documented in this file.
 ### Fixed
 
 - Tier 3 now forwards host-configured `LLM_JUDGE_MODEL` and
-  `SKILL_EVAL_JUDGE_MODEL` overrides to generated and native Harbor verifiers
-  while keeping them out of agent environments. Skill-authored `runtime_env`
-  and native task environments cannot set or alias either operator-controlled
-  judge override.
+  `SKILL_EVAL_JUDGE_MODEL` overrides through Harbor's verifier-only job layer
+  for standard grading. They are not injected into the evaluated agent's
+  initial environment; skill-authored `runtime_env` and native task
+  `[environment.env]` tables cannot set or alias either operator-controlled
+  override.
+  Native verifier declarations remain compatible, while the job-level value
+  takes precedence during standard grading. Tier 3 results now record the
+  resolved judge provider, model, source, and whether a dedicated job-wide
+  override was applied, separately from agent models.
 - Quality scoring now uses boundary-aware and context-aware matching for XML tags,
   reserved names, MCP guidance, README references, time references, exclusivity
   language, instruction action verbs, and nested Markdown links, avoiding

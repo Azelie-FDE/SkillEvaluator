@@ -339,6 +339,7 @@ def build_harbor_run_command(
     override_memory_mb: int | None = None,
     override_storage_mb: int | None = None,
     agent_import_path: str | None = None,
+    verifier_env: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Build a Harbor invocation for a built-in environment type or local mode."""
     if env_mode not in HARBOR_ENV_MODES:
@@ -418,6 +419,8 @@ def build_harbor_run_command(
         command.extend(["--override-memory-mb", str(override_memory_mb)])
     if override_storage_mb is not None:
         command.extend(["--override-storage-mb", str(override_storage_mb)])
+    for name, value in sorted((verifier_env or {}).items()):
+        command.extend(["--verifier-env", f"{name}={value}"])
     if _harbor_supports_yes():
         command.append("--yes")
     return command
@@ -739,13 +742,6 @@ def _resolve_runtime_env(templates: dict[str, str] | None) -> tuple[dict[str, st
                 f"harbor.runtime_env.{name} references operator-owned credential(s): " + ", ".join(owned_references)
             )
             continue
-        if percent_references:
-            errors.append(
-                f"harbor.runtime_env.{name} uses unsupported %VAR% reference syntax for: "
-                + ", ".join(sorted(percent_references))
-                + "; use ${VAR}"
-            )
-            continue
         value = os.path.expandvars(template_value)
         if "$" in value:
             errors.append(f"harbor.runtime_env.{name} references an unset environment variable")
@@ -805,6 +801,48 @@ def _harbor_subprocess_environment(
                 environment.setdefault(name, value)
         environment = local_subprocess_env(runtime_agents=[agent] if agent else None, base_env=environment)
     return environment
+
+
+def _judge_model_config(
+    provider: ProviderConfig,
+    provider_env: Mapping[str, str],
+    grading_mode: str,
+) -> dict[str, str | bool]:
+    """Describe the configured standard-grading judge before any provider fallback."""
+    if grading_mode == "custom_only":
+        return {"enabled": False}
+    for name in ("LLM_JUDGE_MODEL", "SKILL_EVAL_JUDGE_MODEL"):
+        if model := provider_env.get(name):
+            return {
+                "enabled": True,
+                "provider": provider.provider,
+                "model": model,
+                "source": name,
+                "override_applied": True,
+            }
+    return {
+        "enabled": True,
+        "provider": provider.provider,
+        "model": provider.model,
+        "source": (
+            "SKILL_EVAL_LLM_MODEL" if os.environ.get("SKILL_EVAL_LLM_MODEL", "").strip() else "provider default"
+        ),
+        "override_applied": False,
+    }
+
+
+def _job_judge_verifier_env(provider_env: Mapping[str, str], grading_mode: str) -> dict[str, str]:
+    """Return host-resolved judge overrides for Harbor's verifier-only job layer."""
+    if grading_mode == "custom_only":
+        return {}
+    if provider_env.get("LLM_JUDGE_MODEL"):
+        return {"LLM_JUDGE_MODEL": "${LLM_JUDGE_MODEL}"}
+    if provider_env.get("SKILL_EVAL_JUDGE_MODEL"):
+        # The bundled verifier reads LLM_JUDGE_MODEL first. Place either host
+        # override at that highest-precedence key so a task-authored legacy
+        # value cannot win after Harbor merges task, step, and job env.
+        return {"LLM_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}"}
+    return {}
 
 
 def _agent_credentials(
@@ -1131,6 +1169,7 @@ def _run_harbor(
     override_memory_mb: int | None,
     override_storage_mb: int | None,
     agent_import_path: str | None = None,
+    verifier_env: Mapping[str, str] | None = None,
     expected_trials: int | None = None,
     expected_total_trials: int | None = None,
     include_task_names: list[str] | None = None,
@@ -1150,6 +1189,7 @@ def _run_harbor(
         override_memory_mb=override_memory_mb,
         override_storage_mb=override_storage_mb,
         agent_import_path=agent_import_path,
+        verifier_env=verifier_env,
     )
     try:
         with _nvidia_build_key_handoff(run_env, env_mode=env_mode) as subprocess_env:
@@ -1406,6 +1446,7 @@ def _run_stop_on_pass_variant(
     override_memory_mb: int | None,
     override_storage_mb: int | None,
     agent_import_path: str | None = None,
+    verifier_env: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Run each case one attempt at a time, stopping its attempts on first pass."""
     errors: list[str] = []
@@ -1428,6 +1469,7 @@ def _run_stop_on_pass_variant(
                 override_memory_mb=override_memory_mb,
                 override_storage_mb=override_storage_mb,
                 agent_import_path=agent_import_path,
+                verifier_env=verifier_env,
                 expected_trials=1,
                 include_task_names=[task_name],
             )
@@ -1463,6 +1505,7 @@ def _run_agent_pair(
     stop_on_pass: bool = False,
     pass_threshold: float = 0.50,
     task_names: list[str] | None = None,
+    verifier_env: Mapping[str, str] | None = None,
 ) -> list[str]:
     jobs = [("with", with_skill)]
     if baseline is not None:
@@ -1490,6 +1533,7 @@ def _run_agent_pair(
                     override_memory_mb=override_memory_mb,
                     override_storage_mb=override_storage_mb,
                     agent_import_path=agent_import_path,
+                    verifier_env=verifier_env,
                 )
             )
         return sequential_errors
@@ -1520,6 +1564,7 @@ def _run_agent_pair(
                 override_memory_mb=override_memory_mb,
                 override_storage_mb=override_storage_mb,
                 agent_import_path=agent_import_path,
+                verifier_env=verifier_env,
                 expected_trials=expected_trials,
             ): variant
             for (variant, dataset), condition_concurrency in zip(jobs, job_concurrency, strict=True)
@@ -1842,7 +1887,8 @@ def _run_harbor_eval_impl(
     )
     reporter.emit(ProgressEvent(stage="credential-validation", state="complete", detail="credentials validated"))
     verifier_env = {**configured_runtime_env, **provider_env}
-    staged_verifier_env = {name: f"${{{name}}}" for name in verifier_env}
+    staged_verifier_env = {name: f"${{{name}}}" for name in verifier_env if name not in _VERIFIER_JUDGE_MODEL_ENV_VARS}
+    job_judge_verifier_env = _job_judge_verifier_env(provider_env, grading_mode)
 
     include_values = [*workspace_config.get("include", []), *(include_skills or [])]
     if include_values and workspace_mode != "group":
@@ -2156,6 +2202,7 @@ def _run_harbor_eval_impl(
             stop_on_pass=bool(stop_on_pass),
             pass_threshold=float(pass_threshold),
             task_names=task_names,
+            verifier_env=job_judge_verifier_env,
         )
 
     active_agents: set[str] = set()
@@ -2248,6 +2295,7 @@ def _run_harbor_eval_impl(
             "jobs_retained": keep_harbor_jobs,
         },
         "provider": {"name": provider.provider, "model": provider.model},
+        "judge": _judge_model_config(provider, provider_env, grading_mode),
         "task_source": task_source,
         "grading": {"mode": grading_mode},
         "agents": model_resolution,
