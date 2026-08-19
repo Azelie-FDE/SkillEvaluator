@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 
 import pytest
+from harbor.utils.env import resolve_env_vars
 
 from skillevaluator.provider_config import ProviderConfig
 from skillevaluator.tier3.harbor import runner
@@ -276,6 +277,7 @@ def test_custom_only_does_not_force_the_standard_judge_model_into_custom_verifie
     }
 
     assert runner._job_judge_verifier_env(provider_env, "custom_only") == {}
+    assert runner._job_judge_subprocess_env(provider_env, "custom_only") == {}
     assert runner._judge_model_config(_provider("nv_build"), provider_env, "custom_only") == {
         "enabled": False,
     }
@@ -286,11 +288,17 @@ def test_custom_only_does_not_force_the_standard_judge_model_into_custom_verifie
     [
         (
             {"SKILL_EVAL_JUDGE_MODEL": "operator-model"},
-            {"LLM_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}"},
+            {
+                "LLM_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}",
+                "SKILL_EVAL_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}",
+            },
         ),
         (
             {"LLM_JUDGE_MODEL": "legacy-model", "SKILL_EVAL_JUDGE_MODEL": "operator-model"},
-            {"LLM_JUDGE_MODEL": "${LLM_JUDGE_MODEL}"},
+            {
+                "LLM_JUDGE_MODEL": "${LLM_JUDGE_MODEL}",
+                "SKILL_EVAL_JUDGE_MODEL": "${LLM_JUDGE_MODEL}",
+            },
         ),
     ],
 )
@@ -299,6 +307,78 @@ def test_standard_judge_override_occupies_the_highest_precedence_verifier_key(
     expected: dict[str, str],
 ) -> None:
     assert runner._job_judge_verifier_env(provider_env, "default") == expected
+
+
+@pytest.mark.parametrize(
+    "host_env",
+    [
+        {"LLM_JUDGE_MODEL": "host-legacy"},
+        {"SKILL_EVAL_JUDGE_MODEL": "host-canonical"},
+        {"LLM_JUDGE_MODEL": "host-legacy", "SKILL_EVAL_JUDGE_MODEL": "host-canonical"},
+    ],
+)
+def test_standard_judge_override_replaces_both_native_aliases_before_harbor_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    host_env: dict[str, str],
+) -> None:
+    for name in ("LLM_JUDGE_MODEL", "SKILL_EVAL_JUDGE_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in host_env.items():
+        monkeypatch.setenv(name, value)
+    provider_env = runner._provider_environment(_provider())
+    task_env = {
+        "LLM_JUDGE_MODEL": "task-legacy",
+        "SKILL_EVAL_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}",
+    }
+
+    merged = {**task_env, **runner._job_judge_verifier_env(provider_env, "default")}
+    resolved = resolve_env_vars(merged)
+    selected = host_env.get("LLM_JUDGE_MODEL") or host_env["SKILL_EVAL_JUDGE_MODEL"]
+
+    assert resolved == {
+        "LLM_JUDGE_MODEL": selected,
+        "SKILL_EVAL_JUDGE_MODEL": selected,
+    }
+
+
+@pytest.mark.parametrize("grading_mode", ["default", "default_plus_custom"])
+@pytest.mark.parametrize(
+    "host_env",
+    [
+        {"LLM_JUDGE_MODEL": "host-legacy"},
+        {"SKILL_EVAL_JUDGE_MODEL": "host-canonical"},
+        {"LLM_JUDGE_MODEL": "host-legacy", "SKILL_EVAL_JUDGE_MODEL": "host-canonical"},
+    ],
+)
+def test_standard_judge_override_resolves_both_aliases_for_separate_verifier_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    grading_mode: str,
+    host_env: dict[str, str],
+) -> None:
+    for name in ("LLM_JUDGE_MODEL", "SKILL_EVAL_JUDGE_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in host_env.items():
+        monkeypatch.setenv(name, value)
+    provider_env = runner._provider_environment(_provider())
+    subprocess_aliases = runner._job_judge_subprocess_env(provider_env, grading_mode)
+
+    with monkeypatch.context() as resolver_env:
+        for name in ("LLM_JUDGE_MODEL", "SKILL_EVAL_JUDGE_MODEL"):
+            resolver_env.delenv(name, raising=False)
+        for name, value in subprocess_aliases.items():
+            resolver_env.setenv(name, value)
+        resolved = resolve_env_vars(
+            {
+                "LLM_JUDGE_MODEL": "${LLM_JUDGE_MODEL}",
+                "SKILL_EVAL_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}",
+            }
+        )
+
+    selected = host_env.get("LLM_JUDGE_MODEL") or host_env["SKILL_EVAL_JUDGE_MODEL"]
+    assert resolved == {
+        "LLM_JUDGE_MODEL": selected,
+        "SKILL_EVAL_JUDGE_MODEL": selected,
+    }
 
 
 @pytest.mark.parametrize(
@@ -610,11 +690,14 @@ def test_run_harbor_eval_stages_per_agent_credential_trees(
     assert launched["opencode"][0].endswith("_harbor-tasks/opencode/with")
     assert launched["claude-code"][1].endswith("_harbor-tasks/claude-code/without")
     assert launched["opencode"][2]["LLM_JUDGE_MODEL"] == "legacy-judge-model"
-    assert launched["opencode"][2]["SKILL_EVAL_JUDGE_MODEL"] == "judge-model"
+    assert launched["opencode"][2]["SKILL_EVAL_JUDGE_MODEL"] == "legacy-judge-model"
     assert "ANTHROPIC_API_KEY" not in launched["opencode"][2]
     assert "OPENAI_API_KEY" not in launched["opencode"][2]
     assert launched["claude-code"][2]["NVIDIA_API_KEY"] == "provider-key"
-    assert launched["opencode"][3] == {"LLM_JUDGE_MODEL": "${LLM_JUDGE_MODEL}"}
+    assert launched["opencode"][3] == {
+        "LLM_JUDGE_MODEL": "${LLM_JUDGE_MODEL}",
+        "SKILL_EVAL_JUDGE_MODEL": "${LLM_JUDGE_MODEL}",
+    }
     assert launched["claude-code"][3] == launched["opencode"][3]
     assert result["run_config"]["judge"] == {
         "enabled": True,

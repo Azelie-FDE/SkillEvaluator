@@ -831,18 +831,35 @@ def _judge_model_config(
     }
 
 
-def _job_judge_verifier_env(provider_env: Mapping[str, str], grading_mode: str) -> dict[str, str]:
-    """Return host-resolved judge overrides for Harbor's verifier-only job layer."""
+def _job_judge_override(provider_env: Mapping[str, str], grading_mode: str) -> tuple[str, str] | None:
+    """Return the selected dedicated host override name and value, if enabled."""
     if grading_mode == "custom_only":
+        return None
+    for name in ("LLM_JUDGE_MODEL", "SKILL_EVAL_JUDGE_MODEL"):
+        if value := provider_env.get(name):
+            return name, value
+    return None
+
+
+def _job_judge_verifier_env(provider_env: Mapping[str, str], grading_mode: str) -> dict[str, str]:
+    """Return placeholder-based judge overrides for Harbor's verifier job layer."""
+    selected = _job_judge_override(provider_env, grading_mode)
+    if selected is None:
         return {}
-    if provider_env.get("LLM_JUDGE_MODEL"):
-        return {"LLM_JUDGE_MODEL": "${LLM_JUDGE_MODEL}"}
-    if provider_env.get("SKILL_EVAL_JUDGE_MODEL"):
-        # The bundled verifier reads LLM_JUDGE_MODEL first. Place either host
-        # override at that highest-precedence key so a task-authored legacy
-        # value cannot win after Harbor merges task, step, and job env.
-        return {"LLM_JUDGE_MODEL": "${SKILL_EVAL_JUDGE_MODEL}"}
-    return {}
+    source, _value = selected
+    # Harbor resolves every task-authored placeholder before verifier startup.
+    # Override both spellings from the selected host source so a stale alias
+    # cannot fail resolution or survive task/step/job environment merging.
+    return dict.fromkeys(sorted(_VERIFIER_JUDGE_MODEL_ENV_VARS), f"${{{source}}}")
+
+
+def _job_judge_subprocess_env(provider_env: Mapping[str, str], grading_mode: str) -> dict[str, str]:
+    """Make both aliases resolvable while Harbor constructs verifier environments."""
+    selected = _job_judge_override(provider_env, grading_mode)
+    if selected is None:
+        return {}
+    _source, value = selected
+    return dict.fromkeys(_VERIFIER_JUDGE_MODEL_ENV_VARS, value)
 
 
 def _agent_credentials(
@@ -1889,6 +1906,7 @@ def _run_harbor_eval_impl(
     verifier_env = {**configured_runtime_env, **provider_env}
     staged_verifier_env = {name: f"${{{name}}}" for name in verifier_env if name not in _VERIFIER_JUDGE_MODEL_ENV_VARS}
     job_judge_verifier_env = _job_judge_verifier_env(provider_env, grading_mode)
+    job_judge_subprocess_env = _job_judge_subprocess_env(provider_env, grading_mode)
 
     include_values = [*workspace_config.get("include", []), *(include_skills or [])]
     if include_values and workspace_mode != "group":
@@ -2140,7 +2158,7 @@ def _run_harbor_eval_impl(
                 model=model_resolution[agent]["model"],
                 env_mode=env_mode,
                 jobs_dir=jobs_dir,
-                run_env=runtime_plans[agent].subprocess_env,
+                run_env={**runtime_plans[agent].subprocess_env, **job_judge_subprocess_env},
                 timeout_multiplier=float(timeout_multiplier),
                 override_cpus=override_cpus,
                 override_memory_mb=override_memory_mb,
@@ -2190,7 +2208,7 @@ def _run_harbor_eval_impl(
             with_skill=agent_task_dirs[agent][0],
             baseline=agent_task_dirs[agent][1],
             jobs_dir=jobs_dir,
-            run_env=dict(runtime_plans[agent].subprocess_env),
+            run_env={**runtime_plans[agent].subprocess_env, **job_judge_subprocess_env},
             n_attempts=n_attempts,
             n_concurrent=n_concurrent,
             timeout_multiplier=float(timeout_multiplier),
