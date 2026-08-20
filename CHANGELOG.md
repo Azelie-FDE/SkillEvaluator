@@ -4,6 +4,17 @@ All notable changes to SkillEvaluator are documented in this file.
 
 ## Unreleased
 
+### Added
+
+- Added a public benchmark publication gate, regression coverage, and a
+  documented rollout plan for generated `BENCHMARK.md` cards.
+
+### Changed
+
+- Unified Tier 3 scoring around the canonical five dimensions, persisted an
+  immutable dataset-truth snapshot with provenance metadata, and redesigned
+  `BENCHMARK.md` as a decision-first publication card.
+
 ## 0.2.0 - 2026-08-18
 
 ### Security
