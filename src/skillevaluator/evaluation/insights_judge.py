@@ -45,21 +45,11 @@ _VALID_RECOMMENDATION_CATEGORIES = {
     "Improve",
     "Action",
 }
-_NEGATIVE_CONTROL_CLAIM_PHRASES = (
-    "unintended skill application",
-    "unexpected skill application",
-    "unintended skill activation",
-    "unexpected skill activation",
-    "scope misalignment",
-    "overfitting",
-    "overfit",
-)
-_IRRELEVANT_CASE_REMOVAL_RE = re.compile(
-    r"\b(?:exclude|remove|drop|delete|eliminate)\b.{0,80}"
-    r"\b(?:irrelevant|unrelated|out[- ]of[- ]scope)\b.{0,80}"
-    r"\b(?:case|cases|test|tests|query|queries|prompt|prompts|dataset)\b",
-    re.IGNORECASE,
-)
+_VALID_CLAIM_TYPES = {
+    "general",
+    "negative_control_failure",
+    "dataset_case_removal",
+}
 
 
 _SYSTEM_PROMPT = """\
@@ -97,11 +87,18 @@ NEGATIVE-CONTROL INTERPRETATION:
   when invocation evidence is absent or ambiguous, do not issue the warning.
 - Do not recommend removing an unrelated negative-control case merely because
   it is outside the skill's scope; that is what the case is designed to test.
-- Any conclusion or recommendation alleging unintended skill use, scope
-  misalignment, overfitting, or removal of an irrelevant case MUST include the
-  affected case ids in evidence_case_ids. Such a claim is valid only when the
-  supplied context shows failed routing or explicit invocation evidence for at
-  least one of those negative-control cases.
+- Every conclusion and recommendation MUST include a claim_type and an
+  evidence_case_ids list. Use claim_type "general" only for observations that
+  do not concern negative-control routing or removal of a dataset case. Use
+  claim_type "negative_control_failure" for unintended skill use, scope
+  misalignment, or overfitting involving a negative control. Use claim_type
+  "dataset_case_removal" for any recommendation to remove a case from the
+  dataset.
+- A negative_control_failure or dataset_case_removal claim MUST identify every
+  affected case in evidence_case_ids. Negative-control claims are valid only
+  when the supplied context shows failed routing or explicit invocation
+  evidence for at least one identified negative-control case. Do not label a
+  negative-control claim as general.
 
 Your job is to produce ADDITIONAL, contextual insights:
 
@@ -124,10 +121,10 @@ this exact schema:
 
 {{
   \"conclusions\": [
-    {{\"title\": \"<short title>\", \"message\": \"<1-2 sentences>\", \"severity\": \"pass|warn|fail\", \"evidence_case_ids\": [\"<case id>\"]}}
+    {{\"claim_type\": \"general|negative_control_failure\", \"title\": \"<short title>\", \"message\": \"<1-2 sentences>\", \"severity\": \"pass|warn|fail\", \"evidence_case_ids\": [\"<case id>\"]}}
   ],
   \"recommendations\": [
-    {{\"category\": \"<one of the allowed categories>\", \"title\": \"<short title>\", \"message\": \"<one imperative sentence>\", \"severity\": \"pass|warn|fail\", \"evidence_case_ids\": [\"<case id>\"]}}
+    {{\"claim_type\": \"general|negative_control_failure|dataset_case_removal\", \"category\": \"<one of the allowed categories>\", \"title\": \"<short title>\", \"message\": \"<one imperative sentence>\", \"severity\": \"pass|warn|fail\", \"evidence_case_ids\": [\"<case id>\"]}}
   ]
 }}
 """.format(
@@ -301,14 +298,6 @@ def _coerce_category(value: Any) -> str:
     return "Action"
 
 
-def _requires_negative_control_evidence(item: dict) -> bool:
-    text = f"{item.get('title') or ''} {item.get('message') or ''}"[:2_000]
-    lowered = text.casefold()
-    return any(phrase in lowered for phrase in _NEGATIVE_CONTROL_CLAIM_PHRASES) or bool(
-        _IRRELEVANT_CASE_REMOVAL_RE.search(text)
-    )
-
-
 def _negative_control_grounding(canonical: dict) -> tuple[dict[str, bool], set[str]]:
     """Return negative cases mapped to whether invocation/routing failure exists."""
     known_case_ids: set[str] = set()
@@ -345,11 +334,17 @@ def _negative_control_grounding(canonical: dict) -> tuple[dict[str, bool], set[s
     return evidence, known_case_ids
 
 
-def _referenced_case_ids(item: dict, known_case_ids: set[str]) -> set[str]:
-    references: set[str] = set()
+def _declared_case_ids(item: dict) -> set[str] | None:
     raw_references = item.get("evidence_case_ids")
-    if isinstance(raw_references, list):
-        references.update(str(value) for value in raw_references[:10] if value is not None)
+    if not isinstance(raw_references, list) or len(raw_references) > 10:
+        return None
+    if any(not isinstance(value, str) or not value.strip() for value in raw_references):
+        return None
+    return {value.strip() for value in raw_references}
+
+
+def _text_case_ids(item: dict, known_case_ids: set[str]) -> set[str]:
+    references: set[str] = set()
 
     text = f"{item.get('title') or ''} {item.get('message') or ''}"[:2_000]
     for case_id in known_case_ids:
@@ -358,22 +353,31 @@ def _referenced_case_ids(item: dict, known_case_ids: set[str]) -> set[str]:
     return references
 
 
-def _unsupported_negative_control_claim(
+def _claim_is_grounded(
     item: dict,
     grounding: tuple[dict[str, bool], set[str]],
 ) -> bool:
     evidence, known_case_ids = grounding
-    if not evidence or not _requires_negative_control_evidence(item):
+    claim_type = item.get("claim_type")
+    if claim_type not in _VALID_CLAIM_TYPES:
         return False
 
-    references = _referenced_case_ids(item, known_case_ids)
-    if not references or any(case_id not in known_case_ids for case_id in references):
-        return True
-
-    negative_references = references.intersection(evidence)
-    if not negative_references:
+    declared_case_ids = _declared_case_ids(item)
+    if declared_case_ids is None or not declared_case_ids.issubset(known_case_ids):
         return False
-    return not any(evidence[case_id] for case_id in negative_references)
+    if not _text_case_ids(item, known_case_ids).issubset(declared_case_ids):
+        return False
+
+    negative_case_ids = declared_case_ids.intersection(evidence)
+    if claim_type == "general":
+        return not negative_case_ids
+
+    if not declared_case_ids:
+        return False
+    if claim_type == "negative_control_failure" and declared_case_ids != negative_case_ids:
+        return False
+
+    return not negative_case_ids or any(evidence[case_id] for case_id in negative_case_ids)
 
 
 class InsightsJudge(LLMClient):
@@ -440,7 +444,7 @@ class InsightsJudge(LLMClient):
         for item in (data.get("conclusions") or [])[:INSIGHTS_JUDGE_MAX_CONCLUSIONS]:
             if not isinstance(item, dict):
                 continue
-            if _unsupported_negative_control_claim(item, grounding):
+            if not _claim_is_grounded(item, grounding):
                 continue
             title = (item.get("title") or "").strip()
             message = (item.get("message") or "").strip()
@@ -459,7 +463,7 @@ class InsightsJudge(LLMClient):
         for item in (data.get("recommendations") or [])[:INSIGHTS_JUDGE_MAX_RECOMMENDATIONS]:
             if not isinstance(item, dict):
                 continue
-            if _unsupported_negative_control_claim(item, grounding):
+            if not _claim_is_grounded(item, grounding):
                 continue
             title = (item.get("title") or "").strip()
             message = (item.get("message") or "").strip()

@@ -163,6 +163,8 @@ class TestInsightsJudgeNegativeControls:
         assert "explicit execution evidence" in prompt
         assert "invocation evidence is absent or ambiguous" in prompt
         assert "Do not recommend removing an unrelated negative-control case" in prompt
+        assert 'claim_type "negative_control_failure"' in prompt
+        assert "evidence_case_ids list" in prompt
 
     def test_prompt_uses_runtime_should_trigger_precedence_for_agentskills_cases(self) -> None:
         dataset = normalize_dataset_entries(
@@ -309,6 +311,7 @@ class TestInsightsJudgeNegativeControls:
             {
                 "conclusions": [
                     {
+                        "claim_type": "negative_control_failure",
                         "title": "Unintended Skill Application",
                         "message": "The evaluated skill was invoked for negative-001.",
                         "severity": "fail",
@@ -349,6 +352,7 @@ class TestInsightsJudgeNegativeControls:
             {
                 "conclusions": [
                     {
+                        "claim_type": "negative_control_failure",
                         "title": "Scope Misalignment",
                         "message": "The evaluated skill activated outside its intended scope.",
                         "severity": "warn",
@@ -370,22 +374,89 @@ class TestInsightsJudgeNegativeControls:
 
         assert InsightsJudge().parse_response(response, canonical=canonical)["conclusions"] == []
 
+    @pytest.mark.parametrize("claim_type", ["negative_control_failure", "general"])
+    def test_parse_rejects_unintended_skill_use_paraphrase_without_routing_evidence(
+        self,
+        claim_type: str,
+    ) -> None:
+        response = json.dumps(
+            {
+                "conclusions": [
+                    {
+                        "claim_type": claim_type,
+                        "title": "Unintended Skill Use",
+                        "message": "The evaluated skill was unnecessarily used for negative-001.",
+                        "severity": "warn",
+                        "evidence_case_ids": ["negative-001"],
+                    }
+                ],
+                "recommendations": [],
+            }
+        )
+        canonical = {
+            "dataset": [{"id": "negative-001", "expected_skill": None}],
+            "trials": [
+                {
+                    "entry_id": "negative-001",
+                    "scores": {"skill_execution": 1.0, "skill_routing": 1.0},
+                }
+            ],
+        }
+
+        assert InsightsJudge().parse_response(response, canonical=canonical)["conclusions"] == []
+
+    @pytest.mark.parametrize("claim_type", ["dataset_case_removal", "general"])
+    def test_parse_rejects_unrelated_case_removal_paraphrase_without_routing_evidence(
+        self,
+        claim_type: str,
+    ) -> None:
+        response = json.dumps(
+            {
+                "conclusions": [],
+                "recommendations": [
+                    {
+                        "claim_type": claim_type,
+                        "category": "Test",
+                        "title": "Remove unrelated case",
+                        "message": "Remove negative-001 from the dataset because it is unrelated.",
+                        "severity": "warn",
+                        "evidence_case_ids": ["negative-001"],
+                    }
+                ],
+            }
+        )
+        canonical = {
+            "dataset": [{"id": "negative-001", "expected_skill": None}],
+            "trials": [
+                {
+                    "entry_id": "negative-001",
+                    "scores": {"skill_execution": 1.0, "skill_routing": 1.0},
+                }
+            ],
+        }
+
+        assert InsightsJudge().parse_response(response, canonical=canonical)["recommendations"] == []
+
     def test_parse_preserves_unrelated_insights_and_nonremoval_test_improvements(self) -> None:
         response = json.dumps(
             {
                 "conclusions": [
                     {
+                        "claim_type": "general",
                         "title": "Efficiency Regression",
                         "message": "Token use increased by 25% for positive-001.",
                         "severity": "warn",
+                        "evidence_case_ids": ["positive-001"],
                     }
                 ],
                 "recommendations": [
                     {
+                        "claim_type": "general",
                         "category": "Improve",
                         "title": "Clarify Assertions",
                         "message": "Remove ambiguity from test cases by making expected outputs explicit.",
                         "severity": "warn",
+                        "evidence_case_ids": ["positive-001"],
                     }
                 ],
             }
