@@ -65,6 +65,20 @@ The runner already provides three deterministic baseline observations
 (\"best performing agent\", \"weakest dimension\", and an optional
 \"coverage expansion\" suggestion). DO NOT repeat those exact observations.
 
+NEGATIVE-CONTROL INTERPRETATION:
+- A dataset case whose expected_skill is null is an intentional negative
+  control: the agent should complete the unrelated task without activating
+  the evaluated skill.
+- A successful negative-control case is correct routing behavior. Do not infer
+  unintended skill application, scope misalignment, or overfitting merely
+  because the agent answered the unrelated task correctly.
+- Report unintended skill application only when explicit execution evidence
+  shows that the evaluated skill was read or invoked, or routing evidence for
+  that case failed. A passing routing result is evidence against that warning;
+  when invocation evidence is absent or ambiguous, do not issue the warning.
+- Do not recommend removing an unrelated negative-control case merely because
+  it is outside the skill's scope; that is what the case is designed to test.
+
 Your job is to produce ADDITIONAL, contextual insights:
 
 CONCLUSIONS (up to {max_conclusions}): observations the reviewer should know
@@ -172,13 +186,34 @@ def _summarize_dataset(dataset: list[dict]) -> list[dict]:
     """Trim dataset cases to the question + ground truth (plus id)."""
     summary: list[dict] = []
     for case in (dataset or [])[:5]:
+        if "expected_skill" not in case:
+            case_type = "unlabeled"
+            skill_expected_to_activate = None
+        elif case.get("expected_skill") is None:
+            case_type = "negative_control"
+            skill_expected_to_activate = False
+        else:
+            case_type = "skill_activation"
+            skill_expected_to_activate = True
+
+        expected_behavior = case.get("expected_behavior")
+        if isinstance(expected_behavior, list):
+            expected_behavior = [str(item)[:300] for item in expected_behavior[:5]]
+        elif isinstance(expected_behavior, str):
+            expected_behavior = expected_behavior[:300]
+        else:
+            expected_behavior = None
+
         summary.append(
             {
                 "id": case.get("id"),
+                "case_type": case_type,
+                "skill_expected_to_activate": skill_expected_to_activate,
                 "question": (case.get("question") or "")[:300],
                 "ground_truth": (case.get("ground_truth") or "")[:300],
                 "expected_skill": case.get("expected_skill"),
                 "expected_script": case.get("expected_script"),
+                "expected_behavior": expected_behavior,
             }
         )
     return summary

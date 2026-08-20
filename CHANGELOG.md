@@ -90,6 +90,10 @@ All notable changes to SkillEvaluator are documented in this file.
 
 ### Fixed
 
+- Tier 3 LLM insights now receive explicit labels and bounded expected-behavior
+  context for `expected_skill: null` negative controls, and the judge is
+  instructed not to flag unrelated successes without invocation or
+  failed-routing evidence.
 - Quality scoring now uses boundary-aware and context-aware matching for XML tags,
   reserved names, MCP guidance, README references, time references, exclusivity
   language, instruction action verbs, and nested Markdown links, avoiding
