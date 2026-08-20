@@ -21,6 +21,7 @@ from skillevaluator.evaluation import (
     compute_dimensions,
     compute_dimensions_deterministic,
 )
+from skillevaluator.tier3.dataset_utils import normalize_dataset_entries
 
 
 @pytest.fixture
@@ -153,3 +154,247 @@ class TestInsightsJudgeNegativeControls:
         assert "explicit execution evidence" in prompt
         assert "invocation evidence is absent or ambiguous" in prompt
         assert "Do not recommend removing an unrelated negative-control case" in prompt
+
+    def test_prompt_uses_runtime_should_trigger_precedence_for_agentskills_cases(self) -> None:
+        dataset = normalize_dataset_entries(
+            {
+                "skill_name": "calculator",
+                "evals": [
+                    {
+                        "id": "negative-001",
+                        "prompt": "Answer without the calculator skill.",
+                        "should_trigger": False,
+                    },
+                    {
+                        "id": "positive-001",
+                        "prompt": "Use the calculator skill.",
+                    },
+                ],
+            }
+        )
+
+        prompt = InsightsJudge().create_user_prompt(canonical={"dataset": dataset}, deterministic={})
+        context = json.loads(prompt.split("\n\n", 1)[1])
+
+        assert [case["case_type"] for case in context["dataset"]] == [
+            "negative_control",
+            "skill_activation",
+        ]
+        assert [case["skill_expected_to_activate"] for case in context["dataset"]] == [False, True]
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            {"id": "negative-null", "expected_skill": None},
+            {"id": "negative-empty", "expected_skill": ""},
+            {"id": "negative-explicit", "expected_skill": "calculator", "should_trigger": False},
+        ],
+    )
+    def test_prompt_uses_runtime_routing_semantics_for_legacy_cases(self, case: dict) -> None:
+        prompt = InsightsJudge().create_user_prompt(canonical={"dataset": [case]}, deterministic={})
+        context = json.loads(prompt.split("\n\n", 1)[1])
+
+        assert context["dataset"][0]["case_type"] == "negative_control"
+        assert context["dataset"][0]["skill_expected_to_activate"] is False
+
+    def test_sampled_trial_keeps_matching_case_metadata_beyond_first_five(self) -> None:
+        dataset = [
+            {"id": f"positive-{index:03d}", "expected_skill": "calculator"}
+            for index in range(1, 6)
+        ] + [
+            {
+                "id": "negative-006",
+                "expected_skill": None,
+                "expected_behavior": ["Do not invoke the calculator skill"],
+            }
+        ]
+        trials = [
+            {
+                "agent": "codex",
+                "entry_id": case["id"],
+                "overall": index / 10,
+                "scores": {"skill_execution": 1.0},
+            }
+            for index, case in enumerate(dataset, start=1)
+        ]
+
+        prompt = InsightsJudge().create_user_prompt(
+            canonical={"dataset": dataset, "trials": trials},
+            deterministic={},
+        )
+        context = json.loads(prompt.split("\n\n", 1)[1])
+
+        sampled = next(trial for trial in context["trials"] if trial["entry_id"] == "negative-006")
+        assert sampled["case"]["case_type"] == "negative_control"
+        assert sampled["case"]["expected_behavior"] == ["Do not invoke the calculator skill"]
+        assert "negative-006" in {case["id"] for case in context["dataset"]}
+
+    def test_trial_sampling_preserves_multi_agent_and_attempt_identity_without_trial_ids(self) -> None:
+        trials = [
+            {"agent": "codex", "entry_id": "shared", "trial_id": None, "overall": 0.1},
+            {"agent": "codex", "entry_id": "shared", "trial_id": None, "overall": 0.2},
+            {"agent": "claude-code", "entry_id": "shared", "trial_id": None, "overall": 0.3},
+        ]
+
+        prompt = InsightsJudge().create_user_prompt(
+            canonical={"dataset": [{"id": "shared", "expected_skill": "calculator"}], "trials": trials},
+            deterministic={},
+        )
+        sampled = json.loads(prompt.split("\n\n", 1)[1])["trials"]
+
+        assert [(trial["agent"], trial["attempt"]) for trial in sampled] == [
+            ("codex", 1),
+            ("codex", 2),
+            ("claude-code", 1),
+        ]
+
+    def test_build_insights_suppresses_original_unsupported_negative_control_findings(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        response = json.dumps(
+            {
+                "conclusions": [
+                    {
+                        "title": "Unintended Skill Application",
+                        "message": (
+                            "The agent correctly answers the unit conversion query but the skill isn't designed "
+                            "for such tasks, indicating scope misalignment."
+                        ),
+                        "severity": "warn",
+                    }
+                ],
+                "recommendations": [
+                    {
+                        "category": "Test",
+                        "title": "Exclude Irrelevant Cases",
+                        "message": (
+                            "Remove unit conversion test cases from the dataset as they fall outside the skill's "
+                            "intended scope."
+                        ),
+                        "severity": "warn",
+                    }
+                ],
+            }
+        )
+        canonical = {
+            "dataset": [{"id": "negative-001", "expected_skill": None}],
+            "trials": [
+                {
+                    "agent": "codex",
+                    "entry_id": "negative-001",
+                    "overall": 1.0,
+                    "scores": {"skill_execution": 1.0, "skill_routing": 1.0},
+                }
+            ],
+        }
+
+        monkeypatch.setattr(InsightsJudge, "completions", lambda *_args, **_kwargs: response)
+
+        parsed = build_insights(canonical, {"conclusions": [], "suggestions": []})
+
+        assert parsed == {"conclusions": [], "recommendations": []}
+
+    def test_parse_preserves_negative_control_warning_with_failed_routing_evidence(self) -> None:
+        response = json.dumps(
+            {
+                "conclusions": [
+                    {
+                        "title": "Unintended Skill Application",
+                        "message": "The evaluated skill was invoked for negative-001.",
+                        "severity": "fail",
+                        "evidence_case_ids": ["negative-001"],
+                    }
+                ],
+                "recommendations": [],
+            }
+        )
+        canonical = {
+            "dataset": [{"id": "negative-001", "expected_skill": None}],
+            "trials": [
+                {
+                    "agent": "codex",
+                    "entry_id": "negative-001",
+                    "scores": {"skill_execution": 0.0},
+                }
+            ],
+        }
+
+        parsed = InsightsJudge().parse_response(response, canonical=canonical)
+
+        assert parsed["conclusions"] == [
+            {
+                "title": "Unintended Skill Application",
+                "message": "The evaluated skill was invoked for negative-001.",
+                "severity": "fail",
+                "source": "llm",
+            }
+        ]
+
+    @pytest.mark.parametrize("evidence_case_ids", [["negative-001"], ["fabricated-999"]])
+    def test_parse_rejects_special_claim_without_grounding(
+        self,
+        evidence_case_ids: list[str],
+    ) -> None:
+        response = json.dumps(
+            {
+                "conclusions": [
+                    {
+                        "title": "Scope Misalignment",
+                        "message": "The evaluated skill activated outside its intended scope.",
+                        "severity": "warn",
+                        "evidence_case_ids": evidence_case_ids,
+                    }
+                ],
+                "recommendations": [],
+            }
+        )
+        canonical = {
+            "dataset": [{"id": "negative-001", "expected_skill": None}],
+            "trials": [
+                {
+                    "entry_id": "negative-001",
+                    "scores": {"skill_execution": 1.0},
+                }
+            ],
+        }
+
+        assert InsightsJudge().parse_response(response, canonical=canonical)["conclusions"] == []
+
+    def test_parse_preserves_unrelated_insights_and_nonremoval_test_improvements(self) -> None:
+        response = json.dumps(
+            {
+                "conclusions": [
+                    {
+                        "title": "Efficiency Regression",
+                        "message": "Token use increased by 25% for positive-001.",
+                        "severity": "warn",
+                    }
+                ],
+                "recommendations": [
+                    {
+                        "category": "Improve",
+                        "title": "Clarify Assertions",
+                        "message": "Remove ambiguity from test cases by making expected outputs explicit.",
+                        "severity": "warn",
+                    }
+                ],
+            }
+        )
+        canonical = {
+            "dataset": [
+                {"id": "negative-001", "expected_skill": None},
+                {"id": "positive-001", "expected_skill": "calculator"},
+            ],
+            "trials": [
+                {
+                    "entry_id": "negative-001",
+                    "scores": {"skill_execution": 1.0},
+                }
+            ],
+        }
+
+        parsed = InsightsJudge().parse_response(response, canonical=canonical)
+
+        assert [item["title"] for item in parsed["conclusions"]] == ["Efficiency Regression"]
+        assert [item["title"] for item in parsed["recommendations"]] == ["Clarify Assertions"]
