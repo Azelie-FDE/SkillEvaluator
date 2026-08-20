@@ -147,7 +147,7 @@ class BenchmarkReporter(ReporterBase):
         )
         self._render_report_purpose(lines)
         self._render_results_at_a_glance(lines, ae, private_labels)
-        self._render_tier_status(lines, results, ae, private_labels)
+        self._render_tier_status(lines, results, ae, policy, private_labels)
         self._render_findings(lines, results, private_labels)
         self._render_methodology(lines, ae, private_labels)
         self._render_freshness(lines)
@@ -348,6 +348,7 @@ class BenchmarkReporter(ReporterBase):
         lines: list[str],
         results: list[ValidationResult],
         ae: dict[str, Any] | None,
+        benchmark_policy: dict[str, bool],
         private_labels: tuple[str, ...],
     ) -> None:
         tier_groups = [
@@ -365,7 +366,7 @@ class BenchmarkReporter(ReporterBase):
             ]
         )
         for tier, purpose, tier_results in tier_groups:
-            status, evidence = _tier_status(tier, tier_results, ae)
+            status, evidence = _tier_status(tier, tier_results, ae, benchmark_policy)
             lines.append(f"| {tier} | {purpose} | **{status}** | {_md_cell(evidence, private_labels)} |")
         lines.append("")
 
@@ -606,12 +607,7 @@ def _tier3_evidence_complete(ae: dict[str, Any] | None) -> bool:
     dataset_digest = ae.get("dataset_digest") or summary.get("dataset_digest")
     attempt_policy = _mapping(ae.get("attempt_policy"))
     attempts = _nonnegative_int(attempt_policy.get("max_attempts"))
-    environment = (
-        summary.get("environment")
-        or summary.get("requested_environment")
-        or ae.get("environment")
-        or ae.get("requested_environment")
-    )
+    environment = summary.get("environment") or ae.get("environment")
     return bool(
         execution_status == "succeeded"
         and _tier3_dimension_verdict(ae) is not None
@@ -631,10 +627,12 @@ def _tier3_dimension_verdict(ae: dict[str, Any] | None) -> str | None:
         return None
 
     agent_verdicts: list[str] = []
+    has_partial_evidence = False
     for agent in supported_agents:
         scores = _agent_dimension_scores(agent)
         if scores is None:
-            return None
+            has_partial_evidence = True
+            continue
         if any(score < DIMENSION_VERDICT_NEUTRAL_THRESHOLD for score in scores):
             agent_verdicts.append("fail")
         elif any(score < DIMENSION_VERDICT_PASS_THRESHOLD for score in scores):
@@ -644,6 +642,8 @@ def _tier3_dimension_verdict(ae: dict[str, Any] | None) -> str | None:
 
     if "pass" in agent_verdicts:
         return "pass"
+    if has_partial_evidence or not agent_verdicts:
+        return None
     if "neutral" in agent_verdicts:
         return "neutral"
     return "fail"
@@ -715,7 +715,9 @@ def _overall_status(
     if has_failures or verdict == "fail" or dimension_verdict == "fail":
         return "FAIL"
 
-    if benchmark_policy["tier3_required"] and not _tier3_evidence_complete(ae):
+    tier3_results = _tier3_results(results)
+    has_present_tier3_result = bool(tier3_results) and not all(_result_skipped(result) for result in tier3_results)
+    if (benchmark_policy["tier3_required"] or has_present_tier3_result) and not _tier3_evidence_complete(ae):
         return "INCOMPLETE"
     execution_status = str((ae or {}).get("execution_status") or summary.get("execution_status") or "").lower()
     if verdict == "neutral" and execution_status in {"succeeded", ""}:
@@ -803,7 +805,7 @@ def _evaluation_date(value: str) -> str:
 
 def _environment(ae: dict[str, Any] | None) -> str | None:
     summary = _mapping((ae or {}).get("summary"))
-    value = summary.get("environment") or (ae or {}).get("environment") or (ae or {}).get("requested_environment")
+    value = summary.get("environment") or (ae or {}).get("environment")
     return str(value) if value else None
 
 
@@ -947,6 +949,7 @@ def _tier_status(
     tier: str,
     results: list[ValidationResult],
     ae: dict[str, Any] | None,
+    benchmark_policy: dict[str, bool],
 ) -> tuple[str, str]:
     if not results:
         return "NOT RUN", "No result was recorded"
@@ -971,9 +974,13 @@ def _tier_status(
             return "FAIL", f"{len(_agents(ae))} agent(s); {_dataset_summary(ae)['total_tasks']} task(s)"
         if execution and execution != "succeeded":
             return "INCOMPLETE", f"Execution status: {execution}"
-        policy = _benchmark_policy(results, ae)
-        if policy["tier3_required"] and not _tier3_evidence_complete(ae):
-            return "INCOMPLETE", "Required Tier 3 evidence is missing"
+        if not _tier3_evidence_complete(ae):
+            evidence = (
+                "Required Tier 3 evidence is missing"
+                if benchmark_policy["tier3_required"]
+                else "Present Tier 3 result lacks complete evidence"
+            )
+            return "INCOMPLETE", evidence
         effective_verdict = verdict
         if verdict == "pass" and dimension_verdict == "neutral":
             effective_verdict = "neutral"

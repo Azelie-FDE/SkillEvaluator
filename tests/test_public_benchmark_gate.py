@@ -11,7 +11,11 @@ from pathlib import Path
 import pytest
 from scripts.ci import check_public_benchmarks as benchmark_gate
 
-from skillevaluator.evaluation.tier3_report import _validation_result_from_payload, advisory_skip_result
+from skillevaluator.evaluation.tier3_report import (
+    _validation_result_from_payload,
+    advisory_skip_result,
+    build_agent_eval_payload,
+)
 from skillevaluator.models import Finding, Severity, ValidationResult
 from skillevaluator.reporting import BenchmarkReporter
 
@@ -135,9 +139,7 @@ def test_gate_rejects_pass_when_any_agent_model_is_not_recorded(tmp_path: Path) 
 
     _files, offenders = benchmark_gate.find_offenders([benchmark])
 
-    assert {offender.reason for offender in offenders} == {
-        "publication PASS without recorded agent model identity"
-    }
+    assert {offender.reason for offender in offenders} == {"publication PASS without recorded agent model identity"}
 
 
 @pytest.mark.parametrize(
@@ -226,7 +228,7 @@ def _tier3_result(verdict: str, *, legacy: bool = False) -> ValidationResult:
         "agents": {"codex": {} if legacy else {"model": "gpt-codex"}},
     }
     if not legacy:
-        dimension_score = {"pass": 0.9, "neutral": 0.7, "fail": 0.3}[verdict.lower()]
+        dimension_score = {"pass": 0.9, "neutral": 0.45, "fail": 0.3}[verdict.lower()]
         payload["agents"]["codex"].update(
             {
                 "execution_status": "succeeded",
@@ -269,6 +271,29 @@ def test_real_reporter_cards_pass_publication_gate(tmp_path: Path, verdict: str)
     _files, offenders = benchmark_gate.find_offenders([benchmark])
 
     assert f"Overall verdict: {verdict}" in rendered
+    assert offenders == []
+
+
+@pytest.mark.parametrize(
+    ("dimension_score", "expected_verdict"),
+    [(0.40, "NEUTRAL"), (0.50, "PASS")],
+)
+def test_dimension_verdict_boundaries_pass_publication_gate(
+    tmp_path: Path,
+    dimension_score: float,
+    expected_verdict: str,
+) -> None:
+    tier3 = _tier3_result("PASS")
+    for dimension in tier3.metadata["agent_eval"]["agents"]["codex"]["dimensions"]:
+        dimension["with_skill"] = dimension_score
+    rendered = BenchmarkReporter(include_timestamp=True).render_all([_tier1_result(), tier3])
+    benchmark = tmp_path / "BENCHMARK.md"
+    benchmark.write_text(rendered, encoding="utf-8")
+
+    _files, offenders = benchmark_gate.find_offenders([benchmark])
+
+    assert f"Overall verdict: {expected_verdict}" in rendered
+    assert f"| Tier 3 | Live agent evaluation | **{expected_verdict}** |" in rendered
     assert offenders == []
 
 
@@ -333,6 +358,61 @@ def test_malformed_canonical_pass_payload_is_incomplete_and_lints_cleanly(tmp_pa
     assert offenders == []
 
 
+def test_canonical_multi_agent_pass_survives_partial_peer_evidence(tmp_path: Path) -> None:
+    passing_scores = {
+        "security": 0.9,
+        "skill_execution": 0.9,
+        "skill_efficiency": 0.9,
+        "accuracy": 0.9,
+        "goal_accuracy": 0.9,
+        "behavior_check": 0.9,
+    }
+    baseline_scores = dict.fromkeys(passing_scores, 0.5)
+    partial_scores = dict(passing_scores)
+    partial_scores.pop("accuracy")
+    partial_baseline = dict(baseline_scores)
+    partial_baseline.pop("accuracy")
+    agents = {
+        "codex": {
+            "model": "gpt-codex",
+            "with_skill": passing_scores,
+            "without_skill": baseline_scores,
+            "execution_status": "succeeded",
+            "rewards": [],
+            "num_trials": 1,
+        },
+        "claude-code": {
+            "model": "claude-sonnet",
+            "with_skill": partial_scores,
+            "without_skill": partial_baseline,
+            "execution_status": "succeeded",
+            "rewards": [],
+            "num_trials": 1,
+        },
+    }
+    payload = build_agent_eval_payload(
+        "demo-skill",
+        agents,
+        dataset=[{"id": "case-1", "expected_skill": "demo-skill"}],
+        env_mode="docker",
+        evaluated_at="2026-07-25T12:00:00+00:00",
+        use_llm_judge=False,
+    )
+    assert payload is not None
+    assert payload["verdict"] == "pass"
+    result = _validation_result_from_payload(payload)
+    assert result is not None
+
+    rendered = BenchmarkReporter(include_timestamp=True).render_all([_tier1_result(), result])
+    benchmark = tmp_path / "BENCHMARK.md"
+    benchmark.write_text(rendered, encoding="utf-8")
+    _files, offenders = benchmark_gate.find_offenders([benchmark])
+
+    assert "Overall verdict: PASS" in rendered
+    assert "| Tier 3 | Live agent evaluation | **PASS** |" in rendered
+    assert offenders == []
+
+
 @pytest.mark.parametrize(
     ("tier3_required", "expected_verdict"),
     [(True, "INCOMPLETE"), (False, "PASS")],
@@ -354,6 +434,32 @@ def test_advisory_tier3_skip_respects_publication_policy(
 
     assert f"Overall verdict: {expected_verdict}" in rendered
     assert "| Tier 3 | Live agent evaluation | **SKIPPED (ADVISORY)** |" in rendered
+    assert offenders == []
+
+
+@pytest.mark.parametrize("policy_location", ["tier1", "agent_eval", "summary"])
+def test_optional_policy_does_not_certify_malformed_present_tier3(
+    tmp_path: Path,
+    policy_location: str,
+) -> None:
+    tier1 = _tier1_result()
+    tier3 = _tier3_result("PASS", legacy=True)
+    if policy_location == "tier1":
+        tier1.metadata["benchmark_policy"] = {"tier3_required": False}
+    elif policy_location == "agent_eval":
+        tier3.metadata["agent_eval"]["benchmark_policy"] = {"tier3_required": False}
+    else:
+        tier3.metadata["agent_eval"]["summary"]["benchmark_policy"] = {"tier3_required": False}
+
+    rendered = BenchmarkReporter(include_timestamp=True).render_all([tier1, tier3])
+    benchmark = tmp_path / "BENCHMARK.md"
+    benchmark.write_text(rendered, encoding="utf-8")
+    _files, offenders = benchmark_gate.find_offenders([benchmark])
+
+    assert "- Tier 3 evidence: optional by policy" in rendered
+    assert "Overall verdict: INCOMPLETE" in rendered
+    assert "| Tier 3 | Live agent evaluation | **INCOMPLETE** |" in rendered
+    assert "Present Tier 3 result lacks complete evidence" in rendered
     assert offenders == []
 
 
@@ -405,6 +511,30 @@ def test_reporter_sanitizes_requested_environment_from_advisory_payload(tmp_path
 
     assert private_environment not in rendered
     assert "Runtime unavailable in Isolated sandbox" in rendered
+    assert offenders == []
+
+
+@pytest.mark.parametrize("requested_environment_location", ["agent_eval", "summary"])
+def test_requested_environment_is_not_completed_run_provenance(
+    tmp_path: Path,
+    requested_environment_location: str,
+) -> None:
+    private_environment = "secret-cluster"
+    tier3 = _tier3_result("PASS")
+    payload = tier3.metadata["agent_eval"]
+    payload["summary"].pop("environment")
+    target = payload if requested_environment_location == "agent_eval" else payload["summary"]
+    target["requested_environment"] = private_environment
+
+    rendered = BenchmarkReporter(include_timestamp=True).render_all([_tier1_result(), tier3])
+    benchmark = tmp_path / "BENCHMARK.md"
+    benchmark.write_text(rendered, encoding="utf-8")
+    _files, offenders = benchmark_gate.find_offenders([benchmark])
+
+    assert private_environment not in rendered
+    assert "- Environment: not recorded (legacy or non-live result)" in rendered
+    assert "Overall verdict: INCOMPLETE" in rendered
+    assert "| Tier 3 | Live agent evaluation | **INCOMPLETE** |" in rendered
     assert offenders == []
 
 
@@ -493,9 +623,7 @@ def test_gate_rejects_pass_with_placeholder_provenance(tmp_path: Path) -> None:
         "- Agents: Codex (`gpt-codex`)": "- Agents: Codex (model not recorded)",
         "- Tasks: 4 evaluation tasks": "- Tasks: not recorded (legacy or non-live result)",
         "- Dataset digest: `sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef` "
-        "(skill-evaluator-dataset-snapshot/1)": (
-            "- Dataset digest: not recorded (legacy or non-live result)"
-        ),
+        "(skill-evaluator-dataset-snapshot/1)": ("- Dataset digest: not recorded (legacy or non-live result)"),
         "- Attempts per task: 1": "- Attempts per task: not recorded (legacy or non-live result)",
         "- Environment: `Isolated sandbox`": "- Environment: not recorded (legacy or non-live result)",
     }
@@ -514,6 +642,20 @@ def test_gate_rejects_pass_with_placeholder_provenance(tmp_path: Path) -> None:
         "publication PASS without recorded attempts per task",
         "publication PASS without recorded environment",
     }
+
+
+def test_gate_requires_provenance_when_optional_tier3_row_claims_pass(tmp_path: Path) -> None:
+    benchmark = tmp_path / "BENCHMARK.md"
+    benchmark.write_text(
+        _valid_benchmark()
+        .replace("- Tier 3 evidence: required for publication", "- Tier 3 evidence: optional by policy")
+        .replace("- Environment: `Isolated sandbox`", "- Environment: not recorded (legacy or non-live result)"),
+        encoding="utf-8",
+    )
+
+    _files, offenders = benchmark_gate.find_offenders([benchmark])
+
+    assert {offender.reason for offender in offenders} == {"publication PASS without recorded environment"}
 
 
 def test_gate_rejects_pass_with_malformed_dataset_digest(tmp_path: Path) -> None:

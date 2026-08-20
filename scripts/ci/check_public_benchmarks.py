@@ -277,7 +277,7 @@ def _check_verdict_tier_consistency(path: Path, text: str, offenders: list[Offen
     line_number, tier3_status = tier3_row
     tier3_complete = tier3_status == "PASS"
     tier3_optional = (_metadata_field_value(text, "Tier 3 evidence") or "").lower() == "optional by policy"
-    if not tier3_optional:
+    if tier3_complete:
         _check_pass_provenance(path, text, offenders)
     if not tier3_complete and not tier3_optional:
         offenders.append(Offender(path, line_number, "publication PASS without completed Tier 3 evidence"))
@@ -291,9 +291,7 @@ def _check_pass_provenance(path: Path, text: str, offenders: list[Offender]) -> 
         matches = _metadata_field_matches(metadata_lines, field)
         line_number = matches[0][0] if matches else fallback_line
         if len(matches) != 1 or not pattern.fullmatch(matches[0][1]):
-            offenders.append(
-                Offender(path, line_number, f"publication PASS without recorded {field.lower()}")
-            )
+            offenders.append(Offender(path, line_number, f"publication PASS without recorded {field.lower()}"))
 
     agent_matches = _metadata_field_matches(metadata_lines, "Agents")
     line_number = agent_matches[0][0] if agent_matches else fallback_line
