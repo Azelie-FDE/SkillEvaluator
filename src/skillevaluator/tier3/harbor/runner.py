@@ -1064,7 +1064,14 @@ def _resolve_agent_runtime_plan(
         names = ", ".join(collisions)
         raise ValueError(f"harbor.runtime_env contains operator-owned credential name(s): {names}")
 
-    provider_env = _provider_environment(provider)
+    # Dedicated judge aliases are job-scoped. Standard grading adds the
+    # selected alias at launch time, while custom-only grading must not retain
+    # it in the reusable Harbor parent environment.
+    provider_env = {
+        name: value
+        for name, value in _provider_environment(provider).items()
+        if name not in _VERIFIER_JUDGE_MODEL_ENV_VARS
+    }
     plans: dict[str, AgentRuntimePlan] = {}
     for agent in agents:
         credentials = _agent_credentials(provider=provider, agent=agent, env_mode=env_mode)

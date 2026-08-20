@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import tomllib
 
 import pytest
 from harbor.utils.env import resolve_env_vars
@@ -706,6 +707,92 @@ def test_run_harbor_eval_stages_per_agent_credential_trees(
         "source": "LLM_JUDGE_MODEL",
         "override_applied": True,
     }
+
+
+def test_custom_only_native_verifier_placeholders_use_task_fallbacks_not_standard_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    skill = tmp_path / "demo"
+    evals = skill / "evals"
+    native_task = evals / "harbor" / "case-001"
+    native_task.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# Demo\n", encoding="utf-8")
+    (evals / "evals.json").write_text(
+        '[{"id":"case-001","question":"Run the native case.","files":[]}]\n',
+        encoding="utf-8",
+    )
+    (evals / "config.yml").write_text(
+        "schema_version: 1\nharbor:\n  task_source: native_harbor\ngrading:\n  mode: custom_only\n",
+        encoding="utf-8",
+    )
+    (evals / "grader.py").write_text("def grade(*args, **kwargs):\n    return 1\n", encoding="utf-8")
+    (native_task / "instruction.md").write_text("Run the native case.\n", encoding="utf-8")
+    (native_task / "task.toml").write_text(
+        'schema_version = "1.3"\n\n[task]\nname = "nvidia/case-001"\n\n'
+        '[metadata]\nentry_id = "case-001"\n\n'
+        '[verifier.env]\nLLM_JUDGE_MODEL = "${LLM_JUDGE_MODEL:-task-legacy-model}"\n'
+        'SKILL_EVAL_JUDGE_MODEL = "${SKILL_EVAL_JUDGE_MODEL:-task-canonical-model}"\n\n[environment]\n',
+        encoding="utf-8",
+    )
+    launched: dict[str, object] = {}
+
+    monkeypatch.setenv("LLM_JUDGE_MODEL", "standard-legacy-model")
+    monkeypatch.setenv("SKILL_EVAL_JUDGE_MODEL", "standard-canonical-model")
+    monkeypatch.setattr(runner, "resolve_llm_provider", lambda: _provider("nv_build"))
+    monkeypatch.setattr(
+        runner,
+        "load_evals_config",
+        lambda _path: ({"harbor": {"task_source": "native_harbor"}}, None),
+    )
+    monkeypatch.setattr(runner, "_check_prerequisites", lambda **_kwargs: [])
+
+    def launch(**kwargs):
+        launched.update(
+            with_skill=kwargs["with_skill"],
+            run_env=dict(kwargs["run_env"]),
+            verifier_env=dict(kwargs["verifier_env"]),
+        )
+        return []
+
+    monkeypatch.setattr(runner, "_run_agent_pair", launch)
+    monkeypatch.setattr(
+        runner,
+        "collect_harbor_results",
+        lambda **_kwargs: {"execution_status": "complete", "execution_errors": [], "metrics": [], "agents": {}},
+    )
+    monkeypatch.setattr(runner, "render_agent_eval_html_report", lambda *_args, **_kwargs: tmp_path / "report.html")
+
+    result = runner.run_harbor_eval(
+        skill,
+        ["opencode"],
+        agent_models={"opencode": "nvidia/nvidia/nemotron-3-nano-30b-a3b"},
+        output_dir=tmp_path / "results",
+        env_mode="docker",
+        grading_mode="custom_only",
+        skip_baseline=True,
+        keep_harbor_jobs=True,
+        agent_runtime_preflight=False,
+    )
+
+    assert "error" not in result
+    assert result["run_config"]["judge"] == {"enabled": False}
+    assert launched["verifier_env"] == {}
+    task_config = tomllib.loads(
+        (launched["with_skill"] / "case-001" / "task.toml").read_text(encoding="utf-8")  # type: ignore[operator]
+    )
+    authored_env = task_config["verifier"]["env"]
+    run_env = launched["run_env"]
+    task_fallbacks = {
+        "LLM_JUDGE_MODEL": "task-legacy-model",
+        "SKILL_EVAL_JUDGE_MODEL": "task-canonical-model",
+    }
+    for name, fallback in task_fallbacks.items():
+        assert name not in run_env
+        assert authored_env[name] == f"${{{name}:-{fallback}}}"
+        with monkeypatch.context() as harbor_process:
+            harbor_process.setattr(os, "environ", dict(run_env))
+            assert resolve_env_vars({name: authored_env[name]}) == {name: fallback}
 
 
 def test_run_harbor_eval_rejects_provenance_key_inside_skill_before_creation(
