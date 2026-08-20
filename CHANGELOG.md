@@ -27,6 +27,12 @@ All notable changes to SkillEvaluator are documented in this file.
 
 ### Changed
 
+- Updated public OpenAI / Anthropic / Bedrock chat defaults to pinned frontier
+  models (`gpt-5.6-sol`, `claude-opus-5`, `us.anthropic.claude-opus-5`),
+  centralized in `provider_config`, and documented `gpt-5.4-mini` as the
+  lower-cost OpenAI `SKILL_EVAL_LLM_MODEL` alternative. Raised
+  dimension/insights judge token budgets to 4096 and widened the gpt-5\*
+  temperature guard to bare model IDs.
 - Added explicit `--block-on-dedup` / `--no-block-on-dedup` and
   `--block-on-agent-eval` / `--no-block-on-agent-eval` controls with
   backward-compatible defaults, Tier 3 source preflight, and consistent gating
