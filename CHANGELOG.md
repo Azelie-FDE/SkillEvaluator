@@ -15,6 +15,12 @@ All notable changes to SkillEvaluator are documented in this file.
   immutable dataset-truth snapshot with provenance metadata, and redesigned
   `BENCHMARK.md` as a decision-first publication card.
 
+### Fixed
+
+- GitHub Actions pull request reports now link source targets to the checked-out
+  repository revision instead of the synthetic `<number>/merge` ref, preventing
+  broken or cross-repository links.
+
 ## 0.2.0 - 2026-08-18
 
 ### Security
@@ -51,6 +57,10 @@ All notable changes to SkillEvaluator are documented in this file.
   context for `expected_skill: null` negative controls, and the judge is
   instructed not to flag unrelated successes without invocation or
   failed-routing evidence.
+- Fixed Anthropic API-root normalization across evaluator and Claude Code
+  paths, and made required Tier 3 judge failures fail closed instead of
+  appearing as numeric zero scores or publishing misleading quality results
+  ([#55](https://github.com/NVIDIA/SkillEvaluator/issues/55)).
 - Tier 3 now normalizes host-configured `LLM_JUDGE_MODEL` and
   `SKILL_EVAL_JUDGE_MODEL` overrides in Harbor's parent process and forwards
   the selected value through its verifier-only job layer for standard grading.
