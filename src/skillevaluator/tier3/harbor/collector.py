@@ -35,7 +35,7 @@ from skillevaluator.tier3.harbor.metrics import (
     score_definition,
 )
 from skillevaluator.tier3.output_provenance import write_output_file_atomically
-from skillevaluator.utils.redaction import redact_sensitive_data, redact_sensitive_text
+from skillevaluator.utils.redaction import is_sensitive_key, redact_sensitive_data, redact_sensitive_text
 from skillevaluator.utils.secure_fs import SecurePathError, SecureRoot, stat_is_link_or_reparse
 
 logger = logging.getLogger(__name__)
@@ -2356,8 +2356,75 @@ def _add_trusted_invocation_evidence(
     invoked = _trusted_trial_skill_invoked(trial_root, source_reward.get("_step_name"), skill_name)
     if invoked is None:
         return
-    clean_reward["skill_invoked"] = invoked
+    if invoked is True:
+        clean_reward["skill_invoked"] = True
+    elif invoked is False:
+        clean_reward["skill_invoked"] = False
+    else:
+        return
     clean_reward["invocation_evidence_source"] = "trajectory"
+
+
+def _can_restore_custom_metric_name(value: str) -> bool:
+    """Allow safe names plus narrow, explicitly metric-shaped secret terms."""
+    if not is_sensitive_key(value):
+        return True
+    camel_split = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", camel_split).strip("_").lower()
+    parts = tuple(part for part in normalized.split("_") if part)
+    return (
+        len(parts) == 2
+        and parts[0] in {"auth", "secret", "token"}
+        and parts[1]
+        in {
+            "accuracy",
+            "compliance",
+            "count",
+            "coverage",
+            "efficiency",
+            "handling",
+            "leakage",
+            "precision",
+            "quality",
+            "rate",
+            "ratio",
+            "recall",
+            "safety",
+            "score",
+            "usage",
+        }
+    )
+
+
+def _restore_custom_metric_scores(source_reward: dict[str, Any], safe_reward: dict[str, Any]) -> None:
+    """Restore only finite numeric values recognized by the custom-metric schema."""
+    for field in ("custom_metrics", "metrics"):
+        source_metrics = source_reward.get(field)
+        safe_metrics = safe_reward.get(field)
+        if not isinstance(source_metrics, dict) or not isinstance(safe_metrics, dict):
+            continue
+        for raw_name, raw_value in source_metrics.items():
+            name = str(raw_name)
+            if not _can_restore_custom_metric_name(name):
+                continue
+            score = extract_custom_metrics({field: {name: raw_value}}).get(name)
+            if score is None:
+                continue
+            if isinstance(raw_value, dict):
+                safe_value = safe_metrics.get(name)
+                if not isinstance(safe_value, dict):
+                    safe_value = {}
+                    safe_metrics[name] = safe_value
+                safe_value["score"] = score
+            else:
+                safe_metrics[name] = score
+
+    # Legacy custom-only rewards allowed this report metric at the top level.
+    token_efficiency = extract_custom_metrics({"token_efficiency": source_reward.get("token_efficiency")}).get(
+        "token_efficiency"
+    )
+    if token_efficiency is not None:
+        safe_reward["token_efficiency"] = token_efficiency
 
 
 def _save_trials(
@@ -2409,11 +2476,11 @@ def _save_trials(
             str(clean_reward.get("evaluation_status") or "").casefold() in {"error", "failed"}
             or overall_score(clean_reward) is None
         )
-        safe_reward = (
-            redact_sensitive_data(clean_reward, max_str_len=REWARD_DIAGNOSTIC_STRING_MAX_CHARS)
-            if diagnostic_reward or "evaluation_errors" in clean_reward
-            else clean_reward
+        safe_reward = redact_sensitive_data(
+            clean_reward,
+            max_str_len=REWARD_DIAGNOSTIC_STRING_MAX_CHARS if diagnostic_reward else None,
         )
+        _restore_custom_metric_scores(clean_reward, safe_reward)
         (trial_out / "reward.json").write_text(json.dumps(safe_reward, indent=2), encoding="utf-8")
 
         if trial_src:

@@ -12,7 +12,10 @@ from typing import Any
 
 import pytest
 
-from skillevaluator.tier3.harbor.collector import collect_harbor_results
+from skillevaluator.tier3.harbor.collector import (
+    REWARD_DIAGNOSTIC_STRING_MAX_CHARS,
+    collect_harbor_results,
+)
 
 STANDARD_REWARD = {
     "security": 0.9,
@@ -143,6 +146,62 @@ def test_collect_persists_target_invocation_for_both_single_step_variants(tmp_pa
     for variant, trial_name in (("with-skill", "case-with_attempt001"), ("without-skill", "case-without_attempt001")):
         trial_dir = tmp_path / "results" / "opencode" / variant / "trials" / trial_name
         assert {path.name for path in trial_dir.iterdir()} == {"reward.json", "trajectory.json"}
+
+
+def test_collect_redacts_successful_standard_reward_without_diagnostic_truncation(tmp_path: Path) -> None:
+    jobs_dir = tmp_path / "jobs"
+    trial_name = "successful-redaction_attempt001"
+    long_note = "x" * (REWARD_DIAGNOSTIC_STRING_MAX_CHARS + 1)
+    reward = {
+        **STANDARD_REWARD,
+        "details": {
+            "api_key": "plain-text-test-secret",
+            "password": 123456789,
+            "message": "Authorization: Bearer secret-token-value",
+            "safe_note": long_note,
+        },
+        "custom_metrics": {
+            "secret_safety": 0.91,
+            "api_key": 135792468,
+            "api_token": 135792468,
+            "private_token": 135792468,
+            "client_token": 135792468,
+        },
+        "metrics": {
+            "password": 97531,
+            "github_token": 97531,
+            "gitlab_token": 97531,
+            "ssh_key": 97531,
+            "signing_key": 97531,
+        },
+        "evaluation_errors": {},
+        "api_key": 246813579,
+    }
+    _write_trial(
+        jobs_dir,
+        variant="with",
+        trial_name=trial_name,
+        reward=reward,
+        trajectory=_trajectory(skill="demo"),
+    )
+    _write_job_result(jobs_dir / "demo-opencode-with", [trial_name])
+
+    _collect(tmp_path)
+
+    persisted = _persisted_reward(tmp_path, "with", trial_name)
+    assert persisted["skill_invoked"] is True
+    assert persisted["invocation_evidence_source"] == "trajectory"
+    assert persisted["details"]["api_key"] == "<redacted>"
+    assert "secret-token-value" not in persisted["details"]["message"]
+    assert "<redacted>" in persisted["details"]["message"]
+    assert persisted["details"]["safe_note"] == long_note
+    assert persisted["details"]["password"] == "<redacted>"
+    assert persisted["custom_metrics"]["secret_safety"] == 0.91
+    for name in ("api_key", "api_token", "private_token", "client_token"):
+        assert persisted["custom_metrics"][name] == "<redacted>"
+    for name in ("password", "github_token", "gitlab_token", "ssh_key", "signing_key"):
+        assert persisted["metrics"][name] == "<redacted>"
+    assert persisted["api_key"] == "<redacted>"
 
 
 def test_collect_persists_native_skill_tool_invocation(tmp_path: Path) -> None:
