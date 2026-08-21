@@ -18,6 +18,8 @@ import stat
 from pathlib import Path
 from typing import Any
 
+from skillevaluator.tier3.eval_core.atif_helpers import extract_tool_calls_as_dicts, get_skill_tool_calls
+from skillevaluator.tier3.eval_core.checks import check_negative_case
 from skillevaluator.tier3.harbor.metrics import (
     DEFAULT_METRIC_SET,
     DEFAULT_METRICS,
@@ -33,7 +35,7 @@ from skillevaluator.tier3.harbor.metrics import (
     score_definition,
 )
 from skillevaluator.tier3.output_provenance import write_output_file_atomically
-from skillevaluator.utils.redaction import redact_sensitive_data, redact_sensitive_text
+from skillevaluator.utils.redaction import is_sensitive_key, redact_sensitive_data, redact_sensitive_text
 from skillevaluator.utils.secure_fs import SecurePathError, SecureRoot, stat_is_link_or_reparse
 
 logger = logging.getLogger(__name__)
@@ -2221,11 +2223,216 @@ def _annotate_security_attribution(
     return summary
 
 
+def _is_standard_skill_execution_reward(reward: dict[str, Any]) -> bool:
+    """Return whether the reward carries a usable canonical standard score."""
+    standard_metric_sets = {DEFAULT_METRIC_SET, LEGACY_METRIC_SET}
+    declared_metric_set = reward.get("metric_set") or reward.get("metric_set_version")
+    if declared_metric_set and str(declared_metric_set) not in standard_metric_sets:
+        return False
+    metric_set, metrics = metric_set_for_reward(reward)
+    return (
+        metric_set in standard_metric_sets
+        and "skill_execution" in metrics
+        and metric_value(reward, "skill_execution") is not None
+    )
+
+
+def _trajectory_skill_invoked(trajectory: Any, skill_name: str) -> bool | None:
+    """Derive target invocation from one readable ATIF trajectory."""
+    if not isinstance(trajectory, dict):
+        return None
+    steps = trajectory.get("steps")
+    if not isinstance(steps, list) or not steps or any(not isinstance(step, dict) for step in steps):
+        return None
+    agent_steps = [step for step in steps if step.get("source") == "agent"]
+    if not agent_steps:
+        return None
+    for step in agent_steps:
+        tool_calls = step.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            return None
+        for tool_call in tool_calls:
+            if (
+                not isinstance(tool_call, dict)
+                or not isinstance(tool_call.get("function_name"), str)
+                or not tool_call["function_name"].strip()
+                or not isinstance(tool_call.get("arguments"), dict)
+            ):
+                return None
+    try:
+        agent_trajectory = {**trajectory, "steps": agent_steps}
+        tool_calls = extract_tool_calls_as_dicts(agent_trajectory)
+        skill_tool_names = get_skill_tool_calls(agent_trajectory)
+        negative_check = check_negative_case(tool_calls, skill_name, skill_tool_names=skill_tool_names)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    passed = negative_check.get("passed")
+    return not passed if isinstance(passed, bool) else None
+
+
+def _authoritative_step_names(trial_root: Path) -> tuple[bool, list[str] | None]:
+    """Return ordered authoritative Harbor step names, if this is multi-step."""
+    result_path = trial_root / "result.json"
+    steps_path = trial_root / "steps"
+    try:
+        result_path.lstat()
+        result_artifact_present = True
+    except FileNotFoundError:
+        result_artifact_present = False
+    except OSError:
+        return True, None
+    try:
+        steps_path.lstat()
+        steps_layout_present = True
+    except FileNotFoundError:
+        steps_layout_present = False
+    except OSError:
+        return True, None
+
+    result = _read_json(result_path)
+    if not isinstance(result, dict):
+        return (True, None) if result_artifact_present or steps_layout_present else (False, None)
+    if "step_results" not in result:
+        if steps_layout_present:
+            return True, None
+        return False, None
+    step_results = result.get("step_results")
+    if not isinstance(step_results, list) or not step_results:
+        return True, None
+
+    names: list[str] = []
+    for step in step_results:
+        if not isinstance(step, dict):
+            return True, None
+        step_name = step.get("step_name")
+        if not isinstance(step_name, str) or not step_name or step_name in names:
+            return True, None
+        names.append(step_name)
+    return True, names
+
+
+def _trusted_trial_skill_invoked(
+    trial_root: Path,
+    step_name: str | None,
+    skill_name: str,
+) -> bool | None:
+    """Derive trusted invocation without falling back across logical steps."""
+    if step_name:
+        safe_step_paths = {path.parent.parent.name: path for path in _ordered_step_trajectory_paths(trial_root)}
+        trajectory_path = safe_step_paths.get(step_name)
+        return _trajectory_skill_invoked(_read_json(trajectory_path), skill_name) if trajectory_path else None
+
+    is_multi_step, authoritative_names = _authoritative_step_names(trial_root)
+    if is_multi_step:
+        if authoritative_names is None:
+            return None
+        safe_step_paths = {path.parent.parent.name: path for path in _ordered_step_trajectory_paths(trial_root)}
+        saw_unknown = False
+        for authoritative_name in authoritative_names:
+            trajectory_path = safe_step_paths.get(authoritative_name)
+            invoked = _trajectory_skill_invoked(_read_json(trajectory_path), skill_name) if trajectory_path else None
+            if invoked is True:
+                return True
+            if invoked is None:
+                saw_unknown = True
+        return None if saw_unknown else False
+
+    return _trajectory_skill_invoked(_read_json(trial_root / "agent" / "trajectory.json"), skill_name)
+
+
+def _add_trusted_invocation_evidence(
+    clean_reward: dict[str, Any],
+    source_reward: dict[str, Any],
+    trial_root: Path | None,
+    skill_name: str,
+) -> None:
+    """Replace verifier-authored routing evidence on standard rewards only."""
+    if not _is_standard_skill_execution_reward(source_reward):
+        return
+    for key in ("skill_invoked", "routing_passed", "invocation_evidence_source"):
+        clean_reward.pop(key, None)
+    if trial_root is None:
+        return
+    invoked = _trusted_trial_skill_invoked(trial_root, source_reward.get("_step_name"), skill_name)
+    if invoked is None:
+        return
+    if invoked is True:
+        clean_reward["skill_invoked"] = True
+    elif invoked is False:
+        clean_reward["skill_invoked"] = False
+    else:
+        return
+    clean_reward["invocation_evidence_source"] = "trajectory"
+
+
+def _can_restore_custom_metric_name(value: str) -> bool:
+    """Allow safe names plus narrow, explicitly metric-shaped secret terms."""
+    if not is_sensitive_key(value):
+        return True
+    camel_split = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "_", camel_split).strip("_").lower()
+    parts = tuple(part for part in normalized.split("_") if part)
+    return (
+        len(parts) == 2
+        and parts[0] in {"auth", "secret", "token"}
+        and parts[1]
+        in {
+            "accuracy",
+            "compliance",
+            "count",
+            "coverage",
+            "efficiency",
+            "handling",
+            "leakage",
+            "precision",
+            "quality",
+            "rate",
+            "ratio",
+            "recall",
+            "safety",
+            "score",
+            "usage",
+        }
+    )
+
+
+def _restore_custom_metric_scores(source_reward: dict[str, Any], safe_reward: dict[str, Any]) -> None:
+    """Restore only finite numeric values recognized by the custom-metric schema."""
+    for field in ("custom_metrics", "metrics"):
+        source_metrics = source_reward.get(field)
+        safe_metrics = safe_reward.get(field)
+        if not isinstance(source_metrics, dict) or not isinstance(safe_metrics, dict):
+            continue
+        for raw_name, raw_value in source_metrics.items():
+            name = str(raw_name)
+            if not _can_restore_custom_metric_name(name):
+                continue
+            score = extract_custom_metrics({field: {name: raw_value}}).get(name)
+            if score is None:
+                continue
+            if isinstance(raw_value, dict):
+                safe_value = safe_metrics.get(name)
+                if not isinstance(safe_value, dict):
+                    safe_value = {}
+                    safe_metrics[name] = safe_value
+                safe_value["score"] = score
+            else:
+                safe_metrics[name] = score
+
+    # Legacy custom-only rewards allowed this report metric at the top level.
+    token_efficiency = extract_custom_metrics({"token_efficiency": source_reward.get("token_efficiency")}).get(
+        "token_efficiency"
+    )
+    if token_efficiency is not None:
+        safe_reward["token_efficiency"] = token_efficiency
+
+
 def _save_trials(
     rewards: list[dict[str, Any]],
     trials_dir: Path,
     job_dir: Path | None,
     *,
+    skill_name: str,
     agent: str,
     variant: str,
     agent_model: str | None = None,
@@ -2250,6 +2457,7 @@ def _save_trials(
             reward["_trajectory_summary"] = _summarize_trajectory_file(src_traj)
 
         clean_reward = {k: v for k, v in reward.items() if not k.startswith("_")}
+        _add_trusted_invocation_evidence(clean_reward, reward, trial_src, skill_name)
         # Persist the physical attempt identity so bounded report readers can keep
         # fallback multi-step rows for diagnostics without weighting a logical
         # Harbor trial once per step.  This also populates the canonical report's
@@ -2268,11 +2476,11 @@ def _save_trials(
             str(clean_reward.get("evaluation_status") or "").casefold() in {"error", "failed"}
             or overall_score(clean_reward) is None
         )
-        safe_reward = (
-            redact_sensitive_data(clean_reward, max_str_len=REWARD_DIAGNOSTIC_STRING_MAX_CHARS)
-            if diagnostic_reward or "evaluation_errors" in clean_reward
-            else clean_reward
+        safe_reward = redact_sensitive_data(
+            clean_reward,
+            max_str_len=REWARD_DIAGNOSTIC_STRING_MAX_CHARS if diagnostic_reward else None,
         )
+        _restore_custom_metric_scores(clean_reward, safe_reward)
         (trial_out / "reward.json").write_text(json.dumps(safe_reward, indent=2), encoding="utf-8")
 
         if trial_src:
@@ -2615,6 +2823,7 @@ def collect_harbor_results(
                 with_collected_rewards,
                 agent_dir / "with-skill" / "trials",
                 with_job_dir,
+                skill_name=skill_name,
                 agent=agent,
                 variant="with_skill",
                 agent_model=agent_model,
@@ -2774,6 +2983,7 @@ def collect_harbor_results(
                     without_collected_rewards,
                     agent_dir / "without-skill" / "trials",
                     without_job_dir,
+                    skill_name=skill_name,
                     agent=agent,
                     variant="without_skill",
                     agent_model=agent_model,
@@ -2930,6 +3140,7 @@ def collect_harbor_results(
                     with_rewards,
                     agent_dir / "with-skill" / "trials",
                     with_job_dir,
+                    skill_name=skill_name,
                     agent=agent,
                     variant="with_skill",
                     agent_model=agent_model,

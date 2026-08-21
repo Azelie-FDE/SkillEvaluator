@@ -53,6 +53,10 @@ All notable changes to SkillEvaluator are documented in this file.
 
 ### Fixed
 
+- Tier 3 LLM insights now receive explicit labels and bounded expected-behavior
+  context for `expected_skill: null` negative controls, and the judge is
+  instructed not to flag unrelated successes without invocation or
+  failed-routing evidence.
 - Fixed Anthropic API-root normalization across evaluator and Claude Code
   paths, and made required Tier 3 judge failures fail closed instead of
   appearing as numeric zero scores or publishing misleading quality results

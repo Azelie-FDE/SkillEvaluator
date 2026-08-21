@@ -749,6 +749,10 @@ def build_agent_eval_payload(
         use_llm_judge=use_llm_judge and overall_score is not None,
     )
     if evidence_links:
+        payload["conclusions"] = _attach_harbor_evidence_to_conclusions(
+            payload.get("conclusions") or [],
+            evidence_links,
+        )
         payload["recommendations"] = _attach_harbor_evidence_to_recommendations(
             payload.get("recommendations") or [],
             evidence_links,
@@ -1699,11 +1703,30 @@ def _normalize_trials(rewards: list[dict[str, Any]], metrics: list[str]) -> list
     ``_normalize_harbor_trials`` so the ported Trials tab (per-evaluator
     drill-down, token/steps charts, warnings) renders identically.
     """
+    # Import lazily: ``skillevaluator.tier3`` imports report construction through
+    # its command module, so importing Harbor metrics at module load time creates
+    # a collector-first circular import.
+    from skillevaluator.tier3.harbor.metrics import (
+        DEFAULT_METRIC_SET,
+        LEGACY_METRIC_SET,
+        metric_set_for_reward,
+        metric_value,
+    )
+
     out: list[dict[str, Any]] = []
     for reward in rewards:
         if not isinstance(reward, dict):
             continue
-        scores = {m: numeric for m in metrics if (numeric := _finite_float(reward.get(m))) is not None}
+        declared_metric_set = reward.get("metric_set") or reward.get("metric_set_version")
+        standard_metric_sets = {DEFAULT_METRIC_SET, LEGACY_METRIC_SET}
+        metric_set, standard_metrics = metric_set_for_reward(reward)
+        is_declared_custom = bool(declared_metric_set) and str(declared_metric_set) not in standard_metric_sets
+        scores = {
+            m: numeric
+            for m in metrics
+            if not (is_declared_custom and m in {"skill_execution", "skill_routing"})
+            if (numeric := _finite_float(reward.get(m))) is not None
+        }
         trial: dict[str, Any] = {
             "trial_id": reward.get("trial_id"),
             "entry_id": reward.get("entry_id"),
@@ -1722,6 +1745,18 @@ def _normalize_trials(rewards: list[dict[str, Any]], metrics: list[str]) -> list
             trial["warnings"] = list(reward["warnings"])
         if reward.get("error_recovery"):
             trial["error_recovery"] = reward["error_recovery"]
+        is_standard_reward = (
+            (not declared_metric_set or str(declared_metric_set) in standard_metric_sets)
+            and metric_set in standard_metric_sets
+            and "skill_execution" in standard_metrics
+            and metric_value(reward, "skill_execution") is not None
+        )
+        if is_standard_reward and reward.get("invocation_evidence_source") == "trajectory":
+            for key in ("skill_invoked", "routing_passed"):
+                if type(reward.get(key)) is bool:
+                    trial[key] = reward[key]
+            if "skill_invoked" in trial or "routing_passed" in trial:
+                trial["invocation_evidence_source"] = "trajectory"
         harbor_viewer = _normalize_harbor_viewer_metadata(reward.get("harbor_viewer"))
         if harbor_viewer:
             trial["harbor_viewer"] = harbor_viewer
@@ -2071,9 +2106,37 @@ def _attach_harbor_evidence_to_recommendations(
             linked.append(recommendation)
             continue
         entry = dict(recommendation)
-        evidence = entry.get("evidence")
-        if not isinstance(evidence, dict) or not _safe_harbor_viewer_url(evidence.get("url")):
-            entry["evidence"] = evidence_links[min(index, len(evidence_links) - 1)]
+        evidence = _grounded_or_positional_evidence(entry, entry.get("evidence"), evidence_links, index)
+        if evidence is None:
+            entry.pop("evidence", None)
+        else:
+            entry["evidence"] = evidence
+        linked.append(entry)
+    return linked
+
+
+def _attach_harbor_evidence_to_conclusions(
+    conclusions: list[dict[str, Any]],
+    evidence_links: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not conclusions or not evidence_links:
+        return conclusions
+
+    linked: list[dict[str, Any]] = []
+    for conclusion in conclusions:
+        if not isinstance(conclusion, dict):
+            linked.append(conclusion)
+            continue
+        entry = dict(conclusion)
+        case_ids = _evidence_case_ids(entry)
+        if case_ids:
+            evidence = _case_matched_evidence(case_ids, evidence_links)
+            if evidence is None:
+                entry.pop("evidence", None)
+            else:
+                entry["evidence"] = evidence
+        elif not _valid_evidence(entry.get("evidence")):
+            entry.pop("evidence", None)
         linked.append(entry)
     return linked
 
@@ -2091,11 +2154,54 @@ def _attach_harbor_evidence_to_suggestions_v2(
             linked.append(suggestion)
             continue
         entry = dict(suggestion)
-        evidence = entry.get("harbor_evidence") or entry.get("evidence")
-        if not isinstance(evidence, dict) or not _safe_harbor_viewer_url(evidence.get("url")):
-            entry["harbor_evidence"] = evidence_links[min(index, len(evidence_links) - 1)]
+        existing = entry.get("harbor_evidence") or entry.get("evidence")
+        evidence = _grounded_or_positional_evidence(entry, existing, evidence_links, index)
+        if evidence is None:
+            entry.pop("harbor_evidence", None)
+        else:
+            entry["harbor_evidence"] = evidence
         linked.append(entry)
     return linked
+
+
+def _valid_evidence(evidence: object) -> bool:
+    return isinstance(evidence, dict) and _safe_harbor_viewer_url(evidence.get("url")) is not None
+
+
+def _evidence_case_ids(item: dict[str, Any]) -> list[str]:
+    case_ids = item.get("evidence_case_ids")
+    if not isinstance(case_ids, list):
+        return []
+    return [case_id.strip() for case_id in case_ids if isinstance(case_id, str) and case_id.strip()]
+
+
+def _case_matched_evidence(
+    case_ids: list[str],
+    evidence_links: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    for case_id in case_ids:
+        for evidence in evidence_links:
+            if (
+                isinstance(evidence, dict)
+                and str(evidence.get("entry_id") or "") == case_id
+                and _safe_harbor_viewer_url(evidence.get("url"))
+            ):
+                return evidence
+    return None
+
+
+def _grounded_or_positional_evidence(
+    item: dict[str, Any],
+    existing: object,
+    evidence_links: list[dict[str, Any]],
+    index: int,
+) -> dict[str, Any] | None:
+    case_ids = _evidence_case_ids(item)
+    if case_ids:
+        return _case_matched_evidence(case_ids, evidence_links)
+    if _valid_evidence(existing):
+        return existing
+    return evidence_links[min(index, len(evidence_links) - 1)]
 
 
 # ---------------------------------------------------------------------------

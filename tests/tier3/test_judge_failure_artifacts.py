@@ -78,6 +78,7 @@ def _load_verifier(tmp_path: Path) -> ModuleType:
                 "ground_truth": "The task is complete.",
                 "expected_behavior": ["Complete the task"],
                 "should_trigger": False,
+                "evaluated_skill": "demo",
                 "has_skill": True,
             }
         ),

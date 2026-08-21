@@ -90,7 +90,8 @@ def _normalized_key_parts(key: str) -> tuple[str, set[str]]:
     return normalized, parts
 
 
-def _is_sensitive_key(key: str) -> bool:
+def is_sensitive_key(key: str) -> bool:
+    """Return whether a structured-data key conventionally carries a secret."""
     normalized, parts = _normalized_key_parts(key)
     if normalized in _TOKEN_COUNT_KEYS:
         return False
@@ -106,7 +107,7 @@ def _is_sensitive_key(key: str) -> bool:
 
 def _redact_sensitive_assignment(match: re.Match[str]) -> str:
     key = match.group("key")
-    if not _is_sensitive_key(key):
+    if not is_sensitive_key(key):
         return match.group(0)
     return f"{key}{match.group('sep')}<redacted>"
 
@@ -137,7 +138,7 @@ def redact_sensitive_text(value: str, *, max_len: int | None = None) -> str:
 
 def redact_sensitive_data(value: Any, *, parent_key: str = "", max_str_len: int | None = None) -> Any:
     """Recursively redact structured data using secret-looking key names."""
-    if _is_sensitive_key(parent_key):
+    if is_sensitive_key(parent_key):
         return "<redacted>"
     if isinstance(value, Mapping):
         return {

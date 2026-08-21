@@ -3203,6 +3203,9 @@
                                     <span class="t3-insight-source insight-source-{{ source }}">{{ source }}</span>
                                 </div>
                                 <div class="t3-sug-body">{{ conclusion.message }}</div>
+                                {% if conclusion.evidence and conclusion.evidence.url %}
+                                <a class="t3-evidence-link" href="{{ conclusion.evidence.url }}" target="_blank" rel="noopener">View {{ conclusion.evidence.label or 'evidence' }}</a>
+                                {% endif %}
                             </div>
                             <div class="t3-sug-actions">
                                 <button class="t3-copy-btn" onclick='tier3CopyText(this, {{ ((conclusion.title ~ ': ' ~ conclusion.message) | tojson) }})'>Copy</button>
