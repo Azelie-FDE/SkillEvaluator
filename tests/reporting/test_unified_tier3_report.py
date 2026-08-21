@@ -12,8 +12,12 @@ from pathlib import Path
 import pytest
 
 from skillevaluator.evaluation.tier3_report import (
+    _attach_harbor_evidence_to_conclusions,
+    _attach_harbor_evidence_to_recommendations,
+    _attach_harbor_evidence_to_suggestions_v2,
     _evaluator_cards,
     _metric_evidence,
+    _normalize_trials,
     _raw_trial_rewards,
     _ReportBudget,
     agent_eval_result_from_directory,
@@ -144,6 +148,88 @@ def _embedded_tier3_payload(html: str) -> dict:
     if 'data-encoding="base64"' in match.group("attrs"):
         body = base64.b64decode(body).decode("utf-8")
     return json.loads(body)
+
+
+def test_normalize_trials_preserves_only_trusted_standard_invocation_evidence() -> None:
+    standard, custom_spoof, untrusted = _normalize_trials(
+        [
+            {
+                "entry_id": "standard",
+                "metric_set": "skill-evaluator-default-v2",
+                "skill_execution": 0.0,
+                "skill_invoked": True,
+                "routing_passed": False,
+                "invocation_evidence_source": "trajectory",
+            },
+            {
+                "entry_id": "custom",
+                "metric_set": "custom-only",
+                "overall": 1.0,
+                "skill_execution": 0.0,
+                "skill_invoked": True,
+                "routing_passed": False,
+                "invocation_evidence_source": "trajectory",
+            },
+            {
+                "entry_id": "untrusted",
+                "metric_set": "skill-evaluator-default-v2",
+                "skill_execution": 0.0,
+                "skill_invoked": 1,
+                "routing_passed": 0,
+                "invocation_evidence_source": "reward",
+            },
+        ],
+        list(DEFAULT_METRICS),
+    )
+
+    assert standard["skill_invoked"] is True
+    assert standard["routing_passed"] is False
+    assert standard["invocation_evidence_source"] == "trajectory"
+    assert "skill_execution" not in custom_spoof["scores"]
+    for trial in (custom_spoof, untrusted):
+        assert "skill_invoked" not in trial
+        assert "routing_passed" not in trial
+        assert "invocation_evidence_source" not in trial
+
+
+def test_case_grounded_harbor_links_win_over_positional_fallback() -> None:
+    evidence_links = [
+        {"url": "https://harbor.example.test/case-1", "entry_id": "case-1", "label": "case-1"},
+        {"url": "https://harbor.example.test/case-2", "entry_id": "case-2", "label": "case-2"},
+    ]
+    recommendations = _attach_harbor_evidence_to_recommendations(
+        [
+            {
+                "title": "Fix case-2",
+                "evidence_case_ids": ["case-2"],
+                "evidence": evidence_links[0],
+            }
+        ],
+        evidence_links,
+    )
+    suggestions = _attach_harbor_evidence_to_suggestions_v2(
+        [{"recommendation": "Fix case-2", "evidence_case_ids": ["case-2"]}],
+        evidence_links,
+    )
+    conclusions = _attach_harbor_evidence_to_conclusions(
+        [{"title": "Failure in case-2", "evidence_case_ids": ["case-2"]}],
+        evidence_links,
+    )
+
+    assert conclusions[0]["evidence"]["entry_id"] == "case-2"
+    assert recommendations[0]["evidence"]["entry_id"] == "case-2"
+    assert suggestions[0]["harbor_evidence"]["entry_id"] == "case-2"
+
+
+def test_conclusions_without_case_grounding_do_not_receive_positional_evidence() -> None:
+    evidence_links = [{"url": "https://harbor.example.test/case-1", "entry_id": "case-1", "label": "case-1"}]
+
+    conclusions = _attach_harbor_evidence_to_conclusions(
+        [{"title": "Aggregate result", "message": "No case-specific claim"}],
+        evidence_links,
+    )
+
+    assert "evidence" not in conclusions[0]
 
 
 def test_package_loader_reads_template_resources_as_utf8(monkeypatch: pytest.MonkeyPatch) -> None:

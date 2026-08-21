@@ -17,6 +17,7 @@ deterministic conclusions and recommendations from
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any
 
@@ -50,6 +51,18 @@ _VALID_CLAIM_TYPES = {
     "negative_control_failure",
     "dataset_case_removal",
 }
+_MAX_GROUNDED_CLAIM_TEXT_CHARS = 2_000
+_NEGATIVE_CONTROL_SEMANTIC_PATTERNS = (
+    re.compile(r"\bnegative[\s-]*control\b", re.IGNORECASE),
+    re.compile(r"\b(?:scope[\s-]*(?:drift|misalignment)|capability[\s-]*overreach)\b", re.IGNORECASE),
+    re.compile(r"\b(?:unintended|unnecessary|unnecessarily)\b.{0,48}\b(?:skill|capability)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:skill|capability)\b.{0,48}\b(?:over[\s-]*(?:applied|used)|overreach|overfitting)\b", re.IGNORECASE
+    ),
+    re.compile(
+        r"\b(?:unrelated|out[\s-]*of[\s-]*scope)\b.{0,48}\b(?:work|task|request|skill|capability)\b", re.IGNORECASE
+    ),
+)
 
 
 _SYSTEM_PROMPT = """\
@@ -87,18 +100,21 @@ NEGATIVE-CONTROL INTERPRETATION:
   when invocation evidence is absent or ambiguous, do not issue the warning.
 - Do not recommend removing an unrelated negative-control case merely because
   it is outside the skill's scope; that is what the case is designed to test.
-- Every conclusion and recommendation MUST include a claim_type and an
-  evidence_case_ids list. Use claim_type "general" only for observations that
-  do not concern negative-control routing or removal of a dataset case. Use
+- Every conclusion and recommendation MUST include a claim_type and a
+  non-empty evidence_case_ids list containing 1-10 unique known case ids. The
+  title and message together must name every evidence case id and no other case
+  id. General claims may cite only skill-activation cases. Use claim_type
+  "general" only for observations that do not concern negative-control routing
+  or removal of a dataset case. Use
   claim_type "negative_control_failure" for unintended skill use, scope
   misalignment, or overfitting involving a negative control. Use claim_type
   "dataset_case_removal" for any recommendation to remove a case from the
   dataset.
-- A negative_control_failure or dataset_case_removal claim MUST identify every
-  affected case in evidence_case_ids. Negative-control claims are valid only
-  when the supplied context shows failed routing or explicit invocation
-  evidence for at least one identified negative-control case. Do not label a
-  negative-control claim as general.
+- A negative_control_failure claim MUST identify every affected case in
+  evidence_case_ids and is valid only when the supplied context shows failed
+  routing or explicit invocation evidence for every identified negative-control
+  case. A dataset_case_removal claim must not cite a negative control. Do not
+  label a negative-control claim as general.
 
 Your job is to produce ADDITIONAL, contextual insights:
 
@@ -223,7 +239,25 @@ def _summarize_trials(trials: list[dict], cases_by_id: dict[str, dict] | None = 
 
     indexed_trials = [(index, trial) for index, trial in enumerate(trials) if isinstance(trial, dict)]
     sorted_trials = sorted(indexed_trials, key=_key)
-    chosen = sorted_trials[:3] + sorted_trials[-3:]
+
+    def _has_trusted_negative_failure(indexed_trial: tuple[int, dict]) -> bool:
+        _index, trial = indexed_trial
+        entry_id = trial.get("entry_id")
+        case = cases_by_id.get(str(entry_id)) if entry_id is not None else None
+        if not isinstance(case, dict) or _case_routing(case)[1] is not False:
+            return False
+        if trial.get("invocation_evidence_source") != "trajectory":
+            return False
+        skill_invoked = trial.get("skill_invoked") if type(trial.get("skill_invoked")) is bool else None
+        routing_passed = trial.get("routing_passed") if type(trial.get("routing_passed")) is bool else None
+        if skill_invoked is not None and routing_passed is not None:
+            return routing_passed is (not skill_invoked) and skill_invoked
+        if skill_invoked is not None:
+            return skill_invoked
+        return routing_passed is False
+
+    priority = [trial for trial in indexed_trials if _has_trusted_negative_failure(trial)]
+    chosen = priority + sorted_trials[:3] + sorted_trials[-3:]
 
     attempt_counts: dict[tuple[str, str], int] = {}
     attempts_by_index: dict[int, int | str] = {}
@@ -241,21 +275,26 @@ def _summarize_trials(trials: list[dict], cases_by_id: dict[str, dict] | None = 
         scores = trial.get("scores") or {}
         entry_id = trial.get("entry_id")
         case = cases_by_id.get(str(entry_id)) if entry_id is not None else None
-        compact.append(
-            {
-                "agent": trial.get("agent"),
-                "trial_id": trial.get("trial_id"),
-                "entry_id": entry_id,
-                "attempt": attempts_by_index[index],
-                "overall": trial.get("overall"),
-                "scores": {k: v for k, v in scores.items() if v is not None},
-                "baseline_overall": trial.get("baseline_overall"),
-                "lift_scores": trial.get("lift_scores") or {},
-                "warnings": (trial.get("warnings") or [])[:3],
-                "error_recovery": trial.get("error_recovery") or {},
-                "case": _summarize_case(case) if case is not None else None,
-            }
-        )
+        entry = {
+            "agent": trial.get("agent"),
+            "trial_id": trial.get("trial_id"),
+            "entry_id": entry_id,
+            "attempt": attempts_by_index[index],
+            "overall": trial.get("overall"),
+            "scores": {k: v for k, v in scores.items() if v is not None},
+            "baseline_overall": trial.get("baseline_overall"),
+            "lift_scores": trial.get("lift_scores") or {},
+            "warnings": (trial.get("warnings") or [])[:3],
+            "error_recovery": trial.get("error_recovery") or {},
+            "case": _summarize_case(case) if case is not None else None,
+        }
+        if trial.get("invocation_evidence_source") == "trajectory":
+            for key in ("skill_invoked", "routing_passed"):
+                if type(trial.get(key)) is bool:
+                    entry[key] = trial[key]
+            if "skill_invoked" in entry or "routing_passed" in entry:
+                entry["invocation_evidence_source"] = "trajectory"
+        compact.append(entry)
         if len(compact) >= 6:
             break
     return compact
@@ -298,86 +337,141 @@ def _coerce_category(value: Any) -> str:
     return "Action"
 
 
-def _negative_control_grounding(canonical: dict) -> tuple[dict[str, bool], set[str]]:
-    """Return negative cases mapped to whether invocation/routing failure exists."""
-    known_case_ids: set[str] = set()
-    evidence: dict[str, bool] = {}
+def _strict_bool(value: Any) -> bool | None:
+    return value if type(value) is bool else None
+
+
+def _finite_numeric(value: Any) -> float | None:
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return None
+    try:
+        numeric = float(value)
+    except OverflowError:
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def _trial_negative_control_failure(trial: dict) -> bool | None:
+    """Interpret one trial, preferring strict invocation evidence over legacy scores."""
+    if trial.get("invocation_evidence_source") == "trajectory":
+        skill_invoked = _strict_bool(trial.get("skill_invoked"))
+        routing_passed = _strict_bool(trial.get("routing_passed"))
+        if skill_invoked is not None and routing_passed is not None:
+            if routing_passed is not (not skill_invoked):
+                return None
+            return skill_invoked
+        if skill_invoked is not None:
+            return skill_invoked
+        if routing_passed is not None:
+            return not routing_passed
+
+    scores = trial.get("scores") if isinstance(trial.get("scores"), dict) else {}
+    numeric_scores = [
+        numeric
+        for value in (
+            scores.get("skill_execution"),
+            scores.get("skill_routing"),
+            trial.get("skill_execution"),
+            trial.get("skill_routing"),
+        )
+        if (numeric := _finite_numeric(value)) is not None
+    ]
+    if not numeric_scores:
+        return None
+    return any(score < 1.0 for score in numeric_scores)
+
+
+def _negative_control_grounding(canonical: dict) -> tuple[dict[str, bool | None], dict[str, str]]:
+    """Return per-case routing type and grounded negative-control failure state."""
+    case_types: dict[str, str] = {}
+    trial_states: dict[str, list[bool | None]] = {}
     for case in canonical.get("dataset") or []:
         if not isinstance(case, dict) or case.get("id") is None:
             continue
         case_id = str(case["id"])
-        known_case_ids.add(case_id)
-        _case_type, should_trigger = _case_routing(case)
+        case_type, should_trigger = _case_routing(case)
+        case_types[case_id] = case_type
         if should_trigger is False:
-            evidence[case_id] = False
+            trial_states[case_id] = []
 
     for trial in canonical.get("trials") or []:
         if not isinstance(trial, dict) or trial.get("entry_id") is None:
             continue
         case_id = str(trial["entry_id"])
-        if case_id not in evidence:
+        if case_id not in trial_states:
             continue
-        scores = trial.get("scores") if isinstance(trial.get("scores"), dict) else {}
-        routing_scores = [
-            scores.get("skill_execution"),
-            scores.get("skill_routing"),
-            trial.get("skill_execution"),
-            trial.get("skill_routing"),
-        ]
-        failed_routing = any(
-            isinstance(score, int | float) and not isinstance(score, bool) and score < 1.0
-            for score in routing_scores
-        )
-        explicit_invocation = trial.get("skill_invoked") is True or trial.get("routing_passed") is False
-        if failed_routing or explicit_invocation:
+        trial_states[case_id].append(_trial_negative_control_failure(trial))
+
+    evidence: dict[str, bool | None] = {}
+    for case_id, states in trial_states.items():
+        if any(state is True for state in states):
             evidence[case_id] = True
-    return evidence, known_case_ids
+        elif not states or any(state is None for state in states):
+            evidence[case_id] = None
+        else:
+            evidence[case_id] = False
+    return evidence, case_types
 
 
-def _declared_case_ids(item: dict) -> set[str] | None:
+def _declared_case_ids(item: dict) -> list[str] | None:
     raw_references = item.get("evidence_case_ids")
-    if not isinstance(raw_references, list) or len(raw_references) > 10:
+    if not isinstance(raw_references, list) or not 1 <= len(raw_references) <= 10:
         return None
     if any(not isinstance(value, str) or not value.strip() for value in raw_references):
         return None
-    return {value.strip() for value in raw_references}
+    references = [value.strip() for value in raw_references]
+    return references if len(references) == len(set(references)) else None
 
 
-def _text_case_ids(item: dict, known_case_ids: set[str]) -> set[str]:
+def _claim_text(item: dict) -> str | None:
+    text = f"{item.get('title') or ''} {item.get('message') or ''}"
+    return text if len(text) <= _MAX_GROUNDED_CLAIM_TEXT_CHARS else None
+
+
+def _text_case_ids(text: str, known_case_ids: set[str]) -> set[str]:
     references: set[str] = set()
 
-    text = f"{item.get('title') or ''} {item.get('message') or ''}"[:2_000]
     for case_id in known_case_ids:
         if re.search(rf"(?<![\w-]){re.escape(case_id)}(?![\w-])", text, re.IGNORECASE):
             references.add(case_id)
     return references
 
 
+def _has_negative_control_semantics(text: str) -> bool:
+    return any(pattern.search(text) for pattern in _NEGATIVE_CONTROL_SEMANTIC_PATTERNS)
+
+
 def _claim_is_grounded(
     item: dict,
-    grounding: tuple[dict[str, bool], set[str]],
+    grounding: tuple[dict[str, bool | None], dict[str, str]],
 ) -> bool:
-    evidence, known_case_ids = grounding
+    evidence, case_types = grounding
     claim_type = item.get("claim_type")
     if claim_type not in _VALID_CLAIM_TYPES:
         return False
 
     declared_case_ids = _declared_case_ids(item)
-    if declared_case_ids is None or not declared_case_ids.issubset(known_case_ids):
+    if declared_case_ids is None:
         return False
-    if not _text_case_ids(item, known_case_ids).issubset(declared_case_ids):
+    declared_set = set(declared_case_ids)
+    known_case_ids = set(case_types)
+    if not declared_set.issubset(known_case_ids):
+        return False
+    claim_text = _claim_text(item)
+    if claim_text is None or _text_case_ids(claim_text, known_case_ids) != declared_set:
         return False
 
-    negative_case_ids = declared_case_ids.intersection(evidence)
+    declared_types = [case_types[case_id] for case_id in declared_case_ids]
     if claim_type == "general":
-        return not negative_case_ids
+        return not _has_negative_control_semantics(claim_text) and all(
+            case_type == "skill_activation" for case_type in declared_types
+        )
+    if claim_type == "dataset_case_removal":
+        return all(case_type != "negative_control" for case_type in declared_types)
 
-    if not declared_case_ids:
-        return False
-    if claim_type == "negative_control_failure" and declared_case_ids != negative_case_ids:
-        return False
-
-    return not negative_case_ids or any(evidence[case_id] for case_id in negative_case_ids)
+    return all(case_type == "negative_control" for case_type in declared_types) and all(
+        evidence.get(case_id) is True for case_id in declared_case_ids
+    )
 
 
 class InsightsJudge(LLMClient):
@@ -452,10 +546,12 @@ class InsightsJudge(LLMClient):
                 continue
             conclusions.append(
                 {
+                    "claim_type": item["claim_type"],
                     "title": title or "Insight",
                     "message": message or title,
                     "severity": _coerce_severity(item.get("severity")),
                     "source": "llm",
+                    "evidence_case_ids": _declared_case_ids(item),
                 }
             )
 
@@ -471,11 +567,13 @@ class InsightsJudge(LLMClient):
                 continue
             recommendations.append(
                 {
+                    "claim_type": item["claim_type"],
                     "title": title or message[:60],
                     "message": message or title,
                     "category": _coerce_category(item.get("category")),
                     "severity": _coerce_severity(item.get("severity")),
                     "source": "llm",
+                    "evidence_case_ids": _declared_case_ids(item),
                 }
             )
 

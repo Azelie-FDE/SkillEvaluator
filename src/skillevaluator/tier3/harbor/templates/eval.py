@@ -33,6 +33,7 @@ import sys
 import unicodedata
 import urllib.error
 import urllib.request
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote_to_bytes, urlparse, urlsplit
@@ -1866,7 +1867,7 @@ def _salvage_behavior_results(text):
 
 # Tool argument field names used across agents for file paths.
 # Claude Code uses ``file_path`` for Read/Write; other agents use ``path`` or ``raw``.
-_PATH_ARG_KEYS = ("file_path", "path", "raw")
+_PATH_ARG_KEYS = ("file_path", "path", "filename", "target_file", "raw")
 
 
 def _extract_path(tc):
@@ -1909,6 +1910,48 @@ def _is_execution_action(action):
     return any(hint in action_lower for hint in _EXECUTION_TOOL_HINTS)
 
 
+def _is_file_read_action(action):
+    action_lower = str(action).strip().casefold()
+    return "read" in action_lower or any(
+        action_lower == name or action_lower.endswith((f"__{name}", f".{name}", f"/{name}", f":{name}"))
+        for name in ("open", "open_file", "grep", "egrep", "fgrep")
+    )
+
+
+def _lexical_path_components(value):
+    """Normalize separators and dot segments without touching the filesystem."""
+    components = []
+    for component in str(value).replace("\\", "/").strip().strip("'\"<>").split("/"):
+        if not component or component == ".":
+            continue
+        if component == "..":
+            if components and components[-1] != "..":
+                components.pop()
+            else:
+                components.append(component)
+            continue
+        components.append(component)
+    return components
+
+
+def _references_exact_target_artifact(value, target_skill, *, artifact):
+    """Return whether one lexical path references an exact target artifact."""
+    target = str(target_skill).strip()
+    if not target or artifact not in {"skill", "scripts"}:
+        return False
+    components = _lexical_path_components(value)
+    target_key = target.casefold()
+    for index, component in enumerate(components[:-1]):
+        if component.casefold() != target_key:
+            continue
+        child = components[index + 1].casefold()
+        if artifact == "skill" and child == "skill.md" and index + 2 == len(components):
+            return True
+        if artifact == "scripts" and child == "scripts":
+            return True
+    return False
+
+
 # Shell utilities an agent may use to view a SKILL.md file. Covers agents that
 # read via their shell exec tool rather than a native Read tool -- e.g. Codex,
 # which reaches a SKILL.md with sed/head as readily as cat. grep/egrep/fgrep are
@@ -1916,14 +1959,16 @@ def _is_execution_action(action):
 # the `grep SKILL config.json` false positive), and omitting them also avoids a
 # `pgrep` substring collision with a `grep ` entry.
 _FILE_READ_VERBS = {"cat", "sed", "head", "tail", "awk", "less", "more", "nl", "bat"}
-_SHELL_SEPARATORS = {"&&", "||", ";", "|"}
+_SHELL_SEPARATORS = {"&&", "||", ";", "|", "&"}
 _SHELL_ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_SHELL_VARIABLE_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 _OUTPUT_REDIRECTS = {">", ">>", ">|", "&>", "&>>"}
 _HEREDOC_REDIRECTS = {"<<", "<<<"}
 
 
 def _shell_tokens(cmd):
-    lexer = shlex.shlex(str(cmd), posix=True, punctuation_chars=True)
+    normalized = str(cmd).replace("\r\n", "\n").replace("\r", "\n").replace("\n", " ; ")
+    lexer = shlex.shlex(normalized, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     lexer.commenters = ""
     try:
@@ -1936,13 +1981,22 @@ def _shell_tokens(cmd):
 
 
 def _skill_md_arg(arg, assignments):
-    value = str(arg).lstrip("<>")
-    if value.startswith("${") and value.endswith("}"):
-        value = assignments.get(value[2:-1], value)
-    elif value.startswith("$"):
-        value = assignments.get(value[1:], value)
-    value_l = value.lower()
+    value = _resolved_shell_arg(arg, assignments)
+    value_l = value.replace("\\", "/").lower()
     return value_l == "skill.md" or value_l.endswith("/skill.md")
+
+
+def _resolved_shell_arg(arg, assignments):
+    value = str(arg).lstrip("<>")
+    for _ in range(2):
+        resolved = _SHELL_VARIABLE_RE.sub(
+            lambda match: assignments.get(match.group(1) or match.group(2), match.group(0)),
+            value,
+        )
+        if resolved == value:
+            break
+        value = resolved
+    return value
 
 
 def _is_output_redirect(token):
@@ -2009,6 +2063,328 @@ def _cmd_reads_skill_md(cmd) -> bool:
     return False
 
 
+_SCRIPT_INTERPRETERS = {"bash", "dash", "node", "perl", "python", "python3", "ruby", "sh", "zsh"}
+_SHELL_COMMAND_INTERPRETERS = {"bash", "dash", "sh", "zsh"}
+_INERT_SHELL_PRODUCERS = {"echo", "printf"}
+_MAX_SHELL_REFERENCE_CHARS = 32_768
+_MAX_SHELL_REFERENCE_TOKENS = 256
+_MAX_SHELL_REFERENCE_DEPTH = 3
+_MAX_SHELL_WRAPPERS = 8
+
+
+def _shell_substitution_payloads(command_text):
+    """Extract active command/process substitutions without evaluating shell text."""
+
+    def _group_end(start):
+        depth = 1
+        quote = None
+        index = start + 1
+        while index < len(command_text):
+            char = command_text[index]
+            if char == "\\" and quote != "'":
+                index += 2
+                continue
+            if char == "'" and quote != '"':
+                quote = None if quote == "'" else "'"
+            elif char == '"' and quote != "'":
+                quote = None if quote == '"' else '"'
+            elif quote is None:
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                    if depth == 0:
+                        return index
+            index += 1
+        return None
+
+    payloads = []
+    quote = None
+    index = 0
+    while index < len(command_text):
+        char = command_text[index]
+        if char == "\\" and quote != "'":
+            index += 2
+            continue
+        if char == "'" and quote != '"':
+            quote = None if quote == "'" else "'"
+            index += 1
+            continue
+        if char == '"' and quote != "'":
+            quote = None if quote == '"' else '"'
+            index += 1
+            continue
+        if quote != "'" and char in {"$", "<"} and index + 1 < len(command_text) and command_text[index + 1] == "(":
+            end = _group_end(index + 1)
+            if end is None:
+                return payloads, True
+            payloads.append(command_text[index + 2 : end])
+            index = end + 1
+            continue
+        if quote != "'" and char == "`":
+            end = index + 1
+            while end < len(command_text):
+                if command_text[end] == "\\":
+                    end += 2
+                    continue
+                if command_text[end] == "`":
+                    break
+                end += 1
+            if end >= len(command_text):
+                return payloads, True
+            payloads.append(command_text[index + 1 : end])
+            index = end + 1
+            continue
+        index += 1
+    return payloads, False
+
+
+def _path_with_shell_cwd(value, current_directory):
+    value = str(value)
+    if not current_directory or not value or value.startswith(("/", "\\")) or re.match(r"^[A-Za-z]:[\\/]", value):
+        return value
+    return f"{current_directory.rstrip('/\\')}/{value}"
+
+
+def _possibly_references_target_directory(value, target_skill):
+    target_key = str(target_skill).strip().casefold()
+    if not target_key:
+        return False
+    for component in _lexical_path_components(value):
+        component_key = component.casefold()
+        if component_key == target_key:
+            return True
+        if any(marker in component for marker in "*?[") and fnmatchcase(target_key, component_key):
+            return True
+    return False
+
+
+def _mentions_skill_artifact(value):
+    normalized = str(value).replace("\\", "/").casefold()
+    return "skill.md" in normalized or "/scripts/" in normalized
+
+
+def _command_input_args(command, cmd_idx, assignments):
+    args = []
+    skip_next = False
+    for arg in command[cmd_idx + 1 :]:
+        if skip_next:
+            skip_next = False
+            continue
+        if _is_heredoc_redirect(arg):
+            break
+        if _is_output_redirect(arg):
+            skip_next = True
+            continue
+        args.append(_resolved_shell_arg(arg, assignments))
+    return args
+
+
+def _shell_executable(value):
+    return str(value).replace("\\", "/").rsplit("/", 1)[-1].casefold()
+
+
+def _unwrap_shell_command(command, cmd_idx, assignments):
+    """Skip bounded env/command/exec wrappers and return the real command index."""
+    for _ in range(_MAX_SHELL_WRAPPERS):
+        if cmd_idx >= len(command):
+            return cmd_idx
+        executable = _shell_executable(_resolved_shell_arg(command[cmd_idx], assignments))
+        if executable == "env":
+            cmd_idx += 1
+            while cmd_idx < len(command):
+                token = _resolved_shell_arg(command[cmd_idx], assignments)
+                if token == "--":
+                    cmd_idx += 1
+                    break
+                assignment = _SHELL_ASSIGNMENT_RE.match(token)
+                if assignment:
+                    assignments[assignment.group(1)] = assignment.group(2)
+                    cmd_idx += 1
+                    continue
+                if token in {"-u", "--unset", "-C", "--chdir"}:
+                    cmd_idx += 2
+                    continue
+                if token.startswith("-"):
+                    cmd_idx += 1
+                    continue
+                break
+            continue
+        if executable == "command":
+            cmd_idx += 1
+            if cmd_idx < len(command) and command[cmd_idx] == "--":
+                cmd_idx += 1
+            while cmd_idx < len(command) and str(command[cmd_idx]).startswith("-"):
+                if command[cmd_idx] in {"-v", "-V"}:
+                    return len(command)
+                cmd_idx += 1
+            continue
+        if executable == "exec":
+            cmd_idx += 1
+            while cmd_idx < len(command) and str(command[cmd_idx]).startswith("-"):
+                option = str(command[cmd_idx])
+                cmd_idx += 1
+                if option == "-a":
+                    cmd_idx += 1
+            continue
+        if executable == "timeout":
+            cmd_idx += 1
+            while cmd_idx < len(command) and str(command[cmd_idx]).startswith("-"):
+                option = str(command[cmd_idx])
+                cmd_idx += 1
+                if option in {"-k", "--kill-after", "-s", "--signal"}:
+                    cmd_idx += 1
+            if cmd_idx < len(command):
+                cmd_idx += 1
+            continue
+        if executable == "nice":
+            cmd_idx += 1
+            if cmd_idx < len(command) and command[cmd_idx] in {"-n", "--adjustment"}:
+                cmd_idx += 2
+            elif cmd_idx < len(command) and re.fullmatch(r"-\d+", str(command[cmd_idx])):
+                cmd_idx += 1
+            continue
+        return cmd_idx
+    return None
+
+
+def _shell_c_payload(command, cmd_idx, assignments):
+    for index in range(cmd_idx + 1, len(command) - 1):
+        option = _resolved_shell_arg(command[index], assignments)
+        if option.startswith("-") and "c" in option[1:]:
+            payload_index = index + 1
+            if command[payload_index] == "--":
+                payload_index += 1
+            if payload_index < len(command):
+                return _resolved_shell_arg(command[payload_index], assignments)
+    return None
+
+
+def _cmd_references_exact_target(cmd, target_skill, _depth=0):
+    """Detect a target reference, returning None when a parser bound is hit."""
+    command_text = str(cmd)
+    if _depth >= _MAX_SHELL_REFERENCE_DEPTH or len(command_text) > _MAX_SHELL_REFERENCE_CHARS:
+        return None
+    saw_unknown = False
+    substitutions, malformed_substitution = _shell_substitution_payloads(command_text)
+    if malformed_substitution:
+        saw_unknown = True
+    for payload in substitutions:
+        nested_reference = _cmd_references_exact_target(payload, target_skill, _depth=_depth + 1)
+        if nested_reference is True:
+            return True
+        if nested_reference is None:
+            saw_unknown = True
+    tokens = _shell_tokens(cmd)
+    if len(tokens) > _MAX_SHELL_REFERENCE_TOKENS:
+        return None
+    assignments = {}
+    current_directory = None
+    idx = 0
+    while idx < len(tokens):
+        if tokens[idx] in _SHELL_SEPARATORS:
+            idx += 1
+            continue
+        end = idx
+        while end < len(tokens) and tokens[end] not in _SHELL_SEPARATORS:
+            end += 1
+        command = tokens[idx:end]
+        cmd_idx = 0
+        while cmd_idx < len(command):
+            assignment = _SHELL_ASSIGNMENT_RE.match(command[cmd_idx])
+            if not assignment:
+                break
+            assignments[assignment.group(1)] = assignment.group(2)
+            cmd_idx += 1
+        if (
+            cmd_idx < len(command)
+            and command[cmd_idx] == "("
+            and command[-1] == ")"
+            and any(value.endswith("$") for value in assignments.values())
+        ):
+            nested_reference = _cmd_references_exact_target(
+                shlex.join(command[cmd_idx + 1 : -1]),
+                target_skill,
+                _depth=_depth + 1,
+            )
+            if nested_reference is True:
+                return True
+            if nested_reference is None:
+                saw_unknown = True
+            idx = end + 1
+            continue
+        unwrapped_idx = _unwrap_shell_command(command, cmd_idx, assignments)
+        if unwrapped_idx is None:
+            saw_unknown = True
+            idx = end + 1
+            continue
+        cmd_idx = unwrapped_idx
+        if cmd_idx < len(command):
+            executable_path = _path_with_shell_cwd(
+                _resolved_shell_arg(command[cmd_idx], assignments),
+                current_directory,
+            )
+            executable = _shell_executable(executable_path)
+            input_args = _command_input_args(command, cmd_idx, assignments)
+            effective_input_args = [_path_with_shell_cwd(arg, current_directory) for arg in input_args]
+            if executable == "cd":
+                directory = next((arg for arg in input_args if arg and not arg.startswith("-")), None)
+                if directory is None:
+                    saw_unknown = True
+                else:
+                    current_directory = _path_with_shell_cwd(directory, current_directory)
+                idx = end + 1
+                continue
+            if (
+                executable in _FILE_READ_VERBS
+                and _command_reads_skill_md_arg(command, cmd_idx, assignments)
+                and any(
+                    _references_exact_target_artifact(arg, target_skill, artifact="skill")
+                    for arg in effective_input_args
+                )
+            ):
+                return True
+            if executable in _SHELL_COMMAND_INTERPRETERS:
+                payload = _shell_c_payload(command, cmd_idx, assignments)
+                if payload is not None:
+                    nested_reference = _cmd_references_exact_target(payload, target_skill, _depth=_depth + 1)
+                    if nested_reference is True:
+                        return True
+                    if nested_reference is None:
+                        saw_unknown = True
+                    idx = end + 1
+                    continue
+            directly_executes_target = _references_exact_target_artifact(
+                executable_path,
+                target_skill,
+                artifact="scripts",
+            )
+            interpreter_executes_target = (
+                executable in _SCRIPT_INTERPRETERS or re.fullmatch(r"python\d+(?:\.\d+)*", executable) is not None
+            ) and any(
+                _references_exact_target_artifact(arg, target_skill, artifact="scripts") for arg in effective_input_args
+            )
+            sources_target = executable in {".", "source"} and any(
+                _references_exact_target_artifact(arg, target_skill, artifact="scripts") for arg in effective_input_args
+            )
+            if directly_executes_target or interpreter_executes_target or sources_target:
+                return True
+            if executable not in _INERT_SHELL_PRODUCERS and any(
+                _references_exact_target_artifact(str(token).strip("()"), target_skill, artifact=artifact)
+                for token in command
+                for artifact in ("skill", "scripts")
+            ):
+                saw_unknown = True
+            if (
+                executable not in _INERT_SHELL_PRODUCERS
+                and any(_possibly_references_target_directory(token, target_skill) for token in effective_input_args)
+                and any(_mentions_skill_artifact(token) for token in effective_input_args)
+            ):
+                saw_unknown = True
+        idx = end + 1
+    return None if saw_unknown else False
+
+
 def _normalize_skill_names(value):
     if value is None:
         return []
@@ -2055,6 +2431,15 @@ def _resolve_acceptable_skills(entry, expected_skill=None):
     if raw is None:
         raw = entry.get("acceptable_alternates")
     return _accepted_skill_names(expected_skill or entry.get("expected_skill"), raw)
+
+
+def resolve_should_trigger(entry):
+    """Resolve routing while preserving legacy unlabeled cases as ``None``."""
+    if "should_trigger" in entry:
+        return bool(entry.get("should_trigger"))
+    if "expected_skill" in entry:
+        return bool(entry.get("expected_skill"))
+    return None
 
 
 def _match_skill_name(observed, expected, fuzzy=False):
@@ -2520,22 +2905,35 @@ def check_workflow_order(tool_calls, skill_tool_names=None, expected_skill=None)
 def check_negative_case(tool_calls, skill_under_test, skill_tool_names=None):
     if skill_tool_names:
         for s in skill_tool_names:
-            if skill_under_test.lower() in s.lower():
+            if str(s).strip().casefold() == str(skill_under_test).strip().casefold():
                 return {
                     "passed": False,
                     "score": 0.0,
                     "reason": f"Incorrectly activated {skill_under_test} via Skill tool",
                 }
+    saw_unknown = False
     for tc in tool_calls:
-        action = tc.get("action", "")
-        if "read" in action.lower():
+        action = str(tc.get("action", ""))
+        if _is_file_read_action(action):
             path = _extract_path(tc)
-            if skill_under_test in path and "SKILL.md" in path:
+            if not path:
+                saw_unknown = True
+                continue
+            if _references_exact_target_artifact(path, skill_under_test, artifact="skill"):
                 return {"passed": False, "score": 0.0, "reason": f"Incorrectly read {skill_under_test}/SKILL.md"}
         elif _is_execution_action(action):
             cmd = _command_text(tc)
-            if skill_under_test in cmd:
+            target_reference = _cmd_references_exact_target(cmd, skill_under_test)
+            if target_reference is True:
                 return {"passed": False, "score": 0.0, "reason": f"Incorrectly executed {skill_under_test} scripts"}
+            if target_reference is None:
+                saw_unknown = True
+    if saw_unknown:
+        return {
+            "passed": None,
+            "score": 0.0,
+            "reason": f"Could not safely determine whether {skill_under_test} was triggered",
+        }
     return {"passed": True, "score": 1.0, "reason": f"Correctly did not trigger {skill_under_test}"}
 
 
@@ -2795,6 +3193,76 @@ def check_tool_efficiency(tool_calls, expected_skill=None, expected_script=None)
         "score": round(score, 4),
         "reason": f"{productive}/{total} productive calls ({score:.0%})",
     }
+
+
+def score_skill_execution(
+    tool_calls,
+    expected_skill,
+    expected_script=None,
+    should_trigger=True,
+    *,
+    evaluated_skill=None,
+    require_evaluated_skill=False,
+    skill_tool_names=None,
+    acceptable_skills=None,
+):
+    if should_trigger is None:
+        return {"score": 1.0, "details": {"message": "No expected_skill -- skipped"}}
+
+    if not should_trigger:
+        if require_evaluated_skill and not evaluated_skill:
+            return {
+                "score": 0.0,
+                "details": {
+                    "message": "Explicit negative case is missing trusted evaluated_skill identity",
+                    "should_trigger": False,
+                },
+            }
+        skill_under_test = evaluated_skill or expected_skill
+        if not skill_under_test:
+            return {"score": 1.0, "details": {"message": "Negative case, no skill identified"}}
+        if not tool_calls:
+            neg = {"passed": True, "score": 1.0, "reason": "No tool calls"}
+        else:
+            neg = check_negative_case(tool_calls, skill_under_test, skill_tool_names=skill_tool_names)
+        return {"score": neg["score"], "details": {"negative_check": neg, "should_trigger": False}}
+
+    if not expected_skill:
+        return {"score": 1.0, "details": {"message": "No expected_skill -- skipped"}}
+
+    if not tool_calls:
+        return {"score": 0.0, "details": {"message": "No tool calls in trajectory"}}
+
+    checks = {}
+    scores = []
+
+    r = check_activation(
+        tool_calls,
+        expected_skill,
+        skill_tool_names=skill_tool_names,
+        acceptable_skills=acceptable_skills,
+    )
+    checks["activation"] = r
+    scores.append(r["score"])
+
+    r = check_script_execution(tool_calls, expected_script)
+    checks["script_execution"] = r
+    scores.append(r["score"])
+
+    r = check_workflow_order(
+        tool_calls,
+        skill_tool_names=skill_tool_names,
+        expected_skill=expected_skill,
+    )
+    checks["workflow_order"] = r
+    scores.append(r["score"])
+
+    r = check_error_recovery(tool_calls, expected_script)
+    checks["error_recovery"] = r
+    scores.append(r["score"])
+
+    avg = sum(scores) / len(scores) if scores else 0.0
+    return {"score": round(avg, 4), "details": checks}
 
 
 # ── LLM Judge: Accuracy (5-criterion) ────────────────────────────────────────
@@ -3208,7 +3676,8 @@ def main():
 
     expected_skill = entry.get("expected_skill") or ""
     expected_script = entry.get("expected_script") or ""
-    should_trigger = entry.get("should_trigger", bool(expected_skill))
+    should_trigger = resolve_should_trigger(entry)
+    evaluated_skill = entry.get("evaluated_skill") or ""
     acceptable_skills = _resolve_acceptable_skills(entry, expected_skill)
     expected_behavior = entry.get("expected_behavior", [])
     question = entry.get("question", "")
@@ -3242,47 +3711,18 @@ def main():
     details["security"] = security_result
 
     # ── Eval 2: skill_execution ──────────────────────────────────────────
-    if not should_trigger:
-        skill_under_test = expected_skill
-        if not skill_under_test:
-            se_score = 1.0
-            details["skill_execution"] = {"message": "Negative case, no skill identified"}
-        elif not tool_calls:
-            neg = {"passed": True, "score": 1.0, "reason": "No tool calls"}
-            se_score = 1.0
-            details["skill_execution"] = {"negative_check": neg}
-        else:
-            neg = check_negative_case(tool_calls, skill_under_test, skill_tool_names=skill_tools)
-            se_score = neg["score"]
-            details["skill_execution"] = {"negative_check": neg}
-    elif not expected_skill:
-        se_score = 1.0
-        details["skill_execution"] = {"message": "No expected_skill -- skipped"}
-    elif not tool_calls:
-        se_score = 0.0
-        details["skill_execution"] = {"message": "No tool calls in trajectory"}
-    else:
-        checks = {}
-        scores = []
-        r = check_activation(
-            tool_calls,
-            expected_skill,
-            skill_tool_names=skill_tools,
-            acceptable_skills=acceptable_skills,
-        )
-        checks["activation"] = r
-        scores.append(r["score"])
-        r = check_script_execution(tool_calls, expected_script)
-        checks["script_execution"] = r
-        scores.append(r["score"])
-        r = check_workflow_order(tool_calls, skill_tool_names=skill_tools, expected_skill=expected_skill)
-        checks["workflow_order"] = r
-        scores.append(r["score"])
-        r = check_error_recovery(tool_calls, expected_script)
-        checks["error_recovery"] = r
-        scores.append(r["score"])
-        se_score = round(sum(scores) / len(scores), 4)
-        details["skill_execution"] = checks
+    skill_execution_result = score_skill_execution(
+        tool_calls,
+        expected_skill,
+        expected_script,
+        should_trigger,
+        evaluated_skill=evaluated_skill,
+        require_evaluated_skill=True,
+        skill_tool_names=skill_tools,
+        acceptable_skills=acceptable_skills,
+    )
+    se_score = skill_execution_result["score"]
+    details["skill_execution"] = skill_execution_result["details"]
 
     # ── Eval 3: skill_efficiency ─────────────────────────────────────────
     if not should_trigger or not expected_skill:

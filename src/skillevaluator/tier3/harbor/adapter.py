@@ -1905,11 +1905,18 @@ def _write_entry_json(
     workspace_skill_names: list[str] | None = None,
     grading_mode: str = "default",
     custom_grader: bool = False,
+    evaluated_skill: str | None = None,
 ) -> None:
     tests_dir = task_dir / "tests"
     tests_dir.mkdir(parents=True, exist_ok=True)
+    trusted_identity: dict[str, str] = {}
+    if grading_mode in ("default", "default_plus_custom"):
+        if not evaluated_skill:
+            raise ValueError("SkillEvaluator default grading requires a trusted evaluated skill identity")
+        trusted_identity["evaluated_skill"] = evaluated_skill
     entry_with_flag = {
         **entry,
+        **trusted_identity,
         "has_skill": has_skill,
         "skill_workspace_mode": workspace_mode,
         "workspace_skill_names": workspace_skill_names or [],
@@ -4657,6 +4664,7 @@ def _stage_native_harbor_tasks_into(
                 workspace_skill_names=workspace_skill_names,
                 grading_mode=grading_mode,
                 custom_grader=custom_grader,
+                evaluated_skill=skill_path.name,
             )
             _write_test_sh(task_dir, grading_mode=grading_mode, custom_grader=custom_grader)
         elif custom_grader:
@@ -5006,6 +5014,7 @@ def _generate_harbor_tasks_into(
             workspace_skill_names=workspace_skill_names,
             grading_mode=grading_mode,
             custom_grader=custom_grader,
+            evaluated_skill=(skill_path.name if grading_mode in ("default", "default_plus_custom") else None),
         )
         _write_test_sh(task_dir, grading_mode=grading_mode, custom_grader=custom_grader)
 

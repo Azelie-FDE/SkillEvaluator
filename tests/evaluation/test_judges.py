@@ -21,6 +21,7 @@ from skillevaluator.evaluation import (
     compute_dimensions,
     compute_dimensions_deterministic,
 )
+from skillevaluator.evaluation.tier3_report import _normalize_trials
 from skillevaluator.tier3.dataset_utils import normalize_dataset_entries
 from skillevaluator.tier3.harbor.metrics import DIMENSION_DEFINITIONS
 
@@ -165,6 +166,9 @@ class TestInsightsJudgeNegativeControls:
         assert "Do not recommend removing an unrelated negative-control case" in prompt
         assert 'claim_type "negative_control_failure"' in prompt
         assert "evidence_case_ids list" in prompt
+        assert "non-empty" in prompt
+        assert "name every evidence case id" in prompt
+        assert "general claims may cite only skill-activation cases" in prompt.lower()
 
     def test_prompt_uses_runtime_should_trigger_precedence_for_agentskills_cases(self) -> None:
         dataset = normalize_dataset_entries(
@@ -209,10 +213,7 @@ class TestInsightsJudgeNegativeControls:
         assert context["dataset"][0]["skill_expected_to_activate"] is False
 
     def test_sampled_trial_keeps_matching_case_metadata_beyond_first_five(self) -> None:
-        dataset = [
-            {"id": f"positive-{index:03d}", "expected_skill": "calculator"}
-            for index in range(1, 6)
-        ] + [
+        dataset = [{"id": f"positive-{index:03d}", "expected_skill": "calculator"} for index in range(1, 6)] + [
             {
                 "id": "negative-006",
                 "expected_skill": None,
@@ -258,6 +259,35 @@ class TestInsightsJudgeNegativeControls:
             ("codex", 2),
             ("claude-code", 1),
         ]
+
+    def test_trial_sampling_prioritizes_trusted_negative_control_failure_evidence(self) -> None:
+        dataset = [{"id": f"positive-{index}", "expected_skill": "calculator"} for index in range(8)]
+        dataset[4] = {"id": "negative-4", "expected_skill": None}
+        trials = [
+            {
+                "entry_id": case["id"],
+                "overall": index / 10,
+                "scores": {"skill_execution": 1.0},
+            }
+            for index, case in enumerate(dataset)
+        ]
+        trials[4].update(
+            {
+                "skill_invoked": True,
+                "invocation_evidence_source": "trajectory",
+            }
+        )
+
+        prompt = InsightsJudge().create_user_prompt(
+            canonical={"dataset": dataset, "trials": trials},
+            deterministic={},
+        )
+        sampled = json.loads(prompt.split("\n\n", 1)[1])["trials"]
+
+        evidence_trial = next(trial for trial in sampled if trial["entry_id"] == "negative-4")
+        assert len(sampled) == 6
+        assert evidence_trial["skill_invoked"] is True
+        assert evidence_trial["invocation_evidence_source"] == "trajectory"
 
     def test_build_insights_suppresses_original_unsupported_negative_control_findings(
         self,
@@ -336,10 +366,12 @@ class TestInsightsJudgeNegativeControls:
 
         assert parsed["conclusions"] == [
             {
+                "claim_type": "negative_control_failure",
                 "title": "Unintended Skill Application",
                 "message": "The evaluated skill was invoked for negative-001.",
                 "severity": "fail",
                 "source": "llm",
+                "evidence_case_ids": ["negative-001"],
             }
         ]
 
@@ -454,7 +486,7 @@ class TestInsightsJudgeNegativeControls:
                         "claim_type": "general",
                         "category": "Improve",
                         "title": "Clarify Assertions",
-                        "message": "Remove ambiguity from test cases by making expected outputs explicit.",
+                        "message": "Remove ambiguity from positive-001 by making its expected output explicit.",
                         "severity": "warn",
                         "evidence_case_ids": ["positive-001"],
                     }
@@ -478,3 +510,331 @@ class TestInsightsJudgeNegativeControls:
 
         assert [item["title"] for item in parsed["conclusions"]] == ["Efficiency Regression"]
         assert [item["title"] for item in parsed["recommendations"]] == ["Clarify Assertions"]
+
+    def test_parse_rejects_original_general_claim_with_empty_evidence_ids(self) -> None:
+        response = json.dumps(
+            {
+                "conclusions": [
+                    {
+                        "claim_type": "general",
+                        "title": "Unintended Skill Application",
+                        "message": "The evaluated skill was unnecessarily used.",
+                        "severity": "warn",
+                        "evidence_case_ids": [],
+                    }
+                ],
+                "recommendations": [],
+            }
+        )
+        canonical = {"dataset": [{"id": "negative-001", "expected_skill": None}]}
+
+        assert InsightsJudge().parse_response(response, canonical=canonical)["conclusions"] == []
+
+    @pytest.mark.parametrize(
+        ("title", "message"),
+        [
+            (
+                "Efficiency positive-001",
+                "The skill was unnecessarily over-applied to unrelated negative-control work.",
+            ),
+            (
+                "Capability overreach positive-001",
+                "The evaluated capability was unnecessarily used for unrelated work, indicating scope drift.",
+            ),
+        ],
+    )
+    def test_parse_rejects_general_claim_with_negative_control_semantics(
+        self,
+        title: str,
+        message: str,
+    ) -> None:
+        response = json.dumps(
+            {
+                "conclusions": [
+                    {
+                        "claim_type": "general",
+                        "title": title,
+                        "message": message,
+                        "severity": "warn",
+                        "evidence_case_ids": ["positive-001"],
+                    }
+                ],
+                "recommendations": [],
+            }
+        )
+        canonical = {
+            "dataset": [
+                {"id": "positive-001", "expected_skill": "calculator"},
+                {"id": "negative-001", "expected_skill": None},
+            ]
+        }
+
+        assert InsightsJudge().parse_response(response, canonical=canonical)["conclusions"] == []
+
+    def test_parse_rejects_case_ids_hidden_beyond_the_grounding_text_bound(self) -> None:
+        response = json.dumps(
+            {
+                "conclusions": [
+                    {
+                        "claim_type": "general",
+                        "title": "Efficiency positive-001",
+                        "message": ("x" * 2_100) + " negative-001",
+                        "severity": "warn",
+                        "evidence_case_ids": ["positive-001"],
+                    }
+                ],
+                "recommendations": [],
+            }
+        )
+        canonical = {
+            "dataset": [
+                {"id": "positive-001", "expected_skill": "calculator"},
+                {"id": "negative-001", "expected_skill": None},
+            ]
+        }
+
+        assert InsightsJudge().parse_response(response, canonical=canonical)["conclusions"] == []
+
+    @pytest.mark.parametrize(
+        ("evidence_case_ids", "message"),
+        [
+            (["positive-001"], "Token use increased."),
+            (["positive-001", "positive-001"], "Token use increased for positive-001."),
+            (["fabricated-999"], "Token use increased for fabricated-999."),
+        ],
+    )
+    def test_parse_requires_exact_unique_known_case_ids_named_in_prose(
+        self,
+        evidence_case_ids: list[str],
+        message: str,
+    ) -> None:
+        response = json.dumps(
+            {
+                "conclusions": [
+                    {
+                        "claim_type": "general",
+                        "title": "Efficiency regression",
+                        "message": message,
+                        "severity": "warn",
+                        "evidence_case_ids": evidence_case_ids,
+                    }
+                ],
+                "recommendations": [],
+            }
+        )
+        canonical = {"dataset": [{"id": "positive-001", "expected_skill": "calculator"}]}
+
+        assert InsightsJudge().parse_response(response, canonical=canonical)["conclusions"] == []
+
+    @pytest.mark.parametrize(
+        ("trial", "accepted"),
+        [
+            ({"skill_invoked": True}, True),
+            ({"routing_passed": False}, True),
+            ({"skill_invoked": False}, False),
+            ({"routing_passed": True}, False),
+            ({"skill_invoked": True, "routing_passed": False}, True),
+            ({"skill_invoked": False, "routing_passed": True}, False),
+            ({"skill_invoked": True, "routing_passed": True, "scores": {"skill_execution": 0.0}}, False),
+            ({"skill_invoked": False, "routing_passed": False, "scores": {"skill_execution": 0.0}}, False),
+            ({"scores": {"skill_execution": 0.0}}, True),
+            ({"scores": {"skill_execution": 1.0}}, False),
+        ],
+    )
+    def test_parse_negative_control_uses_strict_evidence_before_legacy_numeric_fallback(
+        self,
+        trial: dict,
+        accepted: bool,
+    ) -> None:
+        response = json.dumps(
+            {
+                "conclusions": [
+                    {
+                        "claim_type": "negative_control_failure",
+                        "title": "Unintended invocation in negative-001",
+                        "message": "The evaluated skill was invoked for negative-001.",
+                        "severity": "fail",
+                        "evidence_case_ids": ["negative-001"],
+                    }
+                ],
+                "recommendations": [],
+            }
+        )
+        canonical = {
+            "dataset": [{"id": "negative-001", "expected_skill": None}],
+            "trials": [
+                {
+                    "entry_id": "negative-001",
+                    **(
+                        {"invocation_evidence_source": "trajectory"}
+                        if "skill_invoked" in trial or "routing_passed" in trial
+                        else {}
+                    ),
+                    **trial,
+                }
+            ],
+        }
+
+        parsed = InsightsJudge().parse_response(response, canonical=canonical)["conclusions"]
+
+        assert bool(parsed) is accepted
+        if accepted:
+            assert parsed[0]["claim_type"] == "negative_control_failure"
+            assert parsed[0]["evidence_case_ids"] == ["negative-001"]
+
+    def test_parse_requires_every_cited_negative_control_to_have_failure_evidence(self) -> None:
+        response = json.dumps(
+            {
+                "conclusions": [
+                    {
+                        "claim_type": "negative_control_failure",
+                        "title": "Failures in negative-001 and negative-002",
+                        "message": "The skill was invoked for negative-001 and negative-002.",
+                        "severity": "fail",
+                        "evidence_case_ids": ["negative-001", "negative-002"],
+                    }
+                ],
+                "recommendations": [],
+            }
+        )
+        canonical = {
+            "dataset": [
+                {"id": "negative-001", "expected_skill": None},
+                {"id": "negative-002", "expected_skill": None},
+            ],
+            "trials": [
+                {
+                    "entry_id": "negative-001",
+                    "skill_invoked": True,
+                    "invocation_evidence_source": "trajectory",
+                },
+                {
+                    "entry_id": "negative-002",
+                    "skill_invoked": False,
+                    "invocation_evidence_source": "trajectory",
+                },
+            ],
+        }
+
+        assert InsightsJudge().parse_response(response, canonical=canonical)["conclusions"] == []
+
+    @pytest.mark.parametrize("source", [None, "custom-verifier"])
+    def test_parse_does_not_trust_direct_or_custom_spoofed_invocation_booleans(
+        self,
+        source: str | None,
+    ) -> None:
+        response = json.dumps(
+            {
+                "conclusions": [
+                    {
+                        "claim_type": "negative_control_failure",
+                        "title": "Unintended invocation in negative-001",
+                        "message": "The evaluated skill was invoked for negative-001.",
+                        "severity": "fail",
+                        "evidence_case_ids": ["negative-001"],
+                    }
+                ],
+                "recommendations": [],
+            }
+        )
+        trial = {
+            "entry_id": "negative-001",
+            "skill_invoked": True,
+            "routing_passed": False,
+            "scores": {"skill_execution": 1.0},
+        }
+        if source is not None:
+            trial["invocation_evidence_source"] = source
+        canonical = {
+            "dataset": [{"id": "negative-001", "expected_skill": None}],
+            "trials": [trial],
+        }
+
+        assert InsightsJudge().parse_response(response, canonical=canonical)["conclusions"] == []
+
+    def test_parse_does_not_use_explicit_custom_metric_as_legacy_routing_grounding(self) -> None:
+        trials = _normalize_trials(
+            [
+                {
+                    "entry_id": "negative-001",
+                    "metric_set": "custom-only",
+                    "overall": 0.8,
+                    "skill_execution": 0.25,
+                }
+            ],
+            ["skill_execution"],
+        )
+        response = json.dumps(
+            {
+                "conclusions": [
+                    {
+                        "claim_type": "negative_control_failure",
+                        "title": "Unintended invocation in negative-001",
+                        "message": "The evaluated skill was invoked for negative-001.",
+                        "severity": "fail",
+                        "evidence_case_ids": ["negative-001"],
+                    }
+                ],
+                "recommendations": [],
+            }
+        )
+        canonical = {
+            "dataset": [{"id": "negative-001", "expected_skill": None}],
+            "trials": trials,
+        }
+
+        assert InsightsJudge().parse_response(response, canonical=canonical)["conclusions"] == []
+
+    def test_parse_treats_overflowing_legacy_numeric_evidence_as_unknown(self) -> None:
+        response = json.dumps(
+            {
+                "conclusions": [
+                    {
+                        "claim_type": "negative_control_failure",
+                        "title": "Unintended invocation in negative-001",
+                        "message": "The evaluated skill was invoked for negative-001.",
+                        "severity": "fail",
+                        "evidence_case_ids": ["negative-001"],
+                    }
+                ],
+                "recommendations": [],
+            }
+        )
+        canonical = {
+            "dataset": [{"id": "negative-001", "expected_skill": None}],
+            "trials": [
+                {
+                    "entry_id": "negative-001",
+                    "scores": {"skill_execution": 10**10_000},
+                }
+            ],
+        }
+
+        assert InsightsJudge().parse_response(response, canonical=canonical)["conclusions"] == []
+
+    def test_parse_preserves_ordered_grounding_for_positive_general_claim(self) -> None:
+        response = json.dumps(
+            {
+                "conclusions": [
+                    {
+                        "claim_type": "general",
+                        "title": "Positive evidence positive-002",
+                        "message": "Efficiency improved in positive-001 and positive-002.",
+                        "severity": "pass",
+                        "evidence_case_ids": ["positive-002", "positive-001"],
+                    }
+                ],
+                "recommendations": [],
+            }
+        )
+        canonical = {
+            "dataset": [
+                {"id": "positive-001", "expected_skill": "calculator"},
+                {"id": "positive-002", "expected_skill": "calculator"},
+            ]
+        }
+
+        parsed = InsightsJudge().parse_response(response, canonical=canonical)["conclusions"]
+
+        assert parsed[0]["claim_type"] == "general"
+        assert parsed[0]["evidence_case_ids"] == ["positive-002", "positive-001"]
