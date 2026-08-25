@@ -4,12 +4,23 @@ All notable changes to SkillEvaluator are documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+- Tier 3 paired pass@k evidence now respects Python's active integer-string
+  conversion limit, preserves nonzero Wilson interval widths and paired-effect
+  directions at large case counts, and documents exact-rational omission
+  markers.
+
 ## 0.2.1 - 2026-08-24
 
 ### Added
 
 - Added a public benchmark publication gate, regression coverage, and a
   documented rollout plan for generated `BENCHMARK.md` cards.
+- Tier 3 pass@k results now include per-arm 95% Wilson score intervals and,
+  when case identities pair completely, direction-preserving paired outcomes
+  with a two-sided exact McNemar diagnostic, its attainable-p resolution limit,
+  and the paired pass-rate delta.
 
 ### Changed
 
