@@ -25,6 +25,16 @@ All notable changes to SkillEvaluator are documented in this file.
 
 ### Fixed
 
+- Tier 3 now exercises each resolved agent route and the enabled standard-
+  grading route against its provider's model catalog before image preparation
+  or task staging. Definitive native-provider authentication and deterministic
+  Bedrock credential/configuration failures stop immediately with a redacted
+  diagnostic. Non-authoritative OpenAI catalog permission/membership results,
+  public or compatible catalog success that does not authenticate inference,
+  compatible-gateway catalog authentication, transient failures, and native
+  Harbor judge selection resolved only at runtime continue as degraded checks.
+  Redacted per-route outcomes are retained even when the later agent runtime
+  preflight fails ([#71](https://github.com/NVIDIA/SkillEvaluator/issues/71)).
 - Tier 3 Harbor collection now accepts the `step_results: null` sentinel
   emitted for successful single-step trials while retaining fail-closed
   validation for malformed non-null multi-step result containers.
