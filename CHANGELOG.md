@@ -12,6 +12,8 @@ All notable changes to SkillEvaluator are documented in this file.
 
 ### Fixed
 
+- Quality scoring, script lint, and `create-eval-dataset` now treat `tools/`
+  the same as `scripts/` for executable helpers.
 - License detection no longer treats a frontmatter `license` identifier as
   authoritative when a LICENSE file declares a different license. Claiming
   MIT while shipping GPL-3.0 now fails closed. Every LICENSE/COPYING file is
